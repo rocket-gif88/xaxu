@@ -157,83 +157,108 @@ function detectSweep(candles, levels) {
 // Must occur within 1–3 candles after sweep candle
 // Returns: { found, candleIdx, bodySize, avgBody }
 function detectDisplacement(candles, sweepIdx, direction) {
-  const BODY_MULT = 1.5;
-  const CLOSE_ZONE = 0.25; // top/bottom 25% of candle range
-
-  // Average body of last 10 candles BEFORE sweep
+  // Scans up to 4 candles. Tolerates 1 weak/indecisive candle gap.
+  const BODY_MULT  = 1.5;
+  const CLOSE_ZONE = 0.25;
   const slice = candles.slice(Math.max(0, sweepIdx - 10), sweepIdx);
-  if (slice.length < 3) return { found: false, reason: 'insufficient history' };
+  if (slice.length < 3) return { found: false, reason: 'insufficient candle history' };
   const avgBody10 = slice.reduce((s,c) => s + body(c), 0) / slice.length;
+  let weakGap = false;
 
-  for (let offset = 1; offset <= 3; offset++) {
+  for (let offset = 1; offset <= 4; offset++) {
     const idx = sweepIdx + offset;
     if (idx >= candles.length) break;
     const c = candles[idx];
     const b = body(c);
     const r = range(c);
     if (r === 0) continue;
-
-    const bodyOk = b >= avgBody10 * BODY_MULT;
-    const dirOk  = direction === 'BUY' ? c.c > c.o : c.c < c.o;
-    // Close in top 25% (buy) or bottom 25% (sell)
-    const closeZone = direction === 'BUY'
-      ? (c.c - c.l) / r >= (1 - CLOSE_ZONE)   // close in top 25%
-      : (c.h - c.c) / r >= (1 - CLOSE_ZONE);  // close in bottom 25%
-
-    if (bodyOk && dirOk && closeZone) {
-      return { found: true, candleIdx: idx, bodySize: b, avgBody: avgBody10,
+    const dirOk      = direction === 'BUY' ? c.c > c.o : c.c < c.o;
+    const bodyStrong = b >= avgBody10 * BODY_MULT;
+    const closeZone  = direction === 'BUY'
+      ? (c.c - c.l) / r >= (1 - CLOSE_ZONE)
+      : (c.h - c.c) / r >= (1 - CLOSE_ZONE);
+    if (bodyStrong && dirOk && closeZone) {
+      return { found: true, candleIdx: idx,
                ratio: parseFloat((b/avgBody10).toFixed(2)),
+               avgBody: avgBody10, weakGap,
                impulseHigh: c.h, impulseLow: c.l };
     }
+    // Allow 1 weak/indecisive candle gap before invalidating
+    if (!weakGap && (!dirOk || b < avgBody10 * 0.5)) { weakGap = true; continue; }
+    if (offset > 2 && !bodyStrong) break;
   }
-  return { found: false, reason: 'no qualifying displacement candle in 3 bars' };
+  return { found: false, reason: 'no displacement within 4 bars (1 weak gap allowed)' };
 }
 
 // ─── MARKET STRUCTURE SHIFT (BOS) ─────────────────────────────────────────
 // BUY: find last lower-high, check break above by 0.05%
 // SELL: find last higher-low, check break below by 0.05%
 function detectBOS(candles, sweepIdx, direction) {
-  const BOS_MIN = 0.0005; // 0.05%
-  const lookback = candles.slice(Math.max(0, sweepIdx - 20), sweepIdx + 1);
+  // Flexible BOS: (A) strong candle close beyond level, OR
+  //               (B) wick break + strong follow-through candle next bar.
+  // Prioritizes internal BOS (micro swing, last 5 candles) over external.
+  const BOS_MIN    = 0.0005;
+  const WICK_MIN   = 0.0003;
+  const FOLLOW_MULT = 1.2;
 
-  if (direction === 'BUY') {
-    // Find last lower-high in lookback (a high lower than the previous high)
-    let lowerHigh = null;
-    for (let i = lookback.length - 2; i >= 1; i--) {
-      if (lookback[i].h < lookback[i-1].h && lookback[i].h < lookback[i+1].h) {
-        lowerHigh = lookback[i].h;
-        break;
-      }
-    }
-    if (lowerHigh === null) return { found: false, reason: 'no lower-high found' };
+  const sliceBos = candles.slice(Math.max(0, sweepIdx - 8), sweepIdx);
+  const avgBodyBos = sliceBos.length > 0
+    ? sliceBos.reduce((s,c) => s + body(c), 0) / sliceBos.length : 0;
 
-    // Check if any candle after sweep breaks above lowerHigh by 0.05%
-    for (let i = sweepIdx + 1; i < Math.min(candles.length, sweepIdx + 10); i++) {
-      if (candles[i].c > lowerHigh * (1 + BOS_MIN)) {
-        return { found: true, bos_level: lowerHigh, bos_candle: i,
-                 label: `Break above LH $${lowerHigh.toFixed(3)}` };
-      }
+  function findSwingLevel(lookbackCandles, dir) {
+    // Internal: last 5 candles (micro structure)
+    const internal5 = lookbackCandles.slice(-5);
+    for (let i = internal5.length - 2; i >= 1; i--) {
+      if (dir === 'BUY'  && internal5[i].h < internal5[i-1].h && internal5[i].h < internal5[i+1].h)
+        return { price: internal5[i].h, type: 'internal' };
+      if (dir === 'SELL' && internal5[i].l > internal5[i-1].l && internal5[i].l > internal5[i+1].l)
+        return { price: internal5[i].l, type: 'internal' };
     }
-    return { found: false, reason: `no break above LH $${lowerHigh?.toFixed(3)}` };
-
-  } else { // SELL
-    let higherLow = null;
-    for (let i = lookback.length - 2; i >= 1; i--) {
-      if (lookback[i].l > lookback[i-1].l && lookback[i].l > lookback[i+1].l) {
-        higherLow = lookback[i].l;
-        break;
-      }
+    // External: full lookback (macro structure)
+    for (let i = lookbackCandles.length - 2; i >= 1; i--) {
+      if (dir === 'BUY'  && lookbackCandles[i].h < lookbackCandles[i-1].h && lookbackCandles[i].h < lookbackCandles[i+1].h)
+        return { price: lookbackCandles[i].h, type: 'external' };
+      if (dir === 'SELL' && lookbackCandles[i].l > lookbackCandles[i-1].l && lookbackCandles[i].l > lookbackCandles[i+1].l)
+        return { price: lookbackCandles[i].l, type: 'external' };
     }
-    if (higherLow === null) return { found: false, reason: 'no higher-low found' };
-
-    for (let i = sweepIdx + 1; i < Math.min(candles.length, sweepIdx + 10); i++) {
-      if (candles[i].c < higherLow * (1 - BOS_MIN)) {
-        return { found: true, bos_level: higherLow, bos_candle: i,
-                 label: `Break below HL $${higherLow.toFixed(3)}` };
-      }
-    }
-    return { found: false, reason: `no break below HL $${higherLow?.toFixed(3)}` };
+    return null;
   }
+
+  const lookback = candles.slice(Math.max(0, sweepIdx - 20), sweepIdx + 1);
+  const swing = findSwingLevel(lookback, direction);
+  if (!swing) return { found: false, reason: direction === 'BUY' ? 'no lower-high found' : 'no higher-low found' };
+
+  const lvl = swing.price;
+
+  for (let i = sweepIdx + 1; i < Math.min(candles.length, sweepIdx + 10); i++) {
+    const c  = candles[i];
+    const cn = i + 1 < candles.length ? candles[i + 1] : null;
+
+    if (direction === 'BUY') {
+      // Method A: close clearly above level
+      if (c.c > lvl * (1 + BOS_MIN)) {
+        return { found: true, bos_level: lvl, bos_candle: i, structure_type: swing.type,
+                 method: 'close', label: swing.type + ' BOS: close above LH $' + lvl.toFixed(3) };
+      }
+      // Method B: wick above + strong follow-through
+      if (cn && c.h > lvl * (1 + WICK_MIN) && cn.c > lvl && cn.c > cn.o && body(cn) >= avgBodyBos * FOLLOW_MULT) {
+        return { found: true, bos_level: lvl, bos_candle: i + 1, structure_type: swing.type,
+                 method: 'wick+followthrough', label: swing.type + ' BOS: wick+follow-through above LH $' + lvl.toFixed(3) };
+      }
+    } else {
+      // Method A
+      if (c.c < lvl * (1 - BOS_MIN)) {
+        return { found: true, bos_level: lvl, bos_candle: i, structure_type: swing.type,
+                 method: 'close', label: swing.type + ' BOS: close below HL $' + lvl.toFixed(3) };
+      }
+      // Method B
+      if (cn && c.l < lvl * (1 - WICK_MIN) && cn.c < lvl && cn.c < cn.o && body(cn) >= avgBodyBos * FOLLOW_MULT) {
+        return { found: true, bos_level: lvl, bos_candle: i + 1, structure_type: swing.type,
+                 method: 'wick+followthrough', label: swing.type + ' BOS: wick+follow-through below HL $' + lvl.toFixed(3) };
+      }
+    }
+  }
+  return { found: false, reason: 'no BOS on ' + swing.type + ' level $' + lvl.toFixed(3) };
 }
 
 // ─── M15 BOS CONFIRMATION ─────────────────────────────────────────────────
@@ -352,14 +377,33 @@ function checkVolatility(atrValues) {
 }
 
 // ─── CONFIDENCE SCORE ──────────────────────────────────────────────────────
-function calcConfidence(session, sweep, displacement, bos, pullback) {
+function calcConfidence(sessionOk, sessionOverlap, volatilityOk, sweep, displacement, bos, pullback) {
+  // New weighting: sweep 25, displacement 25, structure 20, pullback 20, session+vol 10
   let score = 0;
-  if (session)     score += 20; // valid session
-  if (sweep)       score += 20; // clean sweep
-  if (displacement.found) score += 20; // strong displacement
-  if (bos.found)   score += 20; // clear BOS
-  if (pullback.found) score += 20; // clean pullback
-  return score;
+  // Sweep quality (25)
+  if (sweep.found) {
+    score += sweep.wickPct >= 0.5 ? 25 : 20; // bonus for very clean wick
+  }
+  // Displacement (25)
+  if (displacement.found) {
+    score += displacement.ratio >= 2.0 ? 25 : displacement.ratio >= 1.5 ? 20 : 15;
+    if (displacement.weakGap) score -= 3; // slight penalty for gap
+  }
+  // Structure (20)
+  if (bos.found) {
+    score += bos.structure_type === 'internal' ? 20 : 15; // internal BOS scores higher
+    if (bos.method === 'wick+followthrough') score -= 2; // method B slightly lower
+  }
+  // Pullback (20)
+  if (pullback.found) {
+    const pb = parseFloat(pullback.retracement);
+    score += (pb >= 50 && pb <= 61.8) ? 20 : 15; // ideal zone gets full score
+  }
+  // Session + Volatility (10)
+  if (sessionOk)      score += 5;
+  if (sessionOverlap) score += 3; // bonus for overlap
+  if (volatilityOk)   score += 2;
+  return Math.min(score, 100);
 }
 
 // ─── MAIN ANALYSIS ROUTE ───────────────────────────────────────────────────
@@ -379,8 +423,18 @@ app.get('/analyze/:sym', async (req, res) => {
     return res.json({ success:false, error:'Data fetch failed: ' + e.message });
   }
 
-  if (!m5  || m5.length  < 30) return res.json({ success:false, error:'Insufficient M5 data. Market may be closed.' });
-  if (!m15 || m15.length < 10) return res.json({ success:false, error:'Insufficient M15 data.' });
+  if (!m5 || m5.length < 20) {
+    return res.json({ success: true, symbol: sym, price: null, atr: null,
+      session: 'Unknown', session_ok: false, setup_state: 'standby',
+      levels: [], log: ['Standby: insufficient M5 candle data. Market may be closed or outside trading hours.'],
+      signal: null, m5_candles: m5?.length || 0 });
+  }
+  if (!m15 || m15.length < 8) {
+    return res.json({ success: true, symbol: sym, price: null, atr: null,
+      session: 'Unknown', session_ok: false, setup_state: 'standby',
+      levels: [], log: ['Standby: insufficient M15 candle data.'],
+      signal: null, m5_candles: m5?.length || 0 });
+  }
 
   const currentPrice  = m5[m5.length-1].c;
   const currentATR    = atrValues?.length > 0 ? atrValues[atrValues.length-1] : null;
@@ -463,7 +517,7 @@ app.get('/analyze/:sym', async (req, res) => {
                 log.push(`R:R: ${tps.rr1} — below minimum 1:2 — setup invalidated`);
               } else {
                 // ── 10. CONFIDENCE ────────────────────────────────
-                const confidence = calcConfidence(sessionOk, sweep.found, disp, bos, pb);
+                const confidence = calcConfidence(sessionOk, sessionOverlap, volatility.ok, sweep, disp, bos, pb);
                 log.push(`Confidence: ${confidence}/100`);
 
                 if (confidence < 80) {
@@ -506,6 +560,8 @@ app.get('/analyze/:sym', async (req, res) => {
                     wick_pct:       parseFloat((sweep.wickPct*100).toFixed(1)),
                     disp_ratio:     disp.ratio,
                     bos_label:      bos.label,
+                    structure_type: bos.structure_type || 'external',
+                    bos_method:     bos.method || 'close',
                     m15_bos:        m15bos,
                     pullback_pct:   pb.retracement,
                     risk_dist:      parseFloat(tps.riskDist.toFixed(3))
