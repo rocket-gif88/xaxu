@@ -507,6 +507,171 @@ function calcConfidence(sessionOk, sessionOverlap, volatilityOk, sweep, displace
   return Math.min(Math.max(score, 0), 100);
 }
 
+
+// ─── ALERT MESSAGE FORMATTERS ─────────────────────────────────────────────
+// Pure functions — no logic, only formatting. Called before res.json().
+
+function formatSignalAlert(sig, atr) {
+  const isBuy    = sig.direction === 'BUY';
+  const asset    = sig.asset === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  const emoji    = isBuy ? '🟢' : '🔴';
+  const dirLabel = isBuy ? 'BUY' : 'SELL';
+
+  // Confidence interpretation
+  const confLabel = sig.confidence >= 85 ? 'High conviction — strong confluence across all criteria'
+                  : sig.confidence >= 75 ? 'Strong setup — most criteria clearly confirmed'
+                  : 'Moderate setup — valid but fewer confirmations';
+
+  // Bias line
+  const biasLine = {
+    bullish_bias: 'Bullish — price is below the prior day low',
+    bearish_bias: 'Bearish — price is above the prior day high',
+    neutral:      'Neutral — price is within the prior day range'
+  }[sig.directional_bias] || 'Neutral';
+
+  // Plain-language context
+  const dir2   = isBuy ? 'below' : 'above';
+  const action = isBuy ? 'reversed sharply higher' : 'reversed sharply lower';
+  const trend  = isBuy ? 'upward' : 'downward';
+  const swept  = sig.sweep_level || 'a key price level';
+  const context = asset + ' briefly moved ' + dir2 + ' ' + swept +
+    ', then ' + action + '. A clear shift in ' + trend + ' momentum has been confirmed.';
+
+  // Interpretation
+  const trapped  = isBuy ? 'Short sellers were briefly trapped below support'
+                          : 'Buyers were briefly trapped above resistance';
+  const control  = isBuy ? 'buyers absorbed the move and regained control'
+                          : 'sellers absorbed the move and regained control';
+  const pbNote   = sig.pullback_pct
+    ? 'Entry is positioned at a ' + sig.pullback_pct + '% retracement of the impulse.'
+    : 'Entry is positioned at a pullback into the move.';
+  const interpretation = trapped + '. Then ' + control + '. ' + pbNote;
+
+  // Execution note
+  const exec = isBuy
+    ? 'Do not chase price. Wait for a pullback toward the entry zone before executing.'
+    : 'Do not sell into the low. Wait for a pullback toward the entry zone before executing.';
+
+  // Structured object for UI + Telegram
+  return {
+    type:        'signal',
+    headline:    emoji + ' ' + asset + ' ' + dirLabel + ' SETUP',
+    context,
+    trade: {
+      entry:     '$' + sig.entry,
+      stop_loss: '$' + sig.stop_loss,
+      tp1:       '$' + sig.take_profit_1,
+      tp2:       '$' + sig.take_profit_2,
+      rr:        '1 : ' + sig.rr
+    },
+    strength: {
+      confidence: sig.confidence + '% — ' + confLabel,
+      session:    sig.session || '—',
+      bias:       biasLine
+    },
+    interpretation,
+    execution:   exec,
+    // Telegram-ready flat text
+    telegram: [
+      emoji + ' *' + asset + ' ' + dirLabel + ' SETUP*',
+      '',
+      '📋 *What happened:*',
+      context,
+      '',
+      '📊 *Trade levels:*',
+      '• Entry zone: $' + sig.entry,
+      '• Stop loss:  $' + sig.stop_loss,
+      '• Target 1:   $' + sig.take_profit_1,
+      '• Target 2:   $' + sig.take_profit_2,
+      '• Risk/Reward: 1:' + sig.rr,
+      '',
+      '📈 *Setup strength:*',
+      '• Confidence: ' + sig.confidence + '% — ' + confLabel,
+      '• Session: ' + (sig.session || '—'),
+      '• Market bias: ' + biasLine,
+      '',
+      '💡 *What this means:*',
+      interpretation,
+      '',
+      '⚡ *Execution note:*',
+      exec,
+      '',
+      '─────────────────────',
+      'Signal ID #' + (sig.id || '—') + ' | Aurum Signals'
+    ].join('\n')
+  };
+}
+
+function formatPreSignalAlert(stage, sym, direction, message, level, session, bias) {
+  const asset   = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  const isBuy   = direction === 'BUY';
+  const emoji   = {
+    approaching_liquidity:  '📍',
+    sweep_detected:         '⚡',
+    displacement_confirmed: '↗',
+    structure_break:        '✅'
+  }[stage] || '📡';
+
+  const stageLabel = {
+    approaching_liquidity:  'KEY LEVEL NEARBY',
+    sweep_detected:         'LIQUIDITY GRAB DETECTED',
+    displacement_confirmed: 'STRONG MOVE CONFIRMED',
+    structure_break:        'TREND SHIFT CONFIRMED'
+  }[stage] || 'SETUP FORMING';
+
+  const stageContext = {
+    approaching_liquidity:  asset + ' is approaching ' + (level ? level.label : 'a key price level') +
+                            '. If price sweeps through and reverses, a ' +
+                            (isBuy?'BUY':'SELL') + ' setup may form.',
+    sweep_detected:         asset + ' has moved through a key level and closed back inside. ' +
+                            'This is a potential ' + (isBuy?'BUY':'SELL') + ' setup. ' +
+                            'Waiting for a strong directional move to confirm.',
+    displacement_confirmed: 'A strong ' + (isBuy?'upward':'downward') + ' move has followed the liquidity grab. ' +
+                            'Waiting for a trend shift (break of structure) to confirm direction.',
+    structure_break:        'The trend shift is confirmed on the 5-minute chart. ' +
+                            'Waiting for price to pull back into the entry zone before triggering.'
+  }[stage] || message;
+
+  const action = {
+    approaching_liquidity:  'Monitor closely. No trade yet — waiting for a sweep and reversal.',
+    sweep_detected:         'No trade yet. Waiting for a strong directional move to follow the grab.',
+    displacement_confirmed: 'No trade yet. Waiting for a trend shift to confirm the direction.',
+    structure_break:        'Setup is nearly complete. Watch for a pullback into the entry zone.'
+  }[stage] || 'Monitoring. No action required yet.';
+
+  const biasLine = {
+    bullish_bias: 'Bullish — price is below the prior day low',
+    bearish_bias: 'Bearish — price is above the prior day high',
+    neutral:      'Neutral — price within the prior day range'
+  }[bias] || 'Neutral';
+
+  return {
+    type:        'pre_signal',
+    stage,
+    headline:    emoji + ' ' + asset + ' — ' + stageLabel,
+    context:     stageContext,
+    direction:   direction || '—',
+    session:     session || '—',
+    bias:        biasLine,
+    action,
+    telegram: [
+      emoji + ' *' + asset + ' — ' + stageLabel + '*',
+      '',
+      stageContext,
+      '',
+      '📋 *Direction:* ' + (direction || '—'),
+      '📋 *Session:* ' + (session || '—'),
+      '📋 *Market bias:* ' + biasLine,
+      '',
+      '⏳ *Action:*',
+      action,
+      '',
+      '─────────────────────',
+      'Pre-signal alert | Aurum Signals'
+    ].join('\n')
+  };
+}
+
 // ─── MAIN ANALYSIS ROUTE ───────────────────────────────────────────────────
 app.get('/analyze/:sym', async (req, res) => {
   const sym = req.params.sym.toUpperCase();
@@ -659,7 +824,7 @@ app.get('/analyze/:sym', async (req, res) => {
                     if (xau && xag) ratio = parseFloat((xau/xag).toFixed(2));
                   } catch(e) {}
 
-                  signal = {
+                  const rawSignal = {
                     asset:          sym,
                     direction:      sweep.direction,
                     entry:          parseFloat(pb.entry.toFixed(3)),
@@ -682,6 +847,9 @@ app.get('/analyze/:sym', async (req, res) => {
                     pullback_pct:   pb.retracement,
                     risk_dist:      parseFloat(tps.riskDist.toFixed(3))
                   };
+                  rawSignal.directional_bias = directionalBias;
+                  const alertMsg = formatSignalAlert(rawSignal, currentATR);
+                  signal = { ...rawSignal, alert: alertMsg };
                   log.push('✅ Signal generated — ' + sweep.direction + ' ' + sym + ' at $' + pb.entry.toFixed(3));
                 }
               }
@@ -723,20 +891,34 @@ app.get('/analyze/:sym', async (req, res) => {
       stage: 'approaching_liquidity',
       message: sweepPotentials[0].message,
       direction: sweepPotentials[0].direction,
-      level: sweepPotentials[0].level
+      level: sweepPotentials[0].level,
+      alert: formatPreSignalAlert('approaching_liquidity', sym, sweepPotentials[0].direction,
+               sweepPotentials[0].message, sweepPotentials[0].level, sess, directionalBias)
     };
   } else if (setupState === 'sweep_detected') {
-    near_setup = { stage: 'sweep_detected',
+    near_setup = {
+      stage: 'sweep_detected',
       message: (sweep.level ? 'Sweep of ' + sweep.level.label + ' confirmed' : 'Sweep confirmed') + ' - awaiting displacement',
-      direction: sweep.direction };
+      direction: sweep.direction,
+      alert: formatPreSignalAlert('sweep_detected', sym, sweep.direction,
+               null, sweep.level, sess, directionalBias)
+    };
   } else if (setupState === 'displacement_confirmed') {
-    near_setup = { stage: 'displacement_confirmed',
+    near_setup = {
+      stage: 'displacement_confirmed',
       message: 'Displacement confirmed (' + (disp ? disp.ratio : '?') + 'x body) - awaiting BOS',
-      direction: sweep.direction };
+      direction: sweep.direction,
+      alert: formatPreSignalAlert('displacement_confirmed', sym, sweep.direction,
+               null, null, sess, directionalBias)
+    };
   } else if (setupState === 'structure_break') {
-    near_setup = { stage: 'structure_break',
+    near_setup = {
+      stage: 'structure_break',
       message: 'BOS confirmed - awaiting pullback entry',
-      direction: sweep.direction };
+      direction: sweep.direction,
+      alert: formatPreSignalAlert('structure_break', sym, sweep.direction,
+               null, null, sess, directionalBias)
+    };
   }
 
   res.json({
