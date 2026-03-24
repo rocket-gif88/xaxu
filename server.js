@@ -43,30 +43,35 @@ const pct   = (a, b) => Math.abs(a - b) / b;            // relative distance
 const body  = c      => Math.abs(c.c - c.o);
 const range = c      => c.h - c.l;                      // always positive
 
-// --- ATR THRESHOLDS ----------------------------------------------------------
-const ATR_THRESHOLDS = {
-  XAUUSD: 0.40,   // $0.40 min ATR per M5 candle — below = thin/dead market
-  XAGUSD: 0.008   // $0.008 min ATR per M5 candle
+// --- ATR RANGE VALIDATION ----------------------------------------------------
+// Valid ATR range per M5 candle. Outside either bound = ignore volatility filter.
+const ATR_RANGE = {
+  XAUUSD: { min: 0.30, max: 8.0  },  // $0.30-$8.00 per M5 candle
+  XAGUSD: { min: 0.005, max: 0.30 }  // $0.005-$0.30 per M5 candle
 };
 function checkATR(sym, atrValues) {
-  if (!atrValues || atrValues.length < 5) {
-    return { ok: true, state: 'unknown', current: null, avg20: null,
-             note: 'Insufficient ATR history — proceeding' };
+  if (!atrValues || atrValues.length < 5 || !ATR_RANGE[sym]) {
+    return { ok: true, state: 'unknown', current: null, avg20: null, note: 'Insufficient ATR' };
   }
   const current = atrValues[atrValues.length - 1];
-  const slice   = atrValues.slice(-20);
-  const avg20   = slice.reduce((s,v)=>s+v,0) / slice.length;
-  const minATR  = ATR_THRESHOLDS[sym] || 0.40;
   if (isNaN(current) || current <= 0) {
-    return { ok: true, state: 'unknown', current, avg20, note: 'ATR value invalid — proceeding' };
+    return { ok: true, state: 'unknown', current, avg20: null, note: 'ATR invalid - proceeding' };
   }
-  if (current < minATR) {
+  const { min, max } = ATR_RANGE[sym];
+  const slice = atrValues.slice(-20);
+  const avg20 = slice.reduce((s,v)=>s+v,0) / slice.length;
+  if (current < min) {
     return { ok: false, state: 'low_volatility', current, avg20,
-             note: 'ATR ' + current.toFixed(4) + ' below minimum ' + minATR + ' — suppressed' };
+             note: 'ATR ' + current.toFixed(4) + ' below min ' + min + ' - suppressed' };
   }
-  const atrState = current >= avg20 ? 'normal' : 'below_avg';
-  return { ok: true, state: atrState, current, avg20,
-           note: 'ATR ' + current.toFixed(4) + ' (avg ' + avg20.toFixed(4) + ') — ' + atrState };
+  if (current > max) {
+    // Too high = news spike; ignore filter, allow engine to run
+    return { ok: null, state: 'high_volatility', current, avg20,
+             note: 'ATR ' + current.toFixed(4) + ' above max ' + max + ' - filter ignored' };
+  }
+  const state = current >= avg20 ? 'normal' : 'below_avg';
+  return { ok: true, state, current, avg20,
+           note: 'ATR ' + current.toFixed(4) + ' (avg ' + avg20.toFixed(4) + ') - ' + state };
 }
 
 // ─── SESSION ──────────────────────────────────────────────────────────────
@@ -151,6 +156,51 @@ function buildLevels(m5Candles, m15Candles) {
   });
 
   return levels;
+}
+
+// --- PROXIMITY DETECTION ---------------------------------------------------
+// Threshold: price within 0.20% of a liquidity level = "approaching"
+const APPROACH_PCT = { XAUUSD: 0.0020, XAGUSD: 0.0020 };
+
+function detectApproaching(price, levels, sym) {
+  const threshold = APPROACH_PCT[sym] || 0.0020;
+  return levels
+    .map(lvl => {
+      const dist    = Math.abs(price - lvl.price);
+      const distPct = dist / lvl.price;
+      return {
+        ...lvl,
+        dist:       parseFloat(dist.toFixed(4)),
+        distPct:    parseFloat((distPct * 100).toFixed(3)),
+        approaching: distPct <= threshold,
+        side:       price > lvl.price ? 'above' : 'below'
+      };
+    })
+    .filter(l => l.approaching)
+    .sort((a, b) => a.distPct - b.distPct);
+}
+
+function detectSweepPotential(price, approachingLevels, candles) {
+  if (!approachingLevels.length || candles.length < 4) return [];
+  const last3    = candles.slice(-3);
+  const momentum = last3[last3.length - 1].c - last3[0].c;
+  const alerts   = [];
+  for (const lvl of approachingLevels) {
+    const movingToward =
+      (lvl.side === 'below' && momentum < 0) ||
+      (lvl.side === 'above' && momentum > 0);
+    if (movingToward) {
+      const dir = lvl.side === 'below' ? 'BUY' : 'SELL';
+      alerts.push({
+        type:      'sweep_potential',
+        level:     lvl,
+        direction: dir,
+        message:   'Price approaching ' + lvl.label + ' at $' + lvl.price.toFixed(3) +
+                   ' (' + lvl.distPct + '% away) - potential ' + dir + ' sweep forming'
+      });
+    }
+  }
+  return alerts;
 }
 
 // ─── SWEEP DETECTION ──────────────────────────────────────────────────────
@@ -420,10 +470,10 @@ function calcConfidence(sessionOk, sessionOverlap, volatilityOk, sweep, displace
   let score = 0;
   if (sweep.found) {
     let sweepScore = sweep.wickPct >= 0.5 ? 25 : 20;
-    // Bonus for stronger liquidity zones
+    // Liquidity strength bonus: x4+ = +4, x3 = +2, x2 = -2
     const liqScore = sweepLevel ? (sweepLevel.strengthScore || 1) : 1;
-    if (liqScore === 3) sweepScore = Math.min(sweepScore + 3, 25); // strong zone
-    if (liqScore === 1) sweepScore = Math.max(sweepScore - 2, 15); // weak zone
+    if (liqScore >= 3)     sweepScore = Math.min(sweepScore + 4, 25);
+    else if (liqScore < 2) sweepScore = Math.max(sweepScore - 2, 15);
     score += sweepScore;
   }
   // Displacement (25)
@@ -477,13 +527,13 @@ app.get('/analyze/:sym', async (req, res) => {
   if (!m5 || m5.length < 20) {
     return res.json({ success: true, symbol: sym, price: null, atr: null,
       session: 'Unknown', session_ok: false, setup_state: 'standby',
-      levels: [], log: ['Standby: insufficient M5 candle data. Market may be closed or outside trading hours.'],
+      levels: [], log: ['Waiting for data: not enough price history available. Market may be closed or outside trading hours.'],
       signal: null, m5_candles: m5?.length || 0 });
   }
   if (!m15 || m15.length < 8) {
     return res.json({ success: true, symbol: sym, price: null, atr: null,
       session: 'Unknown', session_ok: false, setup_state: 'standby',
-      levels: [], log: ['Standby: insufficient M15 candle data.'],
+      levels: [], log: ['Waiting for data: not enough 15-minute price history available.'],
       signal: null, m5_candles: m5?.length || 0 });
   }
 
@@ -521,58 +571,58 @@ app.get('/analyze/:sym', async (req, res) => {
 
   if (!sessionOk) {
     setupState = 'idle';
-    log.push(`Session: CLOSED — no signals generated outside London/NY`);
-  } else if (!volatility.ok) {
+    log.push('Session: Outside active hours (London 08:00-17:00 UTC / New York 13:00-22:00 UTC) — no signals generated');
+  } else if (volatility.ok === false) {
     setupState = 'idle';
-    log.push(`Volatility filter: ${volatility.reason}`);
+    log.push('Volatility check: ' + volatility.note);
   } else {
     // ── 4. SWEEP DETECTION ──────────────────────────────────────────────
     const sweep = detectSweep(m5, levels);
 
     if (!sweep.found) {
       setupState = 'idle';
-      log.push('Sweep: none detected on M5');
+      log.push('No liquidity grab detected on current M5 data');
     } else {
       setupState = 'sweep_detected';
-      log.push(`Sweep: ${sweep.direction} sweep of ${sweep.level.label} @ $${sweep.level.price.toFixed(3)} (wick ${(sweep.wickPct*100).toFixed(1)}% of range)`);
+      log.push('Liquidity grab: ' + sweep.direction + ' — price swept ' + sweep.level.label + ' at $' + sweep.level.price.toFixed(3) + ' (wick ' + (sweep.wickPct*100).toFixed(1) + '% of candle range)');
 
       // ── 5. TIME DECAY CHECK: max 10 M5 candles for full setup ───────
       const sweepToNow = m5.length - 1 - sweep.candleIdx;
       if (sweepToNow > 10) {
         setupState = 'invalidated';
-        log.push(`Time decay: setup expired — ${sweepToNow} candles since sweep (max 10)`);
+        log.push('Setup expired: ' + sweepToNow + ' candles have passed since the liquidity grab (maximum is 10). Setup reset.');
       } else {
         // ── 6. DISPLACEMENT ───────────────────────────────────────────
         const disp = detectDisplacement(m5, sweep.candleIdx, sweep.direction);
 
         if (!disp.found) {
           setupState = 'sweep_detected';
-          log.push(`Displacement: NOT confirmed — ${disp.reason}`);
+          log.push('Strong move: not confirmed — ' + disp.reason);
         } else {
           setupState = 'displacement_confirmed';
-          log.push(`Displacement: confirmed at candle +${disp.candleIdx - sweep.candleIdx} (body ${disp.ratio}× avg)`);
+          log.push('Strong move confirmed: ' + disp.ratio + 'x average candle size, ' + (disp.candleIdx - sweep.candleIdx) + ' candle(s) after the liquidity grab' + (disp.weakGap ? ' (one weak candle gap tolerated)' : ''));
 
           // ── 7. BOS ────────────────────────────────────────────────
           const bos = detectBOS(m5, sweep.candleIdx, sweep.direction);
 
           if (!bos.found) {
             setupState = 'displacement_confirmed';
-            log.push(`BOS M5: not confirmed — ${bos.reason}`);
+            log.push('Trend shift: not confirmed — ' + bos.reason);
           } else {
             const m15bos = confirmBOS_M15(m15, sweep.direction, bos.bos_level);
             setupState = 'structure_break';
-            log.push(`BOS M5: ${bos.label}`);
-            log.push(`BOS M15: ${m15bos ? 'confirmed' : 'NOT visible — continuing (M5 confirmed)'}`);
+            log.push('Trend shift (M5): ' + bos.label);
+            log.push('Trend shift (M15): ' + (m15bos ? 'also visible on 15-minute chart' : 'not visible on 15-minute chart — M5 confirmation used'));
 
             // ── 8. PULLBACK ───────────────────────────────────────
             const pb = detectPullback(m5, disp.candleIdx, sweep.direction, sweep.sweepExtreme);
 
             if (!pb.found) {
               setupState = 'waiting_pullback';
-              log.push(`Pullback: ${pb.reason}`);
+              log.push('Pullback entry: ' + pb.reason);
             } else {
               setupState = 'entry_triggered';
-              log.push(`Pullback: ${pb.retracement}% retracement — entry at $${pb.entry.toFixed(3)}`);
+              log.push('Pullback entry confirmed: ' + pb.retracement + '% retracement — entry price $' + pb.entry.toFixed(3));
 
               // ── 9. LEVELS ─────────────────────────────────────────
               const sl   = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5);
@@ -580,15 +630,15 @@ app.get('/analyze/:sym', async (req, res) => {
 
               if (tps.rr1 < 1.5) {
                 setupState = 'invalidated';
-                log.push(`R:R: ${tps.rr1} — below minimum 1:2 — setup invalidated`);
+                log.push('Risk/Reward check: ' + tps.rr1 + ' — below the minimum 1:2 requirement. Setup not valid.');
               } else {
                 // ── 10. CONFIDENCE ────────────────────────────────
                 const confidence = calcConfidence(sessionOk, sessionOverlap, volatility.ok === true || volatility.ok === undefined, sweep, disp, bos, pb, sweep.level, sess, directionalBias, biasPenalty);
-                log.push(`Confidence: ${confidence}/100`);
+                log.push('Confidence score: ' + confidence + '/100');
 
                 if (confidence < 80) {
                   setupState = 'invalidated';
-                  log.push(`Signal NOT generated — confidence ${confidence} below threshold 80`);
+                  log.push('Signal not generated — confidence score ' + confidence + ' is below the required minimum of 80.');
                 } else {
                   // ── SIGNAL GENERATED ──────────────────────────────
                   const reasonParts = [
@@ -632,7 +682,7 @@ app.get('/analyze/:sym', async (req, res) => {
                     pullback_pct:   pb.retracement,
                     risk_dist:      parseFloat(tps.riskDist.toFixed(3))
                   };
-                  log.push(`✅ SIGNAL GENERATED — ${sweep.direction} ${sym} @ $${pb.entry.toFixed(3)}`);
+                  log.push('✅ Signal generated — ' + sweep.direction + ' ' + sym + ' at $' + pb.entry.toFixed(3));
                 }
               }
             }
@@ -658,14 +708,35 @@ app.get('/analyze/:sym', async (req, res) => {
     }
   } catch(e) {}
 
-  // Near-setup alert: generated after sweep or displacement even without full signal
+  // --- PROXIMITY + PRE-SIGNAL ALERTS ----------------------------------------
+  const approachingLevels = (levels.length && livePrice)
+    ? detectApproaching(livePrice, levels, sym)
+    : [];
+  const sweepPotentials = approachingLevels.length
+    ? detectSweepPotential(livePrice, approachingLevels, m5)
+    : [];
+
+  // Build near_setup alert based on furthest confirmed stage
   let near_setup = null;
-  if (setupState === 'sweep_detected') {
-    near_setup = { stage: 'sweep_detected', message: sweep.level ? 'Sweep of ' + sweep.level.label + ' detected — monitoring for displacement' : 'Sweep detected', direction: sweep.direction };
+  if (sweepPotentials.length && setupState === 'idle') {
+    near_setup = {
+      stage: 'approaching_liquidity',
+      message: sweepPotentials[0].message,
+      direction: sweepPotentials[0].direction,
+      level: sweepPotentials[0].level
+    };
+  } else if (setupState === 'sweep_detected') {
+    near_setup = { stage: 'sweep_detected',
+      message: (sweep.level ? 'Sweep of ' + sweep.level.label + ' confirmed' : 'Sweep confirmed') + ' - awaiting displacement',
+      direction: sweep.direction };
   } else if (setupState === 'displacement_confirmed') {
-    near_setup = { stage: 'displacement_confirmed', message: 'Displacement confirmed — awaiting BOS', direction: sweep.direction };
+    near_setup = { stage: 'displacement_confirmed',
+      message: 'Displacement confirmed (' + (disp ? disp.ratio : '?') + 'x body) - awaiting BOS',
+      direction: sweep.direction };
   } else if (setupState === 'structure_break') {
-    near_setup = { stage: 'structure_break', message: 'BOS confirmed — awaiting pullback entry', direction: sweep.direction };
+    near_setup = { stage: 'structure_break',
+      message: 'BOS confirmed - awaiting pullback entry',
+      direction: sweep.direction };
   }
 
   res.json({
@@ -680,6 +751,8 @@ app.get('/analyze/:sym', async (req, res) => {
     log,
     signal,
     near_setup,
+    approaching_levels: approachingLevels,
+    sweep_potentials: sweepPotentials,
     directional_bias: directionalBias,
     m5_candles:   m5.length,
     ratio
