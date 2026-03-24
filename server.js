@@ -43,6 +43,32 @@ const pct   = (a, b) => Math.abs(a - b) / b;            // relative distance
 const body  = c      => Math.abs(c.c - c.o);
 const range = c      => c.h - c.l;                      // always positive
 
+// --- ATR THRESHOLDS ----------------------------------------------------------
+const ATR_THRESHOLDS = {
+  XAUUSD: 0.40,   // $0.40 min ATR per M5 candle — below = thin/dead market
+  XAGUSD: 0.008   // $0.008 min ATR per M5 candle
+};
+function checkATR(sym, atrValues) {
+  if (!atrValues || atrValues.length < 5) {
+    return { ok: true, state: 'unknown', current: null, avg20: null,
+             note: 'Insufficient ATR history — proceeding' };
+  }
+  const current = atrValues[atrValues.length - 1];
+  const slice   = atrValues.slice(-20);
+  const avg20   = slice.reduce((s,v)=>s+v,0) / slice.length;
+  const minATR  = ATR_THRESHOLDS[sym] || 0.40;
+  if (isNaN(current) || current <= 0) {
+    return { ok: true, state: 'unknown', current, avg20, note: 'ATR value invalid — proceeding' };
+  }
+  if (current < minATR) {
+    return { ok: false, state: 'low_volatility', current, avg20,
+             note: 'ATR ' + current.toFixed(4) + ' below minimum ' + minATR + ' — suppressed' };
+  }
+  const atrState = current >= avg20 ? 'normal' : 'below_avg';
+  return { ok: true, state: atrState, current, avg20,
+           note: 'ATR ' + current.toFixed(4) + ' (avg ' + avg20.toFixed(4) + ') — ' + atrState };
+}
+
 // ─── SESSION ──────────────────────────────────────────────────────────────
 function sessionName(tsMs) {
   const h = new Date(tsMs).getUTCHours();
@@ -51,9 +77,16 @@ function sessionName(tsMs) {
   if (lnd && ny) return 'London+NY Overlap';
   if (lnd)       return 'London';
   if (ny)        return 'New York';
-  return null; // outside valid sessions
+  return null;
 }
-
+function sessionWeight(name) {
+  // Returns confidence bonus for session type
+  if (!name)                      return 0;
+  if (name === 'London+NY Overlap') return 10; // maximum
+  if (name === 'New York')          return 7;  // high
+  if (name === 'London')            return 5;  // medium
+  return 0;
+}
 function isActiveSession(tsMs) { return sessionName(tsMs) !== null; }
 
 // ─── LIQUIDITY LEVELS ─────────────────────────────────────────────────────
@@ -67,8 +100,8 @@ function buildLevels(m5Candles, m15Candles) {
   const ydayEnd   = todayUTC.getTime();
   const yday = m15Candles.filter(c => c.t >= ydayStart && c.t < ydayEnd);
   if (yday.length > 0) {
-    levels.push({ price: Math.max(...yday.map(c=>c.h)), type:'PDH', label:'Previous Day High' });
-    levels.push({ price: Math.min(...yday.map(c=>c.l)), type:'PDL', label:'Previous Day Low'  });
+    levels.push({ price: Math.max(...yday.map(c=>c.h)), type:'PDH', label:'Previous Day High', strength:'strong', strengthScore:3 });
+    levels.push({ price: Math.min(...yday.map(c=>c.l)), type:'PDL', label:'Previous Day Low',  strength:'strong', strengthScore:3 });
   }
 
   // Asian Session H/L — today 00:00–08:00 UTC on M15
@@ -77,8 +110,8 @@ function buildLevels(m5Candles, m15Candles) {
     return c.t >= todayUTC.getTime() && h < 8;
   });
   if (asian.length > 0) {
-    levels.push({ price: Math.max(...asian.map(c=>c.h)), type:'ASH', label:'Asian Session High' });
-    levels.push({ price: Math.min(...asian.map(c=>c.l)), type:'ASL', label:'Asian Session Low'  });
+    levels.push({ price: Math.max(...asian.map(c=>c.h)), type:'ASH', label:'Asian Session High', strength:'medium', strengthScore:2 });
+    levels.push({ price: Math.min(...asian.map(c=>c.l)), type:'ASL', label:'Asian Session Low',  strength:'medium', strengthScore:2 });
   }
 
   // Equal Highs / Lows — M5, last 20 candles, within 0.05%
@@ -96,7 +129,9 @@ function buildLevels(m5Candles, m15Candles) {
   });
   eqHighGroups.filter(g => g.length >= 2).forEach(g => {
     const avg = g.reduce((s,c)=>s+c.h,0)/g.length;
-    levels.push({ price: avg, type:'EQH', label:`Equal Highs (×${g.length})` });
+    const strength = g.length >= 4 ? 'strong' : g.length === 3 ? 'medium' : 'weak';
+    levels.push({ price: avg, type:'EQH', label:'Equal Highs (x'+g.length+')',
+                  strength, strengthScore: g.length >= 4 ? 3 : g.length === 3 ? 2 : 1, touches: g.length });
   });
 
   // Equal Lows
@@ -110,7 +145,9 @@ function buildLevels(m5Candles, m15Candles) {
   });
   eqLowGroups.filter(g => g.length >= 2).forEach(g => {
     const avg = g.reduce((s,c)=>s+c.l,0)/g.length;
-    levels.push({ price: avg, type:'EQL', label:`Equal Lows (×${g.length})` });
+    const strength = g.length >= 4 ? 'strong' : g.length === 3 ? 'medium' : 'weak';
+    levels.push({ price: avg, type:'EQL', label:'Equal Lows (x'+g.length+')',
+                  strength, strengthScore: g.length >= 4 ? 3 : g.length === 3 ? 2 : 1, touches: g.length });
   });
 
   return levels;
@@ -377,33 +414,47 @@ function checkVolatility(atrValues) {
 }
 
 // ─── CONFIDENCE SCORE ──────────────────────────────────────────────────────
-function calcConfidence(sessionOk, sessionOverlap, volatilityOk, sweep, displacement, bos, pullback) {
-  // New weighting: sweep 25, displacement 25, structure 20, pullback 20, session+vol 10
-  let score = 0;
+function calcConfidence(sessionOk, sessionOverlap, volatilityOk, sweep, displacement, bos,
+                        pullback, sweepLevel, sessionLabel, directionalBias, biasPenalty) {
   // Sweep quality (25)
+  let score = 0;
   if (sweep.found) {
-    score += sweep.wickPct >= 0.5 ? 25 : 20; // bonus for very clean wick
+    let sweepScore = sweep.wickPct >= 0.5 ? 25 : 20;
+    // Bonus for stronger liquidity zones
+    const liqScore = sweepLevel ? (sweepLevel.strengthScore || 1) : 1;
+    if (liqScore === 3) sweepScore = Math.min(sweepScore + 3, 25); // strong zone
+    if (liqScore === 1) sweepScore = Math.max(sweepScore - 2, 15); // weak zone
+    score += sweepScore;
   }
   // Displacement (25)
   if (displacement.found) {
     score += displacement.ratio >= 2.0 ? 25 : displacement.ratio >= 1.5 ? 20 : 15;
-    if (displacement.weakGap) score -= 3; // slight penalty for gap
+    if (displacement.weakGap) score -= 3;
   }
   // Structure (20)
   if (bos.found) {
-    score += bos.structure_type === 'internal' ? 20 : 15; // internal BOS scores higher
-    if (bos.method === 'wick+followthrough') score -= 2; // method B slightly lower
+    score += bos.structure_type === 'internal' ? 20 : 15;
+    if (bos.method === 'wick+followthrough') score -= 2;
   }
   // Pullback (20)
   if (pullback.found) {
     const pb = parseFloat(pullback.retracement);
-    score += (pb >= 50 && pb <= 61.8) ? 20 : 15; // ideal zone gets full score
+    score += (pb >= 50 && pb <= 61.8) ? 20 : 15;
   }
-  // Session + Volatility (10)
-  if (sessionOk)      score += 5;
-  if (sessionOverlap) score += 3; // bonus for overlap
-  if (volatilityOk)   score += 2;
-  return Math.min(score, 100);
+  // Session weighting (10 max)
+  const sessW = sessionWeight(sessionLabel);
+  score += Math.round(sessW * (10/10)); // maps 0-10 directly
+  if (!volatilityOk) score -= 5;  // ATR below average = penalty
+
+  // Directional bias adjustment (light penalty for counter-trend)
+  if (biasPenalty > 0 && sweep.found) {
+    const isCounterTrend =
+      (directionalBias === 'bearish_bias' && sweep.direction === 'BUY') ||
+      (directionalBias === 'bullish_bias' && sweep.direction === 'SELL');
+    if (isCounterTrend) score -= biasPenalty;
+  }
+
+  return Math.min(Math.max(score, 0), 100);
 }
 
 // ─── MAIN ANALYSIS ROUTE ───────────────────────────────────────────────────
@@ -446,9 +497,24 @@ app.get('/analyze/:sym', async (req, res) => {
   const levels = buildLevels(m5, m15);
 
   // ── 3. VOLATILITY FILTER ──────────────────────────────────────────────
-  const volatility = checkVolatility(atrValues);
+  const volatility = checkATR(sym, atrValues);
 
-  // ── STATE MACHINE ─────────────────────────────────────────────────────
+  // --- DIRECTIONAL BIAS -------------------------------------------------------
+  // Light filter: adjusts confidence based on price vs PDH/PDL.
+  // Does NOT block trades — only weights.
+  let directionalBias = 'neutral';
+  let biasPenalty     = 0;
+  const pdhLevel = levels.find(l => l.type === 'PDH');
+  const pdlLevel = levels.find(l => l.type === 'PDL');
+  if (pdhLevel && currentPrice > pdhLevel.price) {
+    directionalBias = 'bearish_bias';  // price above PDH = prefer shorts
+    biasPenalty = 5;
+  } else if (pdlLevel && currentPrice < pdlLevel.price) {
+    directionalBias = 'bullish_bias';  // price below PDL = prefer longs
+    biasPenalty = 5;
+  }
+
+    // ── STATE MACHINE ─────────────────────────────────────────────────────
   let setupState  = 'idle';
   let signal      = null;
   const log       = [];
@@ -517,7 +583,7 @@ app.get('/analyze/:sym', async (req, res) => {
                 log.push(`R:R: ${tps.rr1} — below minimum 1:2 — setup invalidated`);
               } else {
                 // ── 10. CONFIDENCE ────────────────────────────────
-                const confidence = calcConfidence(sessionOk, sessionOverlap, volatility.ok, sweep, disp, bos, pb);
+                const confidence = calcConfidence(sessionOk, sessionOverlap, volatility.ok === true || volatility.ok === undefined, sweep, disp, bos, pb, sweep.level, sess, directionalBias, biasPenalty);
                 log.push(`Confidence: ${confidence}/100`);
 
                 if (confidence < 80) {
@@ -592,6 +658,16 @@ app.get('/analyze/:sym', async (req, res) => {
     }
   } catch(e) {}
 
+  // Near-setup alert: generated after sweep or displacement even without full signal
+  let near_setup = null;
+  if (setupState === 'sweep_detected') {
+    near_setup = { stage: 'sweep_detected', message: sweep.level ? 'Sweep of ' + sweep.level.label + ' detected — monitoring for displacement' : 'Sweep detected', direction: sweep.direction };
+  } else if (setupState === 'displacement_confirmed') {
+    near_setup = { stage: 'displacement_confirmed', message: 'Displacement confirmed — awaiting BOS', direction: sweep.direction };
+  } else if (setupState === 'structure_break') {
+    near_setup = { stage: 'structure_break', message: 'BOS confirmed — awaiting pullback entry', direction: sweep.direction };
+  }
+
   res.json({
     success:      true,
     symbol:       sym,
@@ -603,6 +679,8 @@ app.get('/analyze/:sym', async (req, res) => {
     levels:       levels.slice(0,8),
     log,
     signal,
+    near_setup,
+    directional_bias: directionalBias,
     m5_candles:   m5.length,
     ratio
   });
