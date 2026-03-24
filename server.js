@@ -2,330 +2,576 @@ const express = require('express');
 const cors    = require('cors');
 const fetch   = require('node-fetch');
 const app     = express();
-
 app.use(cors());
 app.use(express.json());
 
 const TWELVE_KEY    = '7f3fc6ca85664930ab6e687db8ff0c5d';
 const ANTHROPIC_KEY = ['sk-ant-','api03-PSBtiCb9gNCUnpxHjEl2sqWVtfNop5DtO1WCW2pdUw_upi3Zl0VDjCT7Yyk','W9bboA3Bxnq2ucHBFyuNrNx6CL','w-qYuk4wAA'].join('');
-
 const SYMBOLS = { XAUUSD:'XAU/USD', XAGUSD:'XAG/USD' };
 
-async function td(path) {
-  const base = 'https://api.twelvedata.com';
-  const sep  = path.includes('?') ? '&' : '?';
-  const r    = await fetch(`${base}${path}${sep}apikey=${TWELVE_KEY}`, { signal: AbortSignal.timeout(9000) });
-  return r.json();
+// ─── SAFE FETCH ────────────────────────────────────────────────────────────
+async function tdFetch(path) {
+  const sep = path.includes('?') ? '&' : '?';
+  const url = `https://api.twelvedata.com${path}${sep}apikey=${TWELVE_KEY}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+  return res.json();
 }
 
-// --- Fetch OHLC time series (H1 last N candles)
-async function getCandles(sym, n = 48) {
-  try {
-    const s = SYMBOLS[sym];
-    const d = await td(`/time_series?symbol=${encodeURIComponent(s)}&interval=1h&outputsize=${n}&format=JSON`);
-    if (!d.values) return null;
-    return d.values.map(c => ({
-      t:    new Date(c.datetime + ' UTC').getTime(),
-      o:    parseFloat(c.open),
-      h:    parseFloat(c.high),
-      l:    parseFloat(c.low),
-      c:    parseFloat(c.close),
-    })).reverse(); // oldest first
-  } catch(e) { return null; }
+// ─── CANDLE FETCH ─────────────────────────────────────────────────────────
+async function getCandles(sym, interval, n) {
+  const td = SYMBOLS[sym];
+  const d  = await tdFetch(`/time_series?symbol=${encodeURIComponent(td)}&interval=${interval}&outputsize=${n}`);
+  if (!d.values || d.values.length === 0) return null;
+  return d.values.map(c => ({
+    t: new Date(c.datetime.includes('T') ? c.datetime : c.datetime + ' UTC').getTime(),
+    o: parseFloat(c.open),
+    h: parseFloat(c.high),
+    l: parseFloat(c.low),
+    c: parseFloat(c.close)
+  })).reverse(); // oldest→newest
 }
 
-// --- Fetch live price
-async function getPrice(sym) {
-  try {
-    const d = await td(`/price?symbol=${encodeURIComponent(SYMBOLS[sym])}`);
-    return parseFloat(d.price) || null;
-  } catch(e) { return null; }
+async function getATR(sym, interval, period) {
+  const td = SYMBOLS[sym];
+  const d  = await tdFetch(`/atr?symbol=${encodeURIComponent(td)}&interval=${interval}&time_period=${period}&outputsize=21`);
+  if (!d.values) return [];
+  return d.values.map(v => parseFloat(v.atr)).reverse();
 }
 
-// --- Fetch ATR
-async function getATR(sym, period = 14) {
-  try {
-    const d = await td(`/atr?symbol=${encodeURIComponent(SYMBOLS[sym])}&interval=1h&time_period=${period}&outputsize=1`);
-    if (d.values && d.values[0]) return parseFloat(d.values[0].atr);
-    return null;
-  } catch(e) { return null; }
+// ─── HELPERS ──────────────────────────────────────────────────────────────
+const pct   = (a, b) => Math.abs(a - b) / b;            // relative distance
+const body  = c      => Math.abs(c.c - c.o);
+const range = c      => c.h - c.l;                      // always positive
+
+// ─── SESSION ──────────────────────────────────────────────────────────────
+function sessionName(tsMs) {
+  const h = new Date(tsMs).getUTCHours();
+  const lnd = h >= 8  && h < 17;
+  const ny  = h >= 13 && h < 22;
+  if (lnd && ny) return 'London+NY Overlap';
+  if (lnd)       return 'London';
+  if (ny)        return 'New York';
+  return null; // outside valid sessions
 }
 
-// =====================================================
-// LIQUIDITY SWEEP ENGINE
-// =====================================================
+function isActiveSession(tsMs) { return sessionName(tsMs) !== null; }
 
-function findLiquidityLevels(candles) {
-  const n   = candles.length;
-  const lvls = [];
+// ─── LIQUIDITY LEVELS ─────────────────────────────────────────────────────
+function buildLevels(m5Candles, m15Candles) {
+  const levels = [];
+  const now = Date.now();
 
-  // Previous Day High/Low (last complete 24h)
-  const oneDayAgo = Date.now() - 86400000;
-  const yesterday = candles.filter(c => c.t < oneDayAgo);
-  if (yesterday.length > 0) {
-    const pdh = Math.max(...yesterday.map(c => c.h));
-    const pdl = Math.min(...yesterday.map(c => c.l));
-    lvls.push({ price: pdh, type: 'PDH', label: 'Prev Day High' });
-    lvls.push({ price: pdl, type: 'PDL', label: 'Prev Day Low'  });
+  // Previous Day H/L — candles from yesterday UTC date
+  const todayUTC = new Date(); todayUTC.setUTCHours(0,0,0,0);
+  const ydayStart = todayUTC.getTime() - 86400000;
+  const ydayEnd   = todayUTC.getTime();
+  const yday = m15Candles.filter(c => c.t >= ydayStart && c.t < ydayEnd);
+  if (yday.length > 0) {
+    levels.push({ price: Math.max(...yday.map(c=>c.h)), type:'PDH', label:'Previous Day High' });
+    levels.push({ price: Math.min(...yday.map(c=>c.l)), type:'PDL', label:'Previous Day Low'  });
   }
 
-  // Asian session high/low (00:00–08:00 UTC today)
-  const todayStart = new Date(); todayStart.setUTCHours(0,0,0,0);
-  const asian = candles.filter(c => {
+  // Asian Session H/L — today 00:00–08:00 UTC on M15
+  const asian = m15Candles.filter(c => {
     const h = new Date(c.t).getUTCHours();
-    return c.t >= todayStart.getTime() && h >= 0 && h < 8;
+    return c.t >= todayUTC.getTime() && h < 8;
   });
   if (asian.length > 0) {
-    lvls.push({ price: Math.max(...asian.map(c => c.h)), type: 'ASH', label: 'Asian Session High' });
-    lvls.push({ price: Math.min(...asian.map(c => c.l)), type: 'ASL', label: 'Asian Session Low'  });
+    levels.push({ price: Math.max(...asian.map(c=>c.h)), type:'ASH', label:'Asian Session High' });
+    levels.push({ price: Math.min(...asian.map(c=>c.l)), type:'ASL', label:'Asian Session Low'  });
   }
 
-  // Equal Highs / Equal Lows (within 0.12% of each other, last 20 candles)
-  const recent = candles.slice(-20);
-  const EQ_THRESHOLD = 0.0012;
-  // Equal highs
-  for (let i = 0; i < recent.length - 1; i++) {
-    for (let j = i + 1; j < recent.length; j++) {
-      const diff = Math.abs(recent[i].h - recent[j].h) / recent[i].h;
-      if (diff < EQ_THRESHOLD) {
-        lvls.push({ price: (recent[i].h + recent[j].h) / 2, type: 'EQH', label: 'Equal Highs' });
-        break;
-      }
-    }
-  }
-  // Equal lows
-  for (let i = 0; i < recent.length - 1; i++) {
-    for (let j = i + 1; j < recent.length; j++) {
-      const diff = Math.abs(recent[i].l - recent[j].l) / recent[i].l;
-      if (diff < EQ_THRESHOLD) {
-        lvls.push({ price: (recent[i].l + recent[j].l) / 2, type: 'EQL', label: 'Equal Lows' });
-        break;
-      }
-    }
-  }
+  // Equal Highs / Lows — M5, last 20 candles, within 0.05%
+  const recent20 = m5Candles.slice(-20);
+  const EQ_TOL   = 0.0005; // 0.05%
 
-  return lvls;
+  // Equal Highs
+  const eqHighGroups = [];
+  recent20.forEach((c, i) => {
+    let placed = false;
+    for (const g of eqHighGroups) {
+      if (pct(c.h, g[0].h) <= EQ_TOL) { g.push(c); placed = true; break; }
+    }
+    if (!placed) eqHighGroups.push([c]);
+  });
+  eqHighGroups.filter(g => g.length >= 2).forEach(g => {
+    const avg = g.reduce((s,c)=>s+c.h,0)/g.length;
+    levels.push({ price: avg, type:'EQH', label:`Equal Highs (×${g.length})` });
+  });
+
+  // Equal Lows
+  const eqLowGroups = [];
+  recent20.forEach(c => {
+    let placed = false;
+    for (const g of eqLowGroups) {
+      if (pct(c.l, g[0].l) <= EQ_TOL) { g.push(c); placed = true; break; }
+    }
+    if (!placed) eqLowGroups.push([c]);
+  });
+  eqLowGroups.filter(g => g.length >= 2).forEach(g => {
+    const avg = g.reduce((s,c)=>s+c.l,0)/g.length;
+    levels.push({ price: avg, type:'EQL', label:`Equal Lows (×${g.length})` });
+  });
+
+  return levels;
 }
 
+// ─── SWEEP DETECTION ──────────────────────────────────────────────────────
+// Returns: { found, candleIdx, level, direction, wickPct }
 function detectSweep(candles, levels) {
-  const sweeps = [];
-  if (candles.length < 3) return sweeps;
+  const SWEEP_BREAK  = 0.0002; // 0.02% minimum penetration
+  const WICK_MIN_PCT = 0.30;   // wick >= 30% of total range
 
-  // Look at last 3 completed candles for sweep pattern
-  for (let i = candles.length - 3; i < candles.length - 1; i++) {
-    const prev = candles[i];
-    const curr = candles[i + 1];
+  for (let i = candles.length - 6; i < candles.length; i++) {
+    if (i < 0) continue;
+    const c = candles[i];
+    const totalRange = range(c);
+    if (totalRange === 0) continue;
 
-    levels.forEach(lvl => {
+    for (const lvl of levels) {
       const p = lvl.price;
 
-      // BULLISH SWEEP: candle wicked below level then closed above
-      if (prev.l < p && prev.c > p && prev.c > prev.o) {
-        const wickSize   = p - prev.l;
-        const candleSize = Math.abs(prev.h - prev.l);
-        if (wickSize / candleSize > 0.3) { // wick is > 30% of range
-          sweeps.push({
-            direction: 'BUY',
-            level:     lvl,
-            sweepCandle: prev,
-            confirmCandle: curr,
-            sweepLow:  prev.l,
-            sweepHigh: prev.h
-          });
+      // BUY sweep: low breaks BELOW level by >= 0.02%, close BACK ABOVE
+      if (c.l < p * (1 - SWEEP_BREAK) && c.c > p) {
+        const wickSize = p - c.l;
+        if (wickSize / totalRange >= WICK_MIN_PCT) {
+          return { found: true, candleIdx: i, level: lvl, direction: 'BUY',
+                   sweepExtreme: c.l, closePrice: c.c, wickPct: wickSize/totalRange };
         }
       }
 
-      // BEARISH SWEEP: candle wicked above level then closed below
-      if (prev.h > p && prev.c < p && prev.c < prev.o) {
-        const wickSize   = prev.h - p;
-        const candleSize = Math.abs(prev.h - prev.l);
-        if (wickSize / candleSize > 0.3) {
-          sweeps.push({
-            direction: 'SELL',
-            level:     lvl,
-            sweepCandle: prev,
-            confirmCandle: curr,
-            sweepLow:  prev.l,
-            sweepHigh: prev.h
-          });
+      // SELL sweep: high breaks ABOVE level by >= 0.02%, close BACK BELOW
+      if (c.h > p * (1 + SWEEP_BREAK) && c.c < p) {
+        const wickSize = c.h - p;
+        if (wickSize / totalRange >= WICK_MIN_PCT) {
+          return { found: true, candleIdx: i, level: lvl, direction: 'SELL',
+                   sweepExtreme: c.h, closePrice: c.c, wickPct: wickSize/totalRange };
         }
       }
-    });
+    }
   }
-  return sweeps;
+  return { found: false };
 }
 
-function detectDisplacement(candles, direction, atr) {
-  if (!atr) return { valid: false, strength: 0 };
-  const recent = candles.slice(-5);
-  const avgBody = recent.reduce((s,c) => s + Math.abs(c.c - c.o), 0) / recent.length;
-  const lastCandle = candles[candles.length - 1];
-  const body = Math.abs(lastCandle.c - lastCandle.o);
+// ─── DISPLACEMENT ──────────────────────────────────────────────────────────
+// Must occur within 1–3 candles after sweep candle
+// Returns: { found, candleIdx, bodySize, avgBody }
+function detectDisplacement(candles, sweepIdx, direction) {
+  const BODY_MULT = 1.5;
+  const CLOSE_ZONE = 0.25; // top/bottom 25% of candle range
 
-  const dirOk = direction === 'BUY'
-    ? lastCandle.c > lastCandle.o
-    : lastCandle.c < lastCandle.o;
+  // Average body of last 10 candles BEFORE sweep
+  const slice = candles.slice(Math.max(0, sweepIdx - 10), sweepIdx);
+  if (slice.length < 3) return { found: false, reason: 'insufficient history' };
+  const avgBody10 = slice.reduce((s,c) => s + body(c), 0) / slice.length;
 
-  const strength = body / atr;
-  return { valid: dirOk && body > avgBody * 1.2, strength: parseFloat(strength.toFixed(2)) };
+  for (let offset = 1; offset <= 3; offset++) {
+    const idx = sweepIdx + offset;
+    if (idx >= candles.length) break;
+    const c = candles[idx];
+    const b = body(c);
+    const r = range(c);
+    if (r === 0) continue;
+
+    const bodyOk = b >= avgBody10 * BODY_MULT;
+    const dirOk  = direction === 'BUY' ? c.c > c.o : c.c < c.o;
+    // Close in top 25% (buy) or bottom 25% (sell)
+    const closeZone = direction === 'BUY'
+      ? (c.c - c.l) / r >= (1 - CLOSE_ZONE)   // close in top 25%
+      : (c.h - c.c) / r >= (1 - CLOSE_ZONE);  // close in bottom 25%
+
+    if (bodyOk && dirOk && closeZone) {
+      return { found: true, candleIdx: idx, bodySize: b, avgBody: avgBody10,
+               ratio: parseFloat((b/avgBody10).toFixed(2)),
+               impulseHigh: c.h, impulseLow: c.l };
+    }
+  }
+  return { found: false, reason: 'no qualifying displacement candle in 3 bars' };
 }
 
-function detectStructureShift(candles, direction) {
-  const n = candles.slice(-8);
-  if (n.length < 4) return false;
+// ─── MARKET STRUCTURE SHIFT (BOS) ─────────────────────────────────────────
+// BUY: find last lower-high, check break above by 0.05%
+// SELL: find last higher-low, check break below by 0.05%
+function detectBOS(candles, sweepIdx, direction) {
+  const BOS_MIN = 0.0005; // 0.05%
+  const lookback = candles.slice(Math.max(0, sweepIdx - 20), sweepIdx + 1);
 
   if (direction === 'BUY') {
-    // Look for higher low + break of prior high
-    const lows  = n.map(c => c.l);
-    const highs = n.map(c => c.h);
-    const lastHigh = highs[highs.length - 1];
-    const prevHighs = highs.slice(0, -1);
-    const higherLow = lows[lows.length-1] > lows[lows.length-3];
-    const bosHigh   = lastHigh > Math.max(...prevHighs.slice(-3));
-    return higherLow || bosHigh;
-  } else {
-    const lows  = n.map(c => c.l);
-    const highs = n.map(c => c.h);
-    const lastLow  = lows[lows.length - 1];
-    const prevLows = lows.slice(0, -1);
-    const lowerHigh = highs[highs.length-1] < highs[highs.length-3];
-    const bosLow    = lastLow < Math.min(...prevLows.slice(-3));
-    return lowerHigh || bosLow;
+    // Find last lower-high in lookback (a high lower than the previous high)
+    let lowerHigh = null;
+    for (let i = lookback.length - 2; i >= 1; i--) {
+      if (lookback[i].h < lookback[i-1].h && lookback[i].h < lookback[i+1].h) {
+        lowerHigh = lookback[i].h;
+        break;
+      }
+    }
+    if (lowerHigh === null) return { found: false, reason: 'no lower-high found' };
+
+    // Check if any candle after sweep breaks above lowerHigh by 0.05%
+    for (let i = sweepIdx + 1; i < Math.min(candles.length, sweepIdx + 10); i++) {
+      if (candles[i].c > lowerHigh * (1 + BOS_MIN)) {
+        return { found: true, bos_level: lowerHigh, bos_candle: i,
+                 label: `Break above LH $${lowerHigh.toFixed(3)}` };
+      }
+    }
+    return { found: false, reason: `no break above LH $${lowerHigh?.toFixed(3)}` };
+
+  } else { // SELL
+    let higherLow = null;
+    for (let i = lookback.length - 2; i >= 1; i--) {
+      if (lookback[i].l > lookback[i-1].l && lookback[i].l > lookback[i+1].l) {
+        higherLow = lookback[i].l;
+        break;
+      }
+    }
+    if (higherLow === null) return { found: false, reason: 'no higher-low found' };
+
+    for (let i = sweepIdx + 1; i < Math.min(candles.length, sweepIdx + 10); i++) {
+      if (candles[i].c < higherLow * (1 - BOS_MIN)) {
+        return { found: true, bos_level: higherLow, bos_candle: i,
+                 label: `Break below HL $${higherLow.toFixed(3)}` };
+      }
+    }
+    return { found: false, reason: `no break below HL $${higherLow?.toFixed(3)}` };
   }
 }
 
-function calcConfidence(sessionOk, sessionOverlap, sweep, displacement, structureShift, pullbackOk) {
+// ─── M15 BOS CONFIRMATION ─────────────────────────────────────────────────
+function confirmBOS_M15(m15Candles, direction, bos_level) {
+  if (!bos_level) return false;
+  const recent = m15Candles.slice(-10);
+  const BOS_MIN = 0.0005;
+  for (const c of recent) {
+    if (direction === 'BUY'  && c.c > bos_level * (1 + BOS_MIN)) return true;
+    if (direction === 'SELL' && c.c < bos_level * (1 - BOS_MIN)) return true;
+  }
+  return false;
+}
+
+// ─── PULLBACK ENTRY DETECTION ─────────────────────────────────────────────
+function detectPullback(candles, dispIdx, direction, sweepExtreme) {
+  const disp = candles[dispIdx];
+  if (!disp) return { found: false, reason: 'displacement candle not found' };
+
+  // Displacement range
+  const dispHigh = disp.h;
+  const dispLow  = disp.l;
+  const dispRange = dispHigh - dispLow;
+  if (dispRange === 0) return { found: false, reason: 'zero displacement range' };
+
+  // Entry zone: 50%–61.8% retracement
+  let zone_high, zone_low;
+  if (direction === 'BUY') {
+    // Price moved UP during displacement — pullback retraces DOWN
+    const retr50   = dispHigh - dispRange * 0.50;
+    const retr618  = dispHigh - dispRange * 0.618;
+    const retr70   = dispHigh - dispRange * 0.70;
+    zone_high = retr50;
+    zone_low  = retr618;
+
+    // Look for price entering zone and printing rejection
+    for (let i = dispIdx + 1; i < Math.min(candles.length, dispIdx + 8); i++) {
+      const c = candles[i];
+      if (c.l <= zone_high && c.l >= zone_low) {
+        // Price in zone — check rejection candle: closes bullish, lower wick present
+        if (c.c > c.o && (c.o - c.l) / range(c) > 0.15) {
+          if (c.l < retr70) return { found: false, reason: 'pullback exceeded 70% — setup invalidated' };
+          return { found: true, entry: c.c, zone_high, zone_low, retracement: ((dispHigh - c.l)/dispRange*100).toFixed(1) };
+        }
+      }
+      if (c.l < retr70) return { found: false, reason: 'pullback exceeded 70%' };
+    }
+    return { found: false, reason: 'no pullback into 50-61.8% zone' };
+
+  } else { // SELL
+    const retr50  = dispLow + dispRange * 0.50;
+    const retr618 = dispLow + dispRange * 0.618;
+    const retr70  = dispLow + dispRange * 0.70;
+    zone_high = retr618;
+    zone_low  = retr50;
+
+    for (let i = dispIdx + 1; i < Math.min(candles.length, dispIdx + 8); i++) {
+      const c = candles[i];
+      if (c.h >= zone_low && c.h <= zone_high) {
+        if (c.c < c.o && (c.h - c.o) / range(c) > 0.15) {
+          if (c.h > retr70) return { found: false, reason: 'pullback exceeded 70%' };
+          return { found: true, entry: c.c, zone_high, zone_low, retracement: ((c.h - dispLow)/dispRange*100).toFixed(1) };
+        }
+      }
+      if (c.h > retr70) return { found: false, reason: 'pullback exceeded 70%' };
+    }
+    return { found: false, reason: 'no pullback into 50-61.8% zone' };
+  }
+}
+
+// ─── STOP LOSS ─────────────────────────────────────────────────────────────
+function calcSL(direction, sweepExtreme, atr) {
+  const PIP_BUFFER = direction === 'BUY'
+    ? (sweepExtreme.includes('.') && sweepExtreme.toString().split('.')[1].length >= 3 ? 0.003 : 0.03) // XAU vs XAG
+    : (sweepExtreme.includes('.') && sweepExtreme.toString().split('.')[1].length >= 3 ? 0.003 : 0.03);
+
+  const atrBuffer  = atr * 0.10;
+  const buffer     = Math.max(parseFloat(PIP_BUFFER), atrBuffer);
+
+  if (direction === 'BUY')  return parseFloat((sweepExtreme - buffer).toFixed(3));
+  else                       return parseFloat((sweepExtreme + buffer).toFixed(3));
+}
+
+// ─── TAKE PROFIT ───────────────────────────────────────────────────────────
+function calcTP(direction, entry, sl, levels) {
+  const riskDist = Math.abs(entry - sl);
+  const MIN_RR   = 1.5;
+  const fallback25R = direction === 'BUY'
+    ? entry + riskDist * 2.5
+    : entry - riskDist * 2.5;
+
+  // Find nearest OPPOSING level beyond minimum RR
+  const filtered = levels
+    .filter(l => {
+      if (direction === 'BUY')  return l.price > entry && (l.price - entry) / riskDist >= MIN_RR;
+      return l.price < entry && (entry - l.price) / riskDist >= MIN_RR;
+    })
+    .sort((a,b) => direction === 'BUY' ? a.price - b.price : b.price - a.price);
+
+  const tp1 = filtered[0]  ? parseFloat(filtered[0].price.toFixed(3))  : parseFloat(fallback25R.toFixed(3));
+  const tp2 = filtered[1]  ? parseFloat(filtered[1].price.toFixed(3))  : parseFloat((direction==='BUY' ? entry + riskDist*3.5 : entry - riskDist*3.5).toFixed(3));
+  const rr1 = parseFloat(((Math.abs(tp1 - entry)) / riskDist).toFixed(2));
+
+  return { tp1, tp2, rr1, riskDist };
+}
+
+// ─── VOLATILITY FILTER ─────────────────────────────────────────────────────
+function checkVolatility(atrValues) {
+  if (!atrValues || atrValues.length < 20) return { ok: true, reason: 'insufficient ATR history, proceeding' };
+  const currentATR = atrValues[atrValues.length - 1];
+  const avg20      = atrValues.slice(-20).reduce((s,v)=>s+v,0) / 20;
+  if (currentATR < avg20) {
+    return { ok: false, reason: `ATR ${currentATR.toFixed(3)} below 20-period avg ${avg20.toFixed(3)}` };
+  }
+  return { ok: true, currentATR, avg20 };
+}
+
+// ─── CONFIDENCE SCORE ──────────────────────────────────────────────────────
+function calcConfidence(session, sweep, displacement, bos, pullback) {
   let score = 0;
-  if (!sessionOk) return 0;
-  score += sessionOverlap ? 25 : 15;
-  score += sweep ? 20 : 0;
-  score += displacement.valid ? (displacement.strength > 1.5 ? 25 : 15) : 0;
-  score += structureShift ? 20 : 0;
-  score += pullbackOk ? 10 : 0;
-  return Math.min(score, 98);
+  if (session)     score += 20; // valid session
+  if (sweep)       score += 20; // clean sweep
+  if (displacement.found) score += 20; // strong displacement
+  if (bos.found)   score += 20; // clear BOS
+  if (pullback.found) score += 20; // clean pullback
+  return score;
 }
 
-function isSession(type) {
-  const h = new Date().getUTCHours();
-  if (type === 'london') return h >= 8  && h < 17;
-  if (type === 'ny')     return h >= 13 && h < 22;
-  return (h >= 8 && h < 17) || (h >= 13 && h < 22);
-}
-
-// =====================================================
-// MAIN SIGNAL ROUTE
-// =====================================================
+// ─── MAIN ANALYSIS ROUTE ───────────────────────────────────────────────────
 app.get('/analyze/:sym', async (req, res) => {
   const sym = req.params.sym.toUpperCase();
-  if (!SYMBOLS[sym]) return res.status(400).json({ success: false, error: 'Unknown symbol' });
+  if (!SYMBOLS[sym]) return res.status(400).json({ success:false, error:'Unknown symbol' });
 
+  // ── 1. FETCH DATA ──────────────────────────────────────────────────────
+  let m5, m15, atrValues;
   try {
-    const [candles, price, atr] = await Promise.all([
-      getCandles(sym, 48),
-      getPrice(sym),
-      getATR(sym, 14)
+    [m5, m15, atrValues] = await Promise.all([
+      getCandles(sym, '5min',  120),  // ~10h of M5
+      getCandles(sym, '15min',  96),  // ~24h of M15
+      getATR(sym, '5min', 14)
     ]);
+  } catch(e) {
+    return res.json({ success:false, error:'Data fetch failed: ' + e.message });
+  }
 
-    if (!candles || candles.length < 10) {
-      return res.json({ success: false, error: 'Insufficient candle data. Market may be closed.' });
-    }
-    if (!price) return res.json({ success: false, error: 'Price unavailable.' });
+  if (!m5  || m5.length  < 30) return res.json({ success:false, error:'Insufficient M5 data. Market may be closed.' });
+  if (!m15 || m15.length < 10) return res.json({ success:false, error:'Insufficient M15 data.' });
 
-    const sessionOk      = isSession('any');
-    const sessionOverlap = isSession('london') && isSession('ny');
-    const sessionName    = isSession('london') && isSession('ny') ? 'London+NY Overlap'
-                         : isSession('london') ? 'London' : isSession('ny') ? 'New York' : 'Closed';
+  const currentPrice  = m5[m5.length-1].c;
+  const currentATR    = atrValues?.length > 0 ? atrValues[atrValues.length-1] : null;
+  const currentTS     = m5[m5.length-1].t;
+  const sess          = sessionName(currentTS);
+  const sessionOk     = sess !== null;
 
-    const levels   = findLiquidityLevels(candles);
-    const sweeps   = detectSweep(candles, levels);
+  // ── 2. LIQUIDITY LEVELS ────────────────────────────────────────────────
+  const levels = buildLevels(m5, m15);
 
-    // Current candle data
-    const lastCandle = candles[candles.length - 1];
-    const avgBody    = candles.slice(-10).reduce((s,c) => s + Math.abs(c.c - c.o), 0) / 10;
+  // ── 3. VOLATILITY FILTER ──────────────────────────────────────────────
+  const volatility = checkVolatility(atrValues);
 
-    let signal = null;
+  // ── STATE MACHINE ─────────────────────────────────────────────────────
+  let setupState  = 'idle';
+  let signal      = null;
+  const log       = [];
 
-    if (sessionOk && sweeps.length > 0) {
-      const sweep = sweeps[sweeps.length - 1]; // Most recent sweep
-      const dir   = sweep.direction;
+  if (!sessionOk) {
+    setupState = 'idle';
+    log.push(`Session: CLOSED — no signals generated outside London/NY`);
+  } else if (!volatility.ok) {
+    setupState = 'idle';
+    log.push(`Volatility filter: ${volatility.reason}`);
+  } else {
+    // ── 4. SWEEP DETECTION ──────────────────────────────────────────────
+    const sweep = detectSweep(m5, levels);
 
-      const disp   = detectDisplacement(candles, dir, atr);
-      const struct = detectStructureShift(candles, dir);
+    if (!sweep.found) {
+      setupState = 'idle';
+      log.push('Sweep: none detected on M5');
+    } else {
+      setupState = 'sweep_detected';
+      log.push(`Sweep: ${sweep.direction} sweep of ${sweep.level.label} @ $${sweep.level.price.toFixed(3)} (wick ${(sweep.wickPct*100).toFixed(1)}% of range)`);
 
-      // Pullback check: price retraced 30-70% of last move
-      const displacementRange = Math.abs(lastCandle.h - lastCandle.l);
-      const pullbackOk = displacementRange > 0 && atr > 0 && (displacementRange / atr) < 2.0;
+      // ── 5. TIME DECAY CHECK: max 10 M5 candles for full setup ───────
+      const sweepToNow = m5.length - 1 - sweep.candleIdx;
+      if (sweepToNow > 10) {
+        setupState = 'invalidated';
+        log.push(`Time decay: setup expired — ${sweepToNow} candles since sweep (max 10)`);
+      } else {
+        // ── 6. DISPLACEMENT ───────────────────────────────────────────
+        const disp = detectDisplacement(m5, sweep.candleIdx, sweep.direction);
 
-      const confidence = calcConfidence(sessionOk, sessionOverlap, sweep, disp, struct, pullbackOk);
+        if (!disp.found) {
+          setupState = 'sweep_detected';
+          log.push(`Displacement: NOT confirmed — ${disp.reason}`);
+        } else {
+          setupState = 'displacement_confirmed';
+          log.push(`Displacement: confirmed at candle +${disp.candleIdx - sweep.candleIdx} (body ${disp.ratio}× avg)`);
 
-      if (confidence >= 70) {
-        const entry = price;
-        const slDist  = Math.abs(entry - (dir === 'BUY' ? sweep.sweepLow : sweep.sweepHigh)) + (atr * 0.1);
-        const tp1Dist = slDist * 2.0;
-        const tp2Dist = slDist * 3.5;
+          // ── 7. BOS ────────────────────────────────────────────────
+          const bos = detectBOS(m5, sweep.candleIdx, sweep.direction);
 
-        const sl  = dir === 'BUY' ? parseFloat((entry - slDist).toFixed(3))  : parseFloat((entry + slDist).toFixed(3));
-        const tp1 = dir === 'BUY' ? parseFloat((entry + tp1Dist).toFixed(3)) : parseFloat((entry - tp1Dist).toFixed(3));
-        const tp2 = dir === 'BUY' ? parseFloat((entry + tp2Dist).toFixed(3)) : parseFloat((entry - tp2Dist).toFixed(3));
-        const rr  = parseFloat((tp1Dist / slDist).toFixed(2));
+          if (!bos.found) {
+            setupState = 'displacement_confirmed';
+            log.push(`BOS M5: not confirmed — ${bos.reason}`);
+          } else {
+            const m15bos = confirmBOS_M15(m15, sweep.direction, bos.bos_level);
+            setupState = 'structure_break';
+            log.push(`BOS M5: ${bos.label}`);
+            log.push(`BOS M15: ${m15bos ? 'confirmed' : 'NOT visible — continuing (M5 confirmed)'}`);
 
-        if (rr >= 2.0) {
-          const reasons = [];
-          reasons.push(`Liquidity sweep of ${sweep.level.label}`);
-          if (disp.valid) reasons.push('strong displacement candle');
-          if (struct)     reasons.push(`${dir === 'BUY' ? 'bullish' : 'bearish'} market structure shift`);
-          if (sessionOverlap) reasons.push('session overlap');
+            // ── 8. PULLBACK ───────────────────────────────────────
+            const pb = detectPullback(m5, disp.candleIdx, sweep.direction, sweep.sweepExtreme);
 
-          signal = {
-            asset:        sym,
-            direction:    dir,
-            entry:        parseFloat(entry.toFixed(3)),
-            stop_loss:    sl,
-            take_profit_1:tp1,
-            take_profit_2:tp2,
-            rr,
-            confidence,
-            session:      sessionName,
-            reason:       reasons.join(' + '),
-            setup_type:   'Liquidity Sweep Reversal',
-            sweep_level:  sweep.level.label,
-            sweep_price:  sweep.level.price,
-            displacement: disp.strength,
-            structure:    struct
-          };
+            if (!pb.found) {
+              setupState = 'waiting_pullback';
+              log.push(`Pullback: ${pb.reason}`);
+            } else {
+              setupState = 'entry_triggered';
+              log.push(`Pullback: ${pb.retracement}% retracement — entry at $${pb.entry.toFixed(3)}`);
+
+              // ── 9. LEVELS ─────────────────────────────────────────
+              const sl   = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5);
+              const tps  = calcTP(sweep.direction, pb.entry, sl, levels);
+
+              if (tps.rr1 < 1.5) {
+                setupState = 'invalidated';
+                log.push(`R:R: ${tps.rr1} — below minimum 1:2 — setup invalidated`);
+              } else {
+                // ── 10. CONFIDENCE ────────────────────────────────
+                const confidence = calcConfidence(sessionOk, sweep.found, disp, bos, pb);
+                log.push(`Confidence: ${confidence}/100`);
+
+                if (confidence < 80) {
+                  setupState = 'invalidated';
+                  log.push(`Signal NOT generated — confidence ${confidence} below threshold 80`);
+                } else {
+                  // ── SIGNAL GENERATED ──────────────────────────────
+                  const reasonParts = [
+                    `${sess} ${sweep.level.label} sweep`,
+                    `bullish displacement (${disp.ratio}× body)`,
+                    `M5${m15bos?'/M15':''} BOS`,
+                    `${pb.retracement}% pullback entry`
+                  ];
+                  if (sweep.direction === 'SELL') reasonParts[0] = reasonParts[0].replace('bullish','bearish');
+
+                  // Fetch ratio
+                  let ratio = null;
+                  try {
+                    const [xau,xag] = await Promise.all([
+                      getCandles('XAUUSD','5min',1).then(c=>c?c[0].c:null),
+                      getCandles('XAGUSD','5min',1).then(c=>c?c[0].c:null)
+                    ]);
+                    if (xau && xag) ratio = parseFloat((xau/xag).toFixed(2));
+                  } catch(e) {}
+
+                  signal = {
+                    asset:          sym,
+                    direction:      sweep.direction,
+                    entry:          parseFloat(pb.entry.toFixed(3)),
+                    stop_loss:      sl,
+                    take_profit_1:  tps.tp1,
+                    take_profit_2:  tps.tp2,
+                    rr:             tps.rr1,
+                    confidence,
+                    session:        sess,
+                    reason:         reasonParts.join(' → '),
+                    setup_type:     'Liquidity Sweep Reversal',
+                    sweep_level:    sweep.level.label,
+                    sweep_level_price: parseFloat(sweep.level.price.toFixed(3)),
+                    wick_pct:       parseFloat((sweep.wickPct*100).toFixed(1)),
+                    disp_ratio:     disp.ratio,
+                    bos_label:      bos.label,
+                    m15_bos:        m15bos,
+                    pullback_pct:   pb.retracement,
+                    risk_dist:      parseFloat(tps.riskDist.toFixed(3))
+                  };
+                  log.push(`✅ SIGNAL GENERATED — ${sweep.direction} ${sym} @ $${pb.entry.toFixed(3)}`);
+                }
+              }
+            }
+          }
         }
       }
     }
+  }
 
-    res.json({
-      success:     true,
-      symbol:      sym,
-      price,
-      atr,
-      session:     sessionName,
-      session_ok:  sessionOk,
-      levels:      levels.slice(0, 8),
-      sweep_count: sweeps.length,
-      candle_count:candles.length,
-      last_candle: lastCandle,
-      signal
-    });
+  // Fetch live price for display
+  let livePrice = currentPrice;
+  try { const p = await fetch(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(SYMBOLS[sym])}&apikey=${TWELVE_KEY}`).then(r=>r.json()); if(p.price) livePrice = parseFloat(p.price); } catch(e) {}
 
+  // Ratio
+  let ratio = null;
+  try {
+    if (sym === 'XAUUSD' || sym === 'XAGUSD') {
+      const [xa, xg] = await Promise.all([
+        fetch(`https://api.twelvedata.com/price?symbol=XAU%2FUSD&apikey=${TWELVE_KEY}`).then(r=>r.json()),
+        fetch(`https://api.twelvedata.com/price?symbol=XAG%2FUSD&apikey=${TWELVE_KEY}`).then(r=>r.json())
+      ]);
+      if (xa.price && xg.price) ratio = parseFloat((parseFloat(xa.price)/parseFloat(xg.price)).toFixed(2));
+    }
+  } catch(e) {}
+
+  res.json({
+    success:      true,
+    symbol:       sym,
+    price:        livePrice,
+    atr:          currentATR,
+    session:      sess || 'Closed',
+    session_ok:   sessionOk,
+    setup_state:  setupState,
+    levels:       levels.slice(0,8),
+    log,
+    signal,
+    m5_candles:   m5.length,
+    ratio
+  });
+});
+
+// ─── PRICES ROUTE ─────────────────────────────────────────────────────────
+app.get('/prices', async (req, res) => {
+  try {
+    const [xa, xg] = await Promise.all([
+      fetch(`https://api.twelvedata.com/price?symbol=XAU%2FUSD&apikey=${TWELVE_KEY}`).then(r=>r.json()),
+      fetch(`https://api.twelvedata.com/price?symbol=XAG%2FUSD&apikey=${TWELVE_KEY}`).then(r=>r.json())
+    ]);
+    const xau = parseFloat(xa.price)||null;
+    const xag = parseFloat(xg.price)||null;
+    res.json({ success:true, prices:{ XAUUSD:xau, XAGUSD:xag }, ratio: xau&&xag ? parseFloat((xau/xag).toFixed(2)) : null, ts: new Date().toUTCString() });
   } catch(e) {
-    console.error(e);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success:false, error:e.message });
   }
 });
 
-// Live prices only
-app.get('/prices', async (req, res) => {
-  try {
-    const [xau, xag] = await Promise.all([getPrice('XAUUSD'), getPrice('XAGUSD')]);
-    res.json({ success:true, prices:{ XAUUSD:xau, XAGUSD:xag }, ratio: xau&&xag ? parseFloat((xau/xag).toFixed(2)):null, ts: new Date().toUTCString() });
-  } catch(e) { res.status(500).json({ success:false, error:e.message }); }
-});
-
-app.get('/', (req, res) => res.json({ status:'ok', version:'3.0', engine:'Liquidity Sweep Strategy' }));
+app.get('/', (req, res) => res.json({
+  status:'ok', version:'4.0',
+  engine:'Liquidity Sweep — Pure Price Action (M5+M15)',
+  rules: ['PDH/PDL/ASH/ASL/EQH/EQL levels','0.02% sweep break required','1.5× body displacement','M5+M15 BOS','50-61.8% pullback entry','min 1:2 RR','confidence ≥ 80','10-candle time decay']
+}));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Aurum Signal Engine v3 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Aurum Signal Engine v4 — Liquidity Sweep (port ${PORT})`));
