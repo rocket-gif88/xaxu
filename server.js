@@ -455,6 +455,66 @@ function selectPrimaryZone(levels, price, sess) {
   return primary;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// UNIFIED DIRECTION FUNCTION
+// Single source of truth for zone→direction mapping.
+// Called everywhere a direction needs to be inferred from a level/zone type.
+// ═══════════════════════════════════════════════════════════════════════════
+function getZoneDirection(lvl) {
+  if (!lvl) return null;
+  const t = lvl.type || '';
+  if (t === 'EQH' || t === 'PDH' || t === 'ASH') return 'SELL';
+  if (t === 'EQL' || t === 'PDL' || t === 'ASL') return 'BUY';
+  // For manually set zoneType
+  if (lvl.zoneType === 'sell_zone') return 'SELL';
+  if (lvl.zoneType === 'buy_zone')  return 'BUY';
+  // Last resort — level already has a corrected direction
+  return lvl.direction || null;
+}
+
+// ─── GLOBAL DIRECTIONAL BIAS ─────────────────────────────────────────────────
+// Weights: BOS=+3/-3, displacement=+2/-2, sweep=+1/-1, proximity=+0.5/-0.5
+// biasScore > +1 → BUY  |  < -1 → SELL  |  -1..+1 → NEUTRAL
+// A confirmed setup direction always overrides proximity signals.
+const BIAS_WEIGHTS = { bos: 3, move: 2, sweep: 1, proximity: 0.5 };
+
+function calcGlobalBias(levels, livePrice, activeSetup) {
+  let score = 0;
+  const factors = [];
+
+  // 1. Active setup direction carries highest weight
+  if (activeSetup && activeSetup.active && !activeSetup.invalidated) {
+    const w = activeSetup.events?.trend ? BIAS_WEIGHTS.bos
+            : activeSetup.events?.move  ? BIAS_WEIGHTS.move
+            : activeSetup.events?.sweep ? BIAS_WEIGHTS.sweep
+            : 0;
+    const val = activeSetup.direction === 'BUY' ? w : -w;
+    score += val;
+    factors.push((activeSetup.direction === 'BUY' ? '+' : '') + val +
+      ' (' + activeSetup.stage + ' active)');
+  }
+
+  // 2. Price vs PDH/PDL — structural context
+  const pdh = levels.find(l => l.type === 'PDH');
+  const pdl = levels.find(l => l.type === 'PDL');
+  if (pdh && livePrice > pdh.price) {
+    score -= BIAS_WEIGHTS.proximity;
+    factors.push('-' + BIAS_WEIGHTS.proximity + ' (above PDH → bearish context)');
+  } else if (pdl && livePrice < pdl.price) {
+    score += BIAS_WEIGHTS.proximity;
+    factors.push('+' + BIAS_WEIGHTS.proximity + ' (below PDL → bullish context)');
+  }
+
+  const bias = score > 1  ? 'BUY'
+             : score < -1 ? 'SELL'
+             :               'NEUTRAL';
+
+  console.log('[bias] Score: ' + score.toFixed(1) + ' → ' + bias +
+    (factors.length ? ' (' + factors.join(', ') + ')' : ''));
+
+  return { score, bias, factors };
+}
+
 function detectSweepPotential(price, approachingLevels, candles) {
   if (!approachingLevels.length || candles.length < 4) return [];
   const alerts = [];
@@ -465,10 +525,7 @@ function detectSweepPotential(price, approachingLevels, candles) {
     // EQL = equal lows  = BUY  zone (price sweeps DOWN, reverses UP)
     // PDH/ASH           = SELL (resistance above)
     // PDL/ASL           = BUY  (support below)
-    let dir;
-    if (lvl.type === 'EQH' || lvl.type === 'PDH' || lvl.type === 'ASH') dir = 'SELL';
-    else if (lvl.type === 'EQL' || lvl.type === 'PDL' || lvl.type === 'ASL') dir = 'BUY';
-    else dir = lvl.side === 'below' ? 'BUY' : 'SELL'; // fallback
+    const dir = getZoneDirection(lvl) || (lvl.side === 'below' ? 'BUY' : 'SELL');
 
     const lvlDesc = lvl.isZone
       ? 'Primary ' + dir + ' Zone $' + parseFloat(lvl.minPrice).toFixed(2) + '–$' + parseFloat(lvl.maxPrice).toFixed(2) +
@@ -1291,13 +1348,27 @@ app.get('/analyze/:sym', async (req, res) => {
 
   // Check candle staleness — latest candle should be within 30 minutes
   const latestCandleAge = (nowUtc - m5[m5Count - 1].t) / 60000; // minutes
-  if (latestCandleAge > 30 && inSession) {
-    return res.json({ success: true, symbol: sym, price: m5[m5Count-1]?.c || null,
-      system_state: 'data_error',
-      session: sessionName(nowUtc) || 'Active',
-      session_ok: true, setup_state: 'standby',
-      levels: [], log: ['Live data temporarily unavailable — latest candle is ' + Math.round(latestCandleAge) + ' minutes old'],
-      signal: null, m5_candles: m5Count });
+  if (latestCandleAge > 30) {
+    // SLV (silver proxy) is a US ETF — trades 13:30-20:00 UTC only.
+    // After 20:00 UTC the last candle will be stale — this is expected, not an error.
+    const isSLV       = sym === 'XAGUSD'; // SLV proxy
+    const slvClosed   = isSLV && (utcHour >= 20 || utcHour < 13);
+    const staleState  = slvClosed ? 'session_closed' : 'data_error';
+    const staleMsg    = slvClosed
+      ? 'Silver market closed — SLV ETF trades 13:30–20:00 UTC. Last price: $' + m5[m5Count-1].c.toFixed(3)
+      : 'Live data temporarily unavailable — latest candle is ' + Math.round(latestCandleAge) + ' minutes old';
+    if (!slvClosed && inSession) {
+      return res.json({ success: true, symbol: sym, price: m5[m5Count-1]?.c || null,
+        system_state: staleState, session: sessionName(nowUtc) || 'Active',
+        session_ok: false, setup_state: 'standby',
+        levels: [], log: [staleMsg], signal: null, m5_candles: m5Count });
+    }
+    if (slvClosed) {
+      return res.json({ success: true, symbol: sym, price: m5[m5Count-1]?.c || null,
+        system_state: 'session_closed', session: 'Closed',
+        session_ok: false, setup_state: 'standby',
+        levels: [], log: [staleMsg], signal: null, m5_candles: m5Count });
+    }
   }
 
   // M15 low — warn but do not block
@@ -1320,20 +1391,14 @@ app.get('/analyze/:sym', async (req, res) => {
   // ── 3. VOLATILITY FILTER ──────────────────────────────────────────────
   const volatility = checkATR(sym, atrValues);
 
-  // --- DIRECTIONAL BIAS -------------------------------------------------------
-  // Light filter: adjusts confidence based on price vs PDH/PDL.
-  // Does NOT block trades — only weights.
-  let directionalBias = 'neutral';
-  let biasPenalty     = 0;
-  const pdhLevel = levels.find(l => l.type === 'PDH');
-  const pdlLevel = levels.find(l => l.type === 'PDL');
-  if (pdhLevel && currentPrice > pdhLevel.price) {
-    directionalBias = 'bearish_bias';  // price above PDH = prefer shorts
-    biasPenalty = 5;
-  } else if (pdlLevel && currentPrice < pdlLevel.price) {
-    directionalBias = 'bullish_bias';  // price below PDL = prefer longs
-    biasPenalty = 5;
-  }
+  // --- DIRECTIONAL BIAS — unified via calcGlobalBias() ----------------------
+  const analyzeGlobalBias = calcGlobalBias(levels, currentPrice, null);
+  const directionalBias   = analyzeGlobalBias.bias === 'BUY'  ? 'bullish_bias'
+                          : analyzeGlobalBias.bias === 'SELL' ? 'bearish_bias'
+                          : 'neutral';
+  const biasPenalty = Math.abs(analyzeGlobalBias.score) >= 3 ? 8
+                    : Math.abs(analyzeGlobalBias.score) >= 2 ? 5
+                    : Math.abs(analyzeGlobalBias.score) >= 1 ? 3 : 0;
 
     // ── STATE MACHINE ─────────────────────────────────────────────────────
   let setupState  = 'idle';
@@ -1585,6 +1650,8 @@ app.get('/analyze/:sym', async (req, res) => {
     zone_confidence:   pzConf,
     zone_grade:        pzGrade,
     directional_bias:  directionalBias,
+    bias_score:        analyzeGlobalBias?.score || 0,
+    bias_label:        analyzeGlobalBias?.bias  || 'NEUTRAL',
     m5_candles:   m5.length,
     ratio
   });
@@ -1956,9 +2023,7 @@ function validateSignal(sym, sweep, m5, levels, existingSetup) {
   // PDL/ASL = support below → sweep down → BUY
   if (sweep && sweep.found && sweep.level) {
     const lvlType = sweep.level.type;
-    const expectedDir = (lvlType === 'EQH' || lvlType === 'PDH' || lvlType === 'ASH') ? 'SELL'
-                      : (lvlType === 'EQL' || lvlType === 'PDL' || lvlType === 'ASL') ? 'BUY'
-                      : null;
+    const expectedDir = getZoneDirection(sweep.level);
     if (expectedDir && sweep.direction !== expectedDir) {
       reasons.push('Direction mismatch: ' + lvlType + ' zone requires ' + expectedDir +
         ' but got ' + sweep.direction);
@@ -2058,13 +2123,10 @@ function validateSignal(sym, sweep, m5, levels, existingSetup) {
 // Called after detectSweep — overrides geometry-based direction with zone-type direction
 function correctSweepDirection(sweep) {
   if (!sweep || !sweep.found || !sweep.level) return sweep;
-  const lvlType = sweep.level.type;
-  const correct  = (lvlType === 'EQH' || lvlType === 'PDH' || lvlType === 'ASH') ? 'SELL'
-                 : (lvlType === 'EQL' || lvlType === 'PDL' || lvlType === 'ASL') ? 'BUY'
-                 : sweep.direction; // no override for unknown types
+  const correct = getZoneDirection(sweep.level) || sweep.direction;
   if (correct !== sweep.direction) {
-    console.log('[validate] Direction corrected: ' + sweep.direction + ' → ' + correct +
-      ' (zone type: ' + lvlType + ')');
+    console.log('[bias] Direction corrected: ' + sweep.direction + ' → ' + correct +
+      ' (zone type: ' + sweep.level.type + ')');
   }
   return { ...sweep, direction: correct };
 }
@@ -2112,12 +2174,15 @@ async function autoScan() {
       const sessionOk  = sess !== null;
       const sessionOverlap = sess === 'London+NY Overlap';
 
-      // Directional bias
-      const pdhLevel = levels.find(l => l.type === 'PDH');
-      const pdlLevel = levels.find(l => l.type === 'PDL');
-      let directionalBias = 'neutral', biasPenalty = 0;
-      if (pdhLevel && livePrice > pdhLevel.price)      { directionalBias = 'bearish_bias'; biasPenalty = 5; }
-      else if (pdlLevel && livePrice < pdlLevel.price) { directionalBias = 'bullish_bias'; biasPenalty = 5; }
+      // Unified directional bias — single source of truth
+      const globalBias    = calcGlobalBias(levels, livePrice, setups[sym]);
+      const directionalBias = globalBias.bias === 'BUY'  ? 'bullish_bias'
+                            : globalBias.bias === 'SELL' ? 'bearish_bias'
+                            : 'neutral';
+      // Penalty increases with stronger confirmed bias
+      const biasPenalty = Math.abs(globalBias.score) >= 3 ? 8
+                        : Math.abs(globalBias.score) >= 2 ? 5
+                        : Math.abs(globalBias.score) >= 1 ? 3 : 0;
 
       const asset = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
       let setup   = setups[sym];
