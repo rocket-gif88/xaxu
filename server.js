@@ -1779,7 +1779,7 @@ function formatTelegramSignal(sig) {
   const grade  = sig.grade || (sig.confidence >= 85 ? 'A+' : 'A');
   const gradeEmoji = grade === 'A+' ? '⭐' : '✅';
   const modeLabel  = sig.entry_mode === 'AGGRESSIVE_EARLY' ? ' ⚡ EARLY'
-                   : sig.entry_mode === 'AGGRESSIVE'       ? ' 🎯 AGGRESSIVE'
+                   : sig.entry_mode === 'AGGRESSIVE'       ? ' 🎯 CONFIRMED'
                    : '';
   const alert  = sig.alert || {};
   const expiry = alert.expiry || '—';
@@ -1908,8 +1908,9 @@ function createSetup(sym, direction, levelOrZone) {
       entry:        false,
       invalidated:  false,
     },
-    startedAt:    Date.now(),
-    lastEventAt:  Date.now(),
+    startedAt:       Date.now(),
+    lastEventAt:     Date.now(),
+    earlyLockUntil:  0,   // timestamp — ignore new sweeps until this passes (post early-entry)
     // Cooldown per event type (ms) — safety net against edge-case re-triggers
     cooldowns: {}
   };
@@ -2022,8 +2023,8 @@ function aggressiveEntryEngine(sym, m5, primaryZone, sess) {
   const zoneLow    = primaryZone.minPrice;
   const zoneHigh   = primaryZone.maxPrice;
   const zoneRef    = direction === 'BUY' ? zoneLow : zoneHigh;
-  const CLOSE_TOL  = 0.001; // 0.1% tolerance for close condition
-  const SWEEP_MIN  = 0.0002; // 0.02% minimum sweep beyond zone
+  const CLOSE_TOL  = 0.001;  // 0.1% tolerance for close condition
+  const SWEEP_MIN  = 0.0005; // 0.05% minimum sweep depth — anti-fake-sweep filter
 
   // Rolling average candle size (last 20)
   const recent20 = m5.slice(-20);
@@ -2164,7 +2165,13 @@ function aggressiveEntryEngine(sym, m5, primaryZone, sess) {
                         !earlyCloseOk ? 'close not deep enough inside zone' : '?')
         };
       }
-      continue; // momentum window expired — cancel
+      // Momentum window expired — return NO_ENTRY with specific reason
+      return {
+        type:      'NO_ENTRY',
+        direction,
+        sweepCandle: i,
+        reason:    '❌ No momentum after sweep — window expired (2 candles elapsed)'
+      };
     }
 
     // ── ALL 3 CONDITIONS MET → ENTRY CONFIRMED ───────────────────
@@ -2437,7 +2444,7 @@ async function autoScan() {
         ' ' + primaryZone.priceRange + ' confidence=' + (primaryZone.confidence?.total||0));
 
       // Detect sweep from primary zone only — non-primary zones ignored
-      let sweep = detectSweep(m5, [primaryZone]); // only check primary zone
+      let sweep = detectSweep(m5, [primaryZone]); // PRIMARY ZONE ONLY — all secondary zones ignored
       if (sweep.found) sweep = correctSweepDirection(sweep);
       const sweepToNow = sweep.found ? (m5.length - 1 - sweep.candleIdx) : 999;
 
@@ -2495,6 +2502,14 @@ async function autoScan() {
           resetSetup(sym, 'New sweep on different zone');
           setup = null;
         }
+      }
+
+      // Respect early entry lock — block new setups for 2 candles after AGGRESSIVE_EARLY
+      const priorSetup = setups[sym];
+      if (priorSetup && priorSetup.earlyLockUntil && Date.now() < priorSetup.earlyLockUntil) {
+        const lockMins = Math.ceil((priorSetup.earlyLockUntil - Date.now()) / 60000);
+        console.log('[lock] ' + sym + ': early entry lock active (' + lockMins + 'min remaining) — ignoring new sweep');
+        await delay(400); continue;
       }
 
       // Validate before creating any setup
@@ -2582,15 +2597,26 @@ async function autoScan() {
       const entryResult = aggressiveEntryEngine(sym, m5, primaryZone, sess);
 
       // If engine sees no valid entry pattern at this exact moment, defer
-      // SWEEP_FORMING = engine sees sweep but momentum not yet confirmed → wait
+      // SWEEP_FORMING: sweep valid, momentum not yet confirmed — wait
       if (entryResult.type === 'SWEEP_FORMING') {
         console.log('[' + sym + '] Aggressive engine: sweep forming — ' + entryResult.reason);
         await delay(400); continue;
       }
+      // NO_ENTRY with momentum timeout — send specific invalidation once
+      if (entryResult.type === 'NO_ENTRY' && entryResult.reason?.includes('window expired') && setup) {
+        if (!setup.momentumTimeoutSent) {
+          setup.momentumTimeoutSent = true;
+          await sendTelegram('❌ <b>' + (sym === 'XAUUSD' ? 'GOLD' : 'SILVER') +
+            ' — SETUP INVALIDATED</b>\n\nNo momentum confirmed after liquidity sweep.\n' +
+            'The 2-candle window expired without confirmation.\n\n' +
+            'Watching for next opportunity.\n\n─────────────────\nAurum Signals');
+        }
+      }
       if (entryResult.type === 'NO_ENTRY') {
-        console.log('[' + sym + '] Aggressive engine: no entry pattern — ' + entryResult.reason);
-        // Don't block — fall through to standard score gate
-        // (engine adds timing precision but doesn't veto a structurally valid setup)
+        const isMomentumTimeout = entryResult.reason?.includes('expired');
+        console.log('[' + sym + '] Aggressive engine: ' +
+          (isMomentumTimeout ? '⚠ momentum timeout — ' : 'no pattern — ') + entryResult.reason);
+        // Don't block structural path — fall through to standard score gate
       }
       if (entryResult.type === 'ENTRY_READY') {
         const modeLabel = entryResult.mode === 'AGGRESSIVE_EARLY' ? 'AGGRESSIVE_EARLY' : 'AGGRESSIVE';
@@ -2682,6 +2708,11 @@ async function autoScan() {
         setTimeout(() => sentSignals.delete(sigKey), 4 * 60 * 60 * 1000);
         // Mark setup as complete — no more events
         setup.active = false;
+        // Early entry lock: if AGGRESSIVE_EARLY mode, freeze for 2 candles (10 min)
+        if (entryResult.type === 'ENTRY_READY' && entryResult.mode === 'AGGRESSIVE_EARLY') {
+          setup.earlyLockUntil = Date.now() + 10 * 60 * 1000; // 10 min = 2 × M5 candles
+          console.log('[lock] ' + sym + ': AGGRESSIVE_EARLY lock active for 10 min');
+        }
         await sendTelegram(formatTelegramSignal(rawSig));
       });
 
