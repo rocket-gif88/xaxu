@@ -204,51 +204,103 @@ function sessionWeight(name) {
 function isActiveSession(tsMs) { return sessionName(tsMs) !== null; }
 
 // ─── LIQUIDITY LEVELS ─────────────────────────────────────────────────────
+// ─── LIQUIDITY ZONE CLUSTERING ───────────────────────────────────────────────
+// Groups nearby EQH/EQL levels within CLUSTER_PCT into unified trading zones.
+// Prevents multiple overlapping levels triggering separate alerts.
+const CLUSTER_PCT = 0.0015; // 0.15% of price — groups levels within ~$6-7 at gold prices
+
+function clusterEQLevels(rawLevels, currentPrice, zoneType) {
+  // zoneType: 'EQH' (sell zones) or 'EQL' (buy zones)
+  if (!rawLevels.length) return [];
+
+  // Sort by price
+  const sorted = [...rawLevels].sort((a, b) => a.price - b.price);
+  const threshold = currentPrice * CLUSTER_PCT;
+  const clusters  = [];
+  let current     = [sorted[0]];
+
+  for (let i = 1; i < sorted.length; i++) {
+    const gap = sorted[i].price - sorted[i-1].price;
+    if (gap <= threshold) {
+      current.push(sorted[i]);
+    } else {
+      clusters.push(current);
+      current = [sorted[i]];
+    }
+  }
+  clusters.push(current);
+
+  // Merge overlapping clusters (edge case)
+  const merged = [];
+  for (const cl of clusters) {
+    const last = merged[merged.length - 1];
+    if (last && cl[0].price - last.maxPrice <= threshold) {
+      // Merge into previous cluster
+      last.levels.push(...cl);
+      last.maxPrice     = Math.max(last.maxPrice, ...cl.map(l => l.price));
+      last.minPrice     = Math.min(last.minPrice, ...cl.map(l => l.price));
+      last.totalTouches = last.levels.reduce((s, l) => s + (l.touches || 1), 0);
+      last.strengthScore= last.levels.reduce((s, l) => Math.max(s, l.strengthScore || 1), 0);
+    } else {
+      const allTouches  = cl.reduce((s, l) => s + (l.touches || 1), 0);
+      const maxStr      = cl.reduce((s, l) => Math.max(s, l.strengthScore || 1), 0);
+      const avgPrice    = cl.reduce((s, l) => s + l.price, 0) / cl.length;
+      merged.push({
+        type:          zoneType,
+        zoneType:      zoneType === 'EQH' ? 'sell_zone' : 'buy_zone',
+        price:         avgPrice,           // representative price (for sweep detection)
+        minPrice:      Math.min(...cl.map(l => l.price)),
+        maxPrice:      Math.max(...cl.map(l => l.price)),
+        totalTouches:  allTouches,
+        levelCount:    cl.length,
+        levels:        cl,
+        strengthScore: maxStr,
+        strength:      maxStr >= 3 ? 'strong' : maxStr >= 2 ? 'medium' : 'weak',
+        isZone:        true,               // flag: this is a clustered zone, not a single level
+        label:         zoneType === 'EQH'
+          ? 'Equal Highs zone (' + allTouches + ' touches)'
+          : 'Equal Lows zone ('  + allTouches + ' touches)',
+        priceRange:    parseFloat(Math.min(...cl.map(l=>l.price)).toFixed(3)) + '–' +
+                       parseFloat(Math.max(...cl.map(l=>l.price)).toFixed(3))
+      });
+    }
+  }
+  return merged;
+}
+
 function buildLevels(m5Candles, m15Candles) {
   const levels = [];
-  const now = Date.now();
-
-  // Previous Day H/L — candles from yesterday UTC date
   const todayUTC = new Date(); todayUTC.setUTCHours(0,0,0,0);
-  const ydayStart = todayUTC.getTime() - 86400000;
-  const ydayEnd   = todayUTC.getTime();
-  const yday = m15Candles.filter(c => c.t >= ydayStart && c.t < ydayEnd);
+
+  // Previous Day H/L
+  const yday = m15Candles.filter(c => c.t >= todayUTC.getTime()-86400000 && c.t < todayUTC.getTime());
   if (yday.length > 0) {
     levels.push({ price: Math.max(...yday.map(c=>c.h)), type:'PDH', label:'Previous Day High', strength:'strong', strengthScore:3 });
     levels.push({ price: Math.min(...yday.map(c=>c.l)), type:'PDL', label:'Previous Day Low',  strength:'strong', strengthScore:3 });
   }
 
-  // Asian Session H/L — today 00:00–08:00 UTC on M15
-  const asian = m15Candles.filter(c => {
-    const h = new Date(c.t).getUTCHours();
-    return c.t >= todayUTC.getTime() && h < 8;
-  });
+  // Asian Session H/L
+  const asian = m15Candles.filter(c => c.t >= todayUTC.getTime() && new Date(c.t).getUTCHours() < 8);
   if (asian.length > 0) {
     levels.push({ price: Math.max(...asian.map(c=>c.h)), type:'ASH', label:'Asian Session High', strength:'medium', strengthScore:2 });
     levels.push({ price: Math.min(...asian.map(c=>c.l)), type:'ASL', label:'Asian Session Low',  strength:'medium', strengthScore:2 });
   }
 
-  // Equal Highs / Lows — M5, last 20 candles, within 0.05%
+  // Equal Highs / Lows — detect raw groups first, then cluster into zones
   const recent20 = m5Candles.slice(-20);
-  const EQ_TOL   = 0.0005; // 0.05%
+  const EQ_TOL   = 0.0005; // 0.05% for raw grouping
 
-  // Equal Highs
+  // Detect raw EQH groups
   const eqHighGroups = [];
-  recent20.forEach((c, i) => {
+  recent20.forEach(c => {
     let placed = false;
     for (const g of eqHighGroups) {
       if (pct(c.h, g[0].h) <= EQ_TOL) { g.push(c); placed = true; break; }
     }
     if (!placed) eqHighGroups.push([c]);
   });
-  eqHighGroups.filter(g => g.length >= 2).forEach(g => {
-    const avg = g.reduce((s,c)=>s+c.h,0)/g.length;
-    const strength = g.length >= 4 ? 'strong' : g.length === 3 ? 'medium' : 'weak';
-    levels.push({ price: avg, type:'EQH', label:'Equal Highs (x'+g.length+')',
-                  strength, strengthScore: g.length >= 4 ? 3 : g.length === 3 ? 2 : 1, touches: g.length });
-  });
 
-  // Equal Lows
+  // Detect raw EQL groups
   const eqLowGroups = [];
   recent20.forEach(c => {
     let placed = false;
@@ -257,11 +309,34 @@ function buildLevels(m5Candles, m15Candles) {
     }
     if (!placed) eqLowGroups.push([c]);
   });
-  eqLowGroups.filter(g => g.length >= 2).forEach(g => {
+
+  // Build raw EQH levels (filter singles)
+  const rawEQH = eqHighGroups.filter(g => g.length >= 2).map(g => {
+    const avg = g.reduce((s,c)=>s+c.h,0)/g.length;
+    return { price: avg, type:'EQH', touches: g.length,
+             strengthScore: g.length >= 4 ? 3 : g.length === 3 ? 2 : 1 };
+  });
+
+  const rawEQL = eqLowGroups.filter(g => g.length >= 2).map(g => {
     const avg = g.reduce((s,c)=>s+c.l,0)/g.length;
-    const strength = g.length >= 4 ? 'strong' : g.length === 3 ? 'medium' : 'weak';
-    levels.push({ price: avg, type:'EQL', label:'Equal Lows (x'+g.length+')',
-                  strength, strengthScore: g.length >= 4 ? 3 : g.length === 3 ? 2 : 1, touches: g.length });
+    return { price: avg, type:'EQL', touches: g.length,
+             strengthScore: g.length >= 4 ? 3 : g.length === 3 ? 2 : 1 };
+  });
+
+  // Current price for clustering threshold
+  const currentPrice = m5Candles[m5Candles.length-1]?.c || 1;
+
+  // Cluster into zones
+  const eqhZones = clusterEQLevels(rawEQH, currentPrice, 'EQH');
+  const eqlZones = clusterEQLevels(rawEQL, currentPrice, 'EQL');
+
+  eqhZones.forEach(z => {
+    console.log('[levels] Clustered ' + z.levelCount + ' EQH levels → SELL zone ' + z.priceRange + ' (' + z.totalTouches + ' touches)');
+    levels.push(z);
+  });
+  eqlZones.forEach(z => {
+    console.log('[levels] Clustered ' + z.levelCount + ' EQL levels → BUY zone ' + z.priceRange + ' (' + z.totalTouches + ' touches)');
+    levels.push(z);
   });
 
   return levels;
@@ -275,14 +350,20 @@ function detectApproaching(price, levels, sym) {
   const threshold = APPROACH_PCT[sym] || 0.0020;
   return levels
     .map(lvl => {
-      const dist    = Math.abs(price - lvl.price);
-      const distPct = dist / lvl.price;
+      // For zones: use nearest edge. For single levels: use price.
+      const nearEdge = lvl.isZone
+        ? (price > lvl.maxPrice ? lvl.maxPrice : price < lvl.minPrice ? lvl.minPrice : price)
+        : lvl.price;
+      const dist    = Math.abs(price - nearEdge);
+      const distPct = dist / nearEdge;
+      const inside  = lvl.isZone && price >= lvl.minPrice && price <= lvl.maxPrice;
       return {
         ...lvl,
         dist:       parseFloat(dist.toFixed(4)),
         distPct:    parseFloat((distPct * 100).toFixed(3)),
-        approaching: distPct <= threshold,
-        side:       price > lvl.price ? 'above' : 'below'
+        approaching: distPct <= threshold || inside,
+        inside,
+        side:       price > nearEdge ? 'above' : 'below'
       };
     })
     .filter(l => l.approaching)
@@ -300,12 +381,15 @@ function detectSweepPotential(price, approachingLevels, candles) {
       (lvl.side === 'above' && momentum > 0);
     if (movingToward) {
       const dir = lvl.side === 'below' ? 'BUY' : 'SELL';
+      // Use zone range in message for clustered zones
+      const lvlDesc = lvl.isZone
+        ? lvl.label + ' (' + lvl.priceRange + ')' 
+        : lvl.label + ' at $' + lvl.price.toFixed(3);
       alerts.push({
         type:      'sweep_potential',
         level:     lvl,
         direction: dir,
-        message:   'Price approaching ' + lvl.label + ' at $' + lvl.price.toFixed(3) +
-                   ' (' + lvl.distPct + '% away) - potential ' + dir + ' sweep forming'
+        message:   'Price approaching ' + lvlDesc + ' (' + lvl.distPct + '% away) — potential ' + dir + ' sweep forming'
       });
     }
   }
@@ -316,7 +400,7 @@ function detectSweepPotential(price, approachingLevels, candles) {
 // Returns: { found, candleIdx, level, direction, wickPct }
 function detectSweep(candles, levels) {
   const SWEEP_BREAK  = 0.0002; // 0.02% minimum penetration
-  const WICK_MIN_PCT = 0.30;   // wick >= 30% of total range
+  const WICK_MIN_PCT = 0.30;
 
   for (let i = candles.length - 6; i < candles.length; i++) {
     if (i < 0) continue;
@@ -325,23 +409,32 @@ function detectSweep(candles, levels) {
     if (totalRange === 0) continue;
 
     for (const lvl of levels) {
+      // For zones: use minPrice/maxPrice bounds. For single levels: use price ± small buffer.
+      const isZone   = lvl.isZone === true;
+      const zoneLow  = isZone ? lvl.minPrice : lvl.price;
+      const zoneHigh = isZone ? lvl.maxPrice : lvl.price;
+      // Representative price for sweep calculations
       const p = lvl.price;
 
-      // BUY sweep: low breaks BELOW level by >= 0.02%, close BACK ABOVE
-      if (c.l < p * (1 - SWEEP_BREAK) && c.c > p) {
-        const wickSize = p - c.l;
+      // BUY sweep: candle wicks BELOW zone bottom, closes BACK ABOVE zone bottom
+      const sweepLow  = zoneLow  * (1 - SWEEP_BREAK);
+      const sweepHigh = zoneHigh * (1 + SWEEP_BREAK);
+
+      if (c.l < sweepLow && c.c > zoneLow) {
+        const wickSize = zoneLow - c.l;
         if (wickSize / totalRange >= WICK_MIN_PCT) {
           return { found: true, candleIdx: i, level: lvl, direction: 'BUY',
-                   sweepExtreme: c.l, closePrice: c.c, wickPct: wickSize/totalRange };
+                   sweepExtreme: c.l, closePrice: c.c, wickPct: wickSize/totalRange,
+                   zoneMin: zoneLow, zoneMax: zoneHigh };
         }
       }
 
-      // SELL sweep: high breaks ABOVE level by >= 0.02%, close BACK BELOW
-      if (c.h > p * (1 + SWEEP_BREAK) && c.c < p) {
-        const wickSize = c.h - p;
+      if (c.h > sweepHigh && c.c < zoneHigh) {
+        const wickSize = c.h - zoneHigh;
         if (wickSize / totalRange >= WICK_MIN_PCT) {
           return { found: true, candleIdx: i, level: lvl, direction: 'SELL',
-                   sweepExtreme: c.h, closePrice: c.c, wickPct: wickSize/totalRange };
+                   sweepExtreme: c.h, closePrice: c.c, wickPct: wickSize/totalRange,
+                   zoneMin: zoneLow, zoneMax: zoneHigh };
         }
       }
     }
@@ -607,10 +700,11 @@ function filterOpposingLiquidity(direction, entry, tp1, levels) {
     return l.price < entry && l.price > tp1;
   });
   // Strong opposing level (PDH/PDL or EQH/EQL x3+) within 30% of the move = problematic
-  const blocked = opposing.filter(l =>
-    (l.type === 'PDH' || l.type === 'PDL' || (l.strengthScore && l.strengthScore >= 2)) &&
-    Math.abs(l.price - entry) / riskDist < 0.35
-  );
+  const blocked = opposing.filter(l => {
+    const lvlPrice = l.isZone ? (direction === 'BUY' ? l.minPrice : l.maxPrice) : l.price;
+    return (l.type === 'PDH' || l.type === 'PDL' || (l.strengthScore && l.strengthScore >= 2)) &&
+           Math.abs(lvlPrice - entry) / riskDist < 0.35;
+  });
   if (blocked.length > 0)
     return { pass: false,
       reason: 'Strong opposing liquidity (' + blocked[0].label + ' @ $' + blocked[0].price.toFixed(2) + ') blocks TP1 path' };
@@ -1258,8 +1352,9 @@ app.get('/analyze/:sym', async (req, res) => {
   } catch(e) {}
 
   // --- PROXIMITY + PRE-SIGNAL ALERTS ----------------------------------------
+  // Sort zones by proximity, keep top 3 closest (reduces noise)
   const approachingLevels = (levels.length && livePrice)
-    ? detectApproaching(livePrice, levels, sym)
+    ? detectApproaching(livePrice, levels, sym).slice(0, 3)
     : [];
   const sweepPotentials = approachingLevels.length
     ? detectSweepPotential(livePrice, approachingLevels, m5)
@@ -1538,9 +1633,16 @@ const sentSignals    = new Set(); // track signal IDs already alerted
 const sentPreSignals = new Set();
 
 // Build a unique identity key for a pre-signal
-function preSignalKey(sym, stage, direction, levelPrice) {
-  const roundedLevel = levelPrice ? Math.round(parseFloat(levelPrice) * 100) / 100 : 'none';
-  return sym + '_' + stage + '_' + direction + '_' + roundedLevel;
+function preSignalKey(sym, stage, direction, levelOrZone) {
+  // For zones: key on the range (prevents duplicate alerts within same zone)
+  // For single levels: key on rounded price
+  let zoneId;
+  if (levelOrZone && levelOrZone.isZone) {
+    zoneId = Math.round(levelOrZone.minPrice) + '-' + Math.round(levelOrZone.maxPrice);
+  } else {
+    zoneId = levelOrZone ? Math.round(parseFloat(levelOrZone.price || levelOrZone) * 100) / 100 : 'none';
+  }
+  return sym + '_' + stage + '_' + direction + '_' + zoneId;
 }
 
 // Active setup tracker — max 1 per symbol at a time
@@ -1782,8 +1884,9 @@ async function autoScan() {
       // Send ONLY if: new unique setup identity (sym+stage+direction+level)
       // Never resend same stage for same setup just because time passed.
       if (near_setup && !signal) {
-        const levelPrice = near_setup.level?.price || near_setup.alert?.level?.price || null;
-        const preKey = preSignalKey(sym, near_setup.stage, near_setup.direction, levelPrice);
+        // Pass the full level/zone object so key uses zone range if applicable
+        const levelOrZone = near_setup.level || near_setup.alert?.level || null;
+        const preKey = preSignalKey(sym, near_setup.stage, near_setup.direction, levelOrZone);
         const alreadySent = sentPreSignals.has(preKey);
 
         if (!alreadySent) {
