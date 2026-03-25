@@ -525,6 +525,153 @@ function detectPullback(candles, dispIdx, direction, sweepExtreme) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SIGNAL QUALITY FILTERS — each returns { pass, reason }
+// All must pass before a full signal is generated.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// F1: DISPLACEMENT TIMING — must occur within 1-3 candles (strict), 4th only with no gap
+function filterDisplacementTiming(disp, sweepIdx) {
+  const offset = disp.candleIdx - sweepIdx;
+  if (offset <= 3) return { pass: true };
+  if (offset === 4 && !disp.weakGap)
+    return { pass: true, note: 'offset 4 — no gap, acceptable' };
+  return { pass: false,
+    reason: 'Displacement too delayed (' + offset + ' candles after sweep, max 3)' };
+}
+
+// F2: DISPLACEMENT CHOP — reject slow drifts, require clean single-candle impulse
+function filterDisplacementClean(candles, disp, avgRange) {
+  const c = candles[disp.candleIdx];
+  const b = body(c), r = range(c);
+  if (r === 0) return { pass: false, reason: 'Displacement candle has zero range' };
+  // Body must be > 60% of candle range (not a doji or long-wick chop)
+  if (b / r < 0.55)
+    return { pass: false, reason: 'Displacement body/range ' + (b/r*100).toFixed(0) + '% — too choppy (min 55%)' };
+  // Range must be >= average candle range (not a tiny move)
+  if (r < avgRange * 0.8)
+    return { pass: false, reason: 'Displacement range too small vs average' };
+  return { pass: true };
+}
+
+// F3: BOS QUALITY — close-only confirmation required; reject micro-breaks
+function filterBOSQuality(bos) {
+  // Method B (wick+followthrough) is less clean — downgrade but allow
+  // However: reject if structure_type is external AND method is wick+followthrough
+  // (weakest possible BOS — external swing + wick break = too noisy)
+  if (bos.structure_type === 'external' && bos.method === 'wick+followthrough')
+    return { pass: false,
+      reason: 'BOS too weak — external swing + wick-only break rejected' };
+  // BOS_MIN is already 0.05% in detectBOS — no additional check needed here
+  return { pass: true };
+}
+
+// F4: PULLBACK REJECTION CANDLE — must be genuine reversal, not flat
+function filterPullbackRejection(candles, disp, direction) {
+  // Find the pullback candle (most recent candle in zone)
+  // detectPullback already checks c.c > c.o (BUY) and lower wick > 15%
+  // Add: wick must be at least 20% of range AND body must be > 20% of range
+  // (rejects doji and spinning tops as pullback candles)
+  const pb = candles[disp.candleIdx + 1]; // first candle after displacement
+  if (!pb) return { pass: true }; // can't check yet
+  const b = body(pb), r = range(pb);
+  if (r === 0) return { pass: true };
+  // Not a flat/doji candle
+  if (b / r < 0.20) {
+    // Note: this is informational — detectPullback handles the real check
+    // We log but don't hard-reject here since pullback may not have formed yet
+    return { pass: true, note: 'First candle after disp is flat — pullback forming' };
+  }
+  return { pass: true };
+}
+
+// F5: OVEREXTENSION — reject if displacement already travelled > 2.5x avg range
+function filterOverextension(candles, disp, avgRange) {
+  if (!avgRange || avgRange === 0) return { pass: true };
+  const c = candles[disp.candleIdx];
+  const moveSize = range(c);
+  const ratio    = moveSize / avgRange;
+  if (ratio > 2.5)
+    return { pass: false,
+      reason: 'Move overextended — ' + ratio.toFixed(1) + 'x avg range (max 2.5x). Entry too late.' };
+  return { pass: true, extensionRatio: ratio.toFixed(2) };
+}
+
+// F6: OPPOSING LIQUIDITY — reject if strong opposing level is very close to TP1
+function filterOpposingLiquidity(direction, entry, tp1, levels) {
+  const riskDist = Math.abs(tp1 - entry);
+  if (riskDist === 0) return { pass: true };
+  // Find opposing levels between entry and TP1
+  const opposing = levels.filter(l => {
+    if (direction === 'BUY')  return l.price > entry && l.price < tp1;
+    return l.price < entry && l.price > tp1;
+  });
+  // Strong opposing level (PDH/PDL or EQH/EQL x3+) within 30% of the move = problematic
+  const blocked = opposing.filter(l =>
+    (l.type === 'PDH' || l.type === 'PDL' || (l.strengthScore && l.strengthScore >= 2)) &&
+    Math.abs(l.price - entry) / riskDist < 0.35
+  );
+  if (blocked.length > 0)
+    return { pass: false,
+      reason: 'Strong opposing liquidity (' + blocked[0].label + ' @ $' + blocked[0].price.toFixed(2) + ') blocks TP1 path' };
+  return { pass: true };
+}
+
+// F7: SESSION STRENGTH — full signals only during active London/NY
+// (Already enforced by sessionOk check, but add explicit guard here)
+function filterSessionForEntry(sess) {
+  if (!sess) return { pass: false, reason: 'No active session — entry not permitted' };
+  return { pass: true };
+}
+
+// F8: M15 DIRECTION ALIGNMENT — reject if M15 clearly contradicts trade direction
+function filterM15Alignment(m15Candles, direction) {
+  if (!m15Candles || m15Candles.length < 6) return { pass: true, note: 'Insufficient M15 data — skipping check' };
+  // Check last 3 M15 candles for clear directional contradiction
+  const recent = m15Candles.slice(-3);
+  let bullCount = 0, bearCount = 0;
+  recent.forEach(c => { if (c.c > c.o) bullCount++; else bearCount++; });
+  // If all 3 recent M15 candles oppose direction AND we are not in BOS confirmation context
+  // → hard reject
+  if (direction === 'BUY'  && bearCount === 3)
+    return { pass: false, reason: 'M15 clearly bearish (3/3 candles) — contradicts BUY direction' };
+  if (direction === 'SELL' && bullCount === 3)
+    return { pass: false, reason: 'M15 clearly bullish (3/3 candles) — contradicts SELL direction' };
+  return { pass: true, m15Bias: bullCount > bearCount ? 'bullish' : bearCount > bullCount ? 'bearish' : 'neutral' };
+}
+
+// Run all quality filters — returns { pass, failedFilter, reason, notes }
+function runQualityFilters(candles, m15Candles, sweep, disp, bos, pullback,
+                            levels, direction, entry, tp1, sess, avgRange) {
+  const notes = [];
+
+  const f1 = filterDisplacementTiming(disp, sweep.candleIdx);
+  if (!f1.pass) return { pass: false, failedFilter: 'F1_DISPLACEMENT_TIMING', reason: f1.reason };
+  if (f1.note) notes.push(f1.note);
+
+  const f2 = filterDisplacementClean(candles, disp, avgRange);
+  if (!f2.pass) return { pass: false, failedFilter: 'F2_DISPLACEMENT_CHOP', reason: f2.reason };
+
+  const f3 = filterBOSQuality(bos);
+  if (!f3.pass) return { pass: false, failedFilter: 'F3_BOS_QUALITY', reason: f3.reason };
+
+  const f5 = filterOverextension(candles, disp, avgRange);
+  if (!f5.pass) return { pass: false, failedFilter: 'F5_OVEREXTENSION', reason: f5.reason };
+  if (f5.extensionRatio) notes.push('Extension: ' + f5.extensionRatio + 'x avg range');
+
+  const f6 = filterOpposingLiquidity(direction, entry, tp1, levels);
+  if (!f6.pass) return { pass: false, failedFilter: 'F6_OPPOSING_LIQ', reason: f6.reason };
+
+  const f7 = filterSessionForEntry(sess);
+  if (!f7.pass) return { pass: false, failedFilter: 'F7_SESSION', reason: f7.reason };
+
+  const f8 = filterM15Alignment(m15Candles, direction);
+  if (!f8.pass) return { pass: false, failedFilter: 'F8_M15_ALIGN', reason: f8.reason };
+  if (f8.m15Bias) notes.push('M15 bias: ' + f8.m15Bias);
+
+  return { pass: true, notes };
+}
+
 // ─── STOP LOSS ─────────────────────────────────────────────────────────────
 function calcSL(direction, sweepExtreme, atr) {
   const PIP_BUFFER = direction === 'BUY'
@@ -1020,6 +1167,16 @@ app.get('/analyze/:sym', async (req, res) => {
                 setupState = 'invalidated';
                 log.push('Risk/Reward check: ' + tps.rr1 + ' — below the minimum 1:2 requirement. Setup not valid.');
               } else {
+                // ── QUALITY FILTERS ───────────────────────────────
+                const avgRange = candles.slice(-10).reduce((s,c) => s + range(c), 0) / 10;
+                const qf = runQualityFilters(m5, m15, sweep, disp, bos, pb,
+                  levels, sweep.direction, parseFloat(pb.entry.toFixed(3)), tps.tp1,
+                  sess, avgRange);
+                if (!qf.pass) {
+                  setupState = 'invalidated';
+                  log.push('Quality filter failed [' + qf.failedFilter + ']: ' + qf.reason);
+                } else {
+                  if (qf.notes && qf.notes.length) log.push('Quality notes: ' + qf.notes.join(' | '));
                 // ── 10. CONFIDENCE ────────────────────────────────
                 const confidence = calcConfidence(sessionOk, sessionOverlap, volatility.ok === true || volatility.ok === undefined, sweep, disp, bos, pb, sweep.level, sess, directionalBias, biasPenalty);
                 log.push('Confidence score: ' + confidence + '/100');
@@ -1164,6 +1321,7 @@ app.get('/analyze/:sym', async (req, res) => {
     m5_candles:   m5.length,
     ratio
   });
+  } // end qf.pass
 });
 
 // ─── PRICES ROUTE ─────────────────────────────────────────────────────────
@@ -1374,7 +1532,16 @@ function formatTelegramPreSignal(sym, ns) {
 // Tracks sent signals to avoid duplicate alerts.
 // ═══════════════════════════════════════════════════════════════
 const sentSignals    = new Set(); // track signal IDs already alerted
-const sentPreSignals = {};        // track pre-signal stages already alerted per symbol
+// Identity-based pre-signal dedup.
+// Key = sym_stage_direction_levelPrice (rounded to 2dp)
+// Value = true (sent) — cleared only when setup resets or progresses to new stage.
+const sentPreSignals = new Set();
+
+// Build a unique identity key for a pre-signal
+function preSignalKey(sym, stage, direction, levelPrice) {
+  const roundedLevel = levelPrice ? Math.round(parseFloat(levelPrice) * 100) / 100 : 'none';
+  return sym + '_' + stage + '_' + direction + '_' + roundedLevel;
+}
 
 // Active setup tracker — max 1 per symbol at a time
 // { XAUUSD: { direction, entry, startedAt, stage }, XAGUSD: {...} }
@@ -1408,11 +1575,12 @@ async function autoScan() {
   const inSession = (h >= 7 && h < 16) || (h >= 13 && h < 22);
 
   if (!inSession) {
-    // Clear active setups at session close
+    // Clear active setups and pre-signal dedup at session close
     for (const sym of ['XAUUSD','XAGUSD']) {
       if (activeSetups[sym]) {
+        for (const k of [...sentPreSignals]) { if (k.startsWith(sym + '_')) sentPreSignals.delete(k); }
         delete activeSetups[sym];
-        console.log('[auto-scan] Session closed — cleared active setup for ' + sym);
+        console.log('[auto-scan] Session closed — cleared active setup + pre-signal cache for ' + sym);
       }
     }
     console.log('[auto-scan] Outside session (UTC ' + h + ':xx) — skipping');
@@ -1464,6 +1632,10 @@ async function autoScan() {
 
         // Time decay invalidation
         if (ageCandles > 10) {
+          // Clear pre-signal dedup so next setup can alert fresh
+          if (active.preKey) sentPreSignals.delete(active.preKey);
+          // Also clear all pre-signal keys for this sym (belt + braces)
+          for (const k of [...sentPreSignals]) { if (k.startsWith(sym + '_')) sentPreSignals.delete(k); }
           delete activeSetups[sym];
           await sendInvalidation(sym, 'Setup expired — no entry within 10 candles (50 minutes).');
           await delay(400); continue;
@@ -1472,6 +1644,7 @@ async function autoScan() {
         // Structure break against direction
         const sweep2 = detectSweep(m5, levels);
         if (sweep2.found && sweep2.direction !== active.direction) {
+          for (const k of [...sentPreSignals]) { if (k.startsWith(sym + '_')) sentPreSignals.delete(k); }
           delete activeSetups[sym];
           await sendInvalidation(sym, 'Structure broke against trade direction. Setup cancelled.');
           await delay(400); continue;
@@ -1512,7 +1685,9 @@ async function autoScan() {
 
               if (!pb.found) {
                 if (pb.reason && pb.reason.includes('70%')) {
-                  // Pullback exceeded 70% — hard invalidation
+                  // Pullback exceeded 70% — hard invalidation, reset dedup
+                  for (const k of [...sentPreSignals]) { if (k.startsWith(sym + '_')) sentPreSignals.delete(k); }
+                  if (activeSetups[sym]) delete activeSetups[sym];
                   await sendInvalidation(sym, 'Pullback exceeded 70% retracement. Setup invalidated.');
                 } else {
                   near_setup = { stage: 'structure_break', direction: sweep.direction,
@@ -1527,6 +1702,15 @@ async function autoScan() {
                 if (tps.rr1 < 1.5) {
                   console.log('[auto-scan] ' + sym + ': R:R ' + tps.rr1 + ' below 1.5 minimum — skip');
                 } else {
+                  // ── QUALITY FILTERS ──────────────────────────────
+                  const avgRange2 = m5.slice(-10).reduce((s,c) => s + range(c), 0) / 10;
+                  const qf2 = runQualityFilters(m5, m15, sweep, disp, bos, pb,
+                    levels, sweep.direction, parseFloat(pb.entry.toFixed(3)), tps.tp1,
+                    sess, avgRange2);
+                  if (!qf2.pass) {
+                    console.log('[auto-scan] ' + sym + ': quality filter [' + qf2.failedFilter + '] — ' + qf2.reason);
+                  } else {
+                  if (qf2.notes && qf2.notes.length) console.log('[auto-scan] ' + sym + ' quality notes: ' + qf2.notes.join(' | '));
                   // ── FULL SCORING ────────────────────────────────
                   const scoreResult = scoreSetup(sess, sessionOk, sweep, disp, bos, pb,
                     volatility.ok === true || volatility.ok === undefined,
@@ -1568,6 +1752,8 @@ async function autoScan() {
         }
       }
 
+                  } // end qf2.pass else
+
       // ── SEND ALERTS ───────────────────────────────────────────
 
       if (signal) {
@@ -1576,6 +1762,8 @@ async function autoScan() {
           sentSignals.add(sigKey);
           setTimeout(() => sentSignals.delete(sigKey), 4 * 60 * 60 * 1000);
 
+          // Clear pre-signal dedup — setup completed, next setup starts fresh
+          for (const k of [...sentPreSignals]) { if (k.startsWith(sym + '_')) sentPreSignals.delete(k); }
           // Register active setup — blocks new signals for this symbol
           activeSetups[sym] = {
             direction: signal.direction,
@@ -1590,26 +1778,37 @@ async function autoScan() {
         }
       }
 
-      // Pre-signal — only send if no active setup, once per stage per hour
+      // Pre-signal — identity-based dedup
+      // Send ONLY if: new unique setup identity (sym+stage+direction+level)
+      // Never resend same stage for same setup just because time passed.
       if (near_setup && !signal) {
-        const preKey   = sym + '_' + near_setup.stage;
-        const lastSent = sentPreSignals[preKey] || 0;
-        if (Date.now() - lastSent > 60 * 60 * 1000) {
-          sentPreSignals[preKey] = Date.now();
+        const levelPrice = near_setup.level?.price || near_setup.alert?.level?.price || null;
+        const preKey = preSignalKey(sym, near_setup.stage, near_setup.direction, levelPrice);
+        const alreadySent = sentPreSignals.has(preKey);
 
-          // Track setup progression
+        if (!alreadySent) {
+          sentPreSignals.add(preKey);
+
+          // Track setup in activeSetups
           if (!activeSetups[sym]) {
             activeSetups[sym] = {
-              direction: near_setup.direction,
-              startedAt: Date.now(),
-              stage: near_setup.stage
+              direction:  near_setup.direction,
+              levelPrice: levelPrice,
+              startedAt:  Date.now(),
+              stage:      near_setup.stage,
+              preKey                        // store key so we can clear it on reset
             };
           } else {
-            activeSetups[sym].stage = near_setup.stage;
+            // Setup progressed to new stage — update stage, keep same startedAt
+            activeSetups[sym].stage  = near_setup.stage;
+            activeSetups[sym].preKey = preKey;
           }
 
-          console.log('[auto-scan] PRE-SIGNAL: ' + sym + ' ' + near_setup.stage);
+          console.log('[auto-scan] PRE-SIGNAL (new): ' + preKey);
           await sendTelegram(formatTelegramPreSignal(sym, near_setup));
+
+        } else {
+          console.log('[auto-scan] PRE-SIGNAL suppressed (already sent): ' + preKey);
         }
       }
 
