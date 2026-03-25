@@ -370,28 +370,110 @@ function detectApproaching(price, levels, sym) {
     .sort((a, b) => a.distPct - b.distPct);
 }
 
+// ── ZONE CONFIDENCE SCORING (0–100) ──────────────────────────────────────────
+// Used for pre-signal gating and UI display.
+// Separate from full signal scoreSetup() — zones don't have BOS/pullback yet.
+function scoreZone(z, price, sess) {
+  let total = 0;
+  const breakdown = {};
+
+  // A. Liquidity Strength (0–25)
+  const touches = z.totalTouches || z.touches || 1;
+  const liqScore = touches >= 8 ? 25 : touches >= 6 ? 22 : touches >= 4 ? 18
+                 : touches >= 3 ? 15 : touches >= 2 ? 10 : 5;
+  breakdown.liquidity = { score: liqScore, max: 25, touches };
+  total += liqScore;
+
+  // B. Zone Width — tighter zone = cleaner level (0–25)
+  // Narrow zone (< 0.1%) = strong, wide zone (> 0.3%) = weak
+  const zoneWidth = z.maxPrice && z.minPrice ? (z.maxPrice - z.minPrice) / z.minPrice : 0;
+  const widthScore = zoneWidth <= 0.001 ? 25 : zoneWidth <= 0.002 ? 20
+                   : zoneWidth <= 0.003 ? 15 : 10;
+  breakdown.zone_width = { score: widthScore, max: 25, widthPct: parseFloat((zoneWidth*100).toFixed(3)) };
+  total += widthScore;
+
+  // C. Proximity (0–25) — how close is price to zone
+  const nearEdge  = z.type === 'EQH' ? z.minPrice : z.maxPrice;
+  const distPct   = Math.abs(price - nearEdge) / nearEdge;
+  const inside    = price >= z.minPrice && price <= z.maxPrice;
+  const proxScore = inside ? 25 : distPct <= 0.001 ? 22 : distPct <= 0.002 ? 18
+                  : distPct <= 0.003 ? 13 : distPct <= 0.005 ? 8 : 3;
+  breakdown.proximity = { score: proxScore, max: 25, distPct: parseFloat((distPct*100).toFixed(3)), inside };
+  total += proxScore;
+
+  // D. Session Quality (0–15)
+  const sessScore = sess === 'London+NY Overlap' ? 15 : sess === 'New York' ? 10
+                  : sess === 'London' ? 10 : 0;
+  breakdown.session = { score: sessScore, max: 15, session: sess };
+  total += sessScore;
+
+  // E. Level Count Bonus (0–10) — more clustered levels = stronger confirmation
+  const levelCount = z.levelCount || 1;
+  const lvlScore   = levelCount >= 4 ? 10 : levelCount >= 3 ? 7 : levelCount >= 2 ? 4 : 0;
+  breakdown.level_count = { score: lvlScore, max: 10, levelCount };
+  total += lvlScore;
+
+  total = Math.min(Math.max(total, 0), 100);
+
+  const grade = total >= 80 ? 'HIGH' : total >= 60 ? 'MEDIUM' : total >= 40 ? 'LOW' : 'IGNORE';
+  const emoji = total >= 80 ? '🟢' : total >= 60 ? '🟡' : '🔴';
+
+  return { total, grade, emoji, breakdown };
+}
+
+// ── SELECT PRIMARY ZONE ─────────────────────────────────────────────────────
+// Scores each zone, selects highest, attaches confidence object.
+function selectPrimaryZone(levels, price, sess) {
+  const zones = levels.filter(l => l.isZone && (l.type === 'EQH' || l.type === 'EQL'));
+  if (!zones.length) return null;
+
+  const scored = zones.map(z => {
+    const direction  = z.type === 'EQH' ? 'SELL' : 'BUY';
+    const nearEdge   = z.type === 'EQH' ? z.minPrice : z.maxPrice;
+    const distPct    = Math.abs(price - nearEdge) / nearEdge;
+    const inside     = price >= z.minPrice && price <= z.maxPrice;
+    const confidence = scoreZone(z, price, sess);
+    // Selection score (for ranking only — not shown to user)
+    const selScore   = confidence.total;
+    return { ...z, direction,
+             distPct: parseFloat((distPct*100).toFixed(3)),
+             inside, confidence, score: selScore };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  const primary = scored[0];
+  console.log('[XAUUSD-like] Primary zone: ' + primary.direction +
+    ' (' + primary.priceRange + ') confidence=' + primary.confidence.total +
+    ' (' + primary.confidence.grade + ') touches=' + primary.totalTouches);
+  return primary;
+}
+
 function detectSweepPotential(price, approachingLevels, candles) {
   if (!approachingLevels.length || candles.length < 4) return [];
-  const last3    = candles.slice(-3);
-  const momentum = last3[last3.length - 1].c - last3[0].c;
-  const alerts   = [];
+  const alerts = [];
+
   for (const lvl of approachingLevels) {
-    const movingToward =
-      (lvl.side === 'below' && momentum < 0) ||
-      (lvl.side === 'above' && momentum > 0);
-    if (movingToward) {
-      const dir = lvl.side === 'below' ? 'BUY' : 'SELL';
-      // Use zone range in message for clustered zones
-      const lvlDesc = lvl.isZone
-        ? lvl.label + ' (' + lvl.priceRange + ')' 
-        : lvl.label + ' at $' + lvl.price.toFixed(3);
-      alerts.push({
-        type:      'sweep_potential',
-        level:     lvl,
-        direction: dir,
-        message:   'Price approaching ' + lvlDesc + ' (' + lvl.distPct + '% away) — potential ' + dir + ' sweep forming'
-      });
-    }
+    // Hard direction rule — never conflict
+    // EQH = equal highs = SELL zone (price sweeps UP, reverses DOWN)
+    // EQL = equal lows  = BUY  zone (price sweeps DOWN, reverses UP)
+    // PDH/ASH           = SELL (resistance above)
+    // PDL/ASL           = BUY  (support below)
+    let dir;
+    if (lvl.type === 'EQH' || lvl.type === 'PDH' || lvl.type === 'ASH') dir = 'SELL';
+    else if (lvl.type === 'EQL' || lvl.type === 'PDL' || lvl.type === 'ASL') dir = 'BUY';
+    else dir = lvl.side === 'below' ? 'BUY' : 'SELL'; // fallback
+
+    const lvlDesc = lvl.isZone
+      ? 'Primary ' + dir + ' Zone $' + parseFloat(lvl.minPrice).toFixed(2) + '–$' + parseFloat(lvl.maxPrice).toFixed(2) +
+        ' (' + lvl.totalTouches + ' touches)'
+      : lvl.label + ' at $' + lvl.price.toFixed(3);
+
+    alerts.push({
+      type:      'sweep_potential',
+      level:     { ...lvl, direction: dir }, // enforce direction on level object too
+      direction: dir,
+      message:   lvlDesc + ' (' + lvl.distPct + '% away)'
+    });
   }
   return alerts;
 }
@@ -1351,49 +1433,64 @@ app.get('/analyze/:sym', async (req, res) => {
     }
   } catch(e) {}
 
-  // --- PROXIMITY + PRE-SIGNAL ALERTS ----------------------------------------
-  // Sort zones by proximity, keep top 3 closest (reduces noise)
-  const approachingLevels = (levels.length && livePrice)
-    ? detectApproaching(livePrice, levels, sym).slice(0, 3)
-    : [];
-  const sweepPotentials = approachingLevels.length
+  // --- PRIMARY ZONE SELECTION + PRE-SIGNAL ALERTS --------------------------
+  // Select ONE primary zone — highest scored EQH/EQL cluster.
+  // All pre-signals derive from this single zone to prevent conflicting directions.
+  const primaryZone     = selectPrimaryZone(levels, livePrice, sess);
+  const approachingLevels = primaryZone
+    ? [{ ...primaryZone,
+         distPct: primaryZone.distPct,
+         isPrimary: true }]
+    : detectApproaching(livePrice, levels.filter(l => l.type !== 'EQH' && l.type !== 'EQL'), sym).slice(0, 1);
+
+  // Gate pre-signals: only generate if zone confidence >= 40 (not IGNORE)
+  const pzConf  = primaryZone?.confidence?.total || 0;
+  const pzGrade = primaryZone?.confidence?.grade || 'IGNORE';
+  const sweepPotentials = (primaryZone && pzConf >= 40 && approachingLevels.length)
     ? detectSweepPotential(livePrice, approachingLevels, m5)
     : [];
+  if (primaryZone && pzConf < 40) {
+    log.push('Zone confidence too low (' + pzConf + ') — pre-signal suppressed');
+  }
 
-  // Build near_setup alert based on furthest confirmed stage
+  // Build near_setup — always inherits direction from primary zone (no conflicts)
   let near_setup = null;
   if (sweepPotentials.length && setupState === 'idle') {
+    const sp  = sweepPotentials[0];
+    const dir = sp.direction; // direction already locked by zone type in detectSweepPotential
     near_setup = {
-      stage: 'approaching_liquidity',
-      message: sweepPotentials[0].message,
-      direction: sweepPotentials[0].direction,
-      level: sweepPotentials[0].level,
-      alert: formatPreSignalAlert('approaching_liquidity', sym, sweepPotentials[0].direction,
-               sweepPotentials[0].message, sweepPotentials[0].level, sess, directionalBias)
+      stage:       'approaching_liquidity',
+      message:     sp.message,
+      direction:   dir,
+      level:       sp.level,
+      zone_confidence: primaryZone?.confidence || null,
+      alert:       formatPreSignalAlert('approaching_liquidity', sym, dir,
+                     sp.message, sp.level, sess, directionalBias)
     };
   } else if (setupState === 'sweep_detected') {
     near_setup = {
-      stage: 'sweep_detected',
-      message: (sweep.level ? 'Sweep of ' + sweep.level.label + ' confirmed' : 'Sweep confirmed') + ' - awaiting displacement',
+      stage:     'sweep_detected',
+      message:   'Sweep of ' + (sweep.level?.label || 'key zone') + ' confirmed — awaiting strong move',
       direction: sweep.direction,
-      alert: formatPreSignalAlert('sweep_detected', sym, sweep.direction,
-               null, sweep.level, sess, directionalBias)
+      level:     sweep.level,
+      alert:     formatPreSignalAlert('sweep_detected', sym, sweep.direction,
+                   null, sweep.level, sess, directionalBias)
     };
   } else if (setupState === 'displacement_confirmed') {
     near_setup = {
-      stage: 'displacement_confirmed',
-      message: 'Displacement confirmed (' + (disp ? disp.ratio : '?') + 'x body) - awaiting BOS',
+      stage:     'displacement_confirmed',
+      message:   'Displacement confirmed (' + (disp ? disp.ratio : '?') + 'x body) — awaiting BOS',
       direction: sweep.direction,
-      alert: formatPreSignalAlert('displacement_confirmed', sym, sweep.direction,
-               null, null, sess, directionalBias)
+      alert:     formatPreSignalAlert('displacement_confirmed', sym, sweep.direction,
+                   null, null, sess, directionalBias)
     };
   } else if (setupState === 'structure_break') {
     near_setup = {
-      stage: 'structure_break',
-      message: 'BOS confirmed - awaiting pullback entry',
+      stage:     'structure_break',
+      message:   'Trend shift confirmed — awaiting pullback entry',
       direction: sweep.direction,
-      alert: formatPreSignalAlert('structure_break', sym, sweep.direction,
-               null, null, sess, directionalBias)
+      alert:     formatPreSignalAlert('structure_break', sym, sweep.direction,
+                   null, null, sess, directionalBias)
     };
   }
 
@@ -1411,8 +1508,11 @@ app.get('/analyze/:sym', async (req, res) => {
     signal,
     near_setup,
     approaching_levels: approachingLevels,
-    sweep_potentials: sweepPotentials,
-    directional_bias: directionalBias,
+    sweep_potentials:  sweepPotentials,
+    primary_zone:      primaryZone,
+    zone_confidence:   pzConf,
+    zone_grade:        pzGrade,
+    directional_bias:  directionalBias,
     m5_candles:   m5.length,
     ratio
   });
@@ -1608,11 +1708,18 @@ function formatTelegramPreSignal(sym, ns) {
   }[ns.stage] || 'SETUP FORMING';
 
   const alert = ns.alert || {};
+  // Zone confidence badge for approaching_liquidity
+  const zoneConf  = ns.zone_confidence;
+  const confLine  = zoneConf
+    ? zoneConf.emoji + ' Zone confidence: ' + zoneConf.total + '/100 (' + zoneConf.grade + ')'
+    : null;
+
   return [
     emoji + ' <b>' + asset + ' — ' + stageLabel + '</b>',
     '',
     alert.context || ns.message || '—',
     '',
+    ...(confLine ? [confLine, ''] : []),
     '⏳ ' + (alert.action || 'Monitoring. No action required yet.'),
     '',
     '─────────────────',
@@ -1626,50 +1733,126 @@ function formatTelegramPreSignal(sym, ns) {
 // Sends Telegram alerts when signals or pre-signals are detected.
 // Tracks sent signals to avoid duplicate alerts.
 // ═══════════════════════════════════════════════════════════════
-const sentSignals    = new Set(); // track signal IDs already alerted
-// Identity-based pre-signal dedup.
-// Key = sym_stage_direction_levelPrice (rounded to 2dp)
-// Value = true (sent) — cleared only when setup resets or progresses to new stage.
-const sentPreSignals = new Set();
+// ═══════════════════════════════════════════════════════════════════════════
+// SETUP STATE MACHINE
+// One state object per symbol. All alerts are event-driven (fire on transition).
+// No alert fires twice for the same event in the same setup lifecycle.
+// ═══════════════════════════════════════════════════════════════════════════
 
-// Build a unique identity key for a pre-signal
-function preSignalKey(sym, stage, direction, levelOrZone) {
-  // For zones: key on the range (prevents duplicate alerts within same zone)
-  // For single levels: key on rounded price
-  let zoneId;
-  if (levelOrZone && levelOrZone.isZone) {
-    zoneId = Math.round(levelOrZone.minPrice) + '-' + Math.round(levelOrZone.maxPrice);
-  } else {
-    zoneId = levelOrZone ? Math.round(parseFloat(levelOrZone.price || levelOrZone) * 100) / 100 : 'none';
-  }
-  return sym + '_' + stage + '_' + direction + '_' + zoneId;
+const SETUP_STAGES = ['idle','approaching','sweep','move','trend','pullback','entry'];
+
+function createSetup(sym, direction, levelOrZone) {
+  const id  = sym + '_' + Date.now();
+  const zoneId = levelOrZone && levelOrZone.isZone
+    ? Math.round(levelOrZone.minPrice) + '-' + Math.round(levelOrZone.maxPrice)
+    : levelOrZone ? Math.round(parseFloat(levelOrZone.price || 0)) : 'none';
+  const setup = {
+    id,
+    sym,
+    direction,
+    zoneId,
+    level: levelOrZone,
+    stage: 'idle',
+    active: true,
+    invalidated: false,
+    // Event fired flags — each fires exactly ONCE per setup lifecycle
+    events: {
+      approaching:  false,
+      sweep:        false,
+      move:         false,
+      trend:        false,
+      pullback:     false,
+      entry:        false,
+      invalidated:  false,
+    },
+    startedAt:    Date.now(),
+    lastEventAt:  Date.now(),
+    // Cooldown per event type (ms) — safety net against edge-case re-triggers
+    cooldowns: {}
+  };
+  console.log('[setup] Created id=' + id + ' dir=' + direction + ' zone=' + zoneId);
+  return setup;
 }
 
-// Active setup tracker — max 1 per symbol at a time
-// { XAUUSD: { direction, entry, startedAt, stage }, XAGUSD: {...} }
-const activeSetups = {};
+// Setups keyed by symbol
+const setups = { XAUUSD: null, XAGUSD: null };
+
+// Legacy compat — sentSignals dedup by entry price
+const sentSignals = new Set();
+
+// Transition: advance stage and fire alert if event not yet sent
+// Returns true if alert was sent, false if blocked
+async function fireEvent(setup, event, sym, alertFn) {
+  if (!setup || !setup.active) {
+    console.log('[' + sym + '] fireEvent ' + event + ' blocked — setup inactive');
+    return false;
+  }
+  if (setup.invalidated) {
+    console.log('[' + sym + '] fireEvent ' + event + ' blocked — setup invalidated');
+    return false;
+  }
+  if (setup.events[event]) {
+    console.log('[' + sym + '] fireEvent ' + event + ' blocked — already fired for this setup (id=' + setup.id + ')');
+    return false;
+  }
+  // 15-minute cooldown per event type as safety net
+  const COOLDOWN_MS = 15 * 60 * 1000;
+  const lastFired = setup.cooldowns[event] || 0;
+  if (Date.now() - lastFired < COOLDOWN_MS) {
+    console.log('[' + sym + '] fireEvent ' + event + ' blocked — cooldown (' +
+      Math.round((COOLDOWN_MS - (Date.now() - lastFired)) / 60000) + 'min remaining)');
+    return false;
+  }
+
+  // Fire the event
+  setup.events[event]  = true;
+  setup.stage          = event;
+  setup.lastEventAt    = Date.now();
+  setup.cooldowns[event] = Date.now();
+  console.log('[' + sym + '] ' + event + ' → alert sent (setup id=' + setup.id + ')');
+
+  try { await alertFn(); } catch(e) { console.error('[' + sym + '] alert error:', e.message); }
+  return true;
+}
+
+// Invalidate a setup — fires exactly once
+async function invalidateSetup(sym, reason) {
+  const setup = setups[sym];
+  if (!setup) return;
+  if (setup.invalidated) {
+    console.log('[' + sym + '] Duplicate invalidation blocked (id=' + setup.id + ')');
+    return;
+  }
+  if (setup.events.invalidated) {
+    console.log('[' + sym + '] Invalidation alert already sent — blocking duplicate');
+    return;
+  }
+  setup.invalidated       = true;
+  setup.active            = false;
+  setup.events.invalidated = true;
+  setup.stage             = 'invalidated';
+  console.log('[' + sym + '] Setup invalidated → alert sent once (id=' + setup.id + '): ' + reason);
+  const asset = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  await sendTelegram('⚠️ <b>' + asset + ' — SETUP INVALIDATED</b>\n\n' + reason + '\n\nWatching for next opportunity.\n\n─────────────────\nAurum Signals');
+}
+
+// Reset a symbol's setup — called when session closes or new sweep on different zone
+function resetSetup(sym, reason) {
+  const existing = setups[sym];
+  if (existing) {
+    console.log('[' + sym + '] Setup reset (id=' + existing.id + '): ' + reason);
+  }
+  setups[sym] = null;
+}
 
 // Session time remaining in minutes
 function sessionMinutesRemaining() {
   const h = new Date().getUTCHours();
   const m = new Date().getUTCMinutes();
   const nowMins = h * 60 + m;
-  // London ends 16:00, NY ends 22:00
-  const londonEnd = 16 * 60;
-  const nyEnd     = 22 * 60;
-  if (nowMins >= 7*60  && nowMins < londonEnd) return londonEnd - nowMins;
-  if (nowMins >= 13*60 && nowMins < nyEnd)      return nyEnd - nowMins;
+  if (nowMins >= 7*60  && nowMins < 16*60) return 16*60 - nowMins;
+  if (nowMins >= 13*60 && nowMins < 22*60) return 22*60 - nowMins;
   return 0;
-}
-
-// Invalidation sender
-async function sendInvalidation(sym, reason) {
-  const asset = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
-  const msg = '⚠️ <b>' + asset + ' — SETUP INVALIDATED</b>\n\n' +
-    reason + '\n\nThe setup has been cancelled. Watching for next opportunity.\n\n' +
-    '─────────────────\nAurum Signals';
-  console.log('[invalidation] ' + sym + ': ' + reason);
-  await sendTelegram(msg);
 }
 
 async function autoScan() {
@@ -1677,37 +1860,32 @@ async function autoScan() {
   const inSession = (h >= 7 && h < 16) || (h >= 13 && h < 22);
 
   if (!inSession) {
-    // Clear active setups and pre-signal dedup at session close
     for (const sym of ['XAUUSD','XAGUSD']) {
-      if (activeSetups[sym]) {
-        for (const k of [...sentPreSignals]) { if (k.startsWith(sym + '_')) sentPreSignals.delete(k); }
-        delete activeSetups[sym];
-        console.log('[auto-scan] Session closed — cleared active setup + pre-signal cache for ' + sym);
+      if (setups[sym]) {
+        resetSetup(sym, 'Session closed');
       }
     }
     console.log('[auto-scan] Outside session (UTC ' + h + ':xx) — skipping');
     return;
   }
 
-  // ── SESSION TIME REMAINING CHECK ──────────────────────────────
   const minsLeft = sessionMinutesRemaining();
   if (minsLeft < 60) {
-    console.log('[auto-scan] Less than 60 min remaining in session (' + minsLeft + 'min) — no new signals');
+    console.log('[auto-scan] <60min in session (' + minsLeft + 'min) — no new signals');
     return;
   }
 
-  console.log('[auto-scan] Running — UTC ' + h + ':' + String(new Date().getUTCMinutes()).padStart(2,'0') +
-    ' | Session: ' + minsLeft + 'min remaining');
+  console.log('[auto-scan] Scanning — UTC ' + h + ':' + String(new Date().getUTCMinutes()).padStart(2,'0') +
+    ' | ' + minsLeft + 'min remaining');
 
   const delay = ms => new Promise(r => setTimeout(r, ms));
 
-  for (const sym of ['XAUUSD', 'XAGUSD']) {
+  for (const sym of ['XAUUSD','XAGUSD']) {
     try {
       const m5 = await getCandles(sym, '5min', 120);
       if (!m5 || m5.length < 50) {
-        console.log('[auto-scan] ' + sym + ': insufficient data (' + (m5?.length||0) + ')');
-        await delay(400);
-        continue;
+        console.log('[auto-scan] ' + sym + ': insufficient data');
+        await delay(400); continue;
       }
 
       const m15        = deriveM15FromM5(m5);
@@ -1727,198 +1905,220 @@ async function autoScan() {
       if (pdhLevel && livePrice > pdhLevel.price)      { directionalBias = 'bearish_bias'; biasPenalty = 5; }
       else if (pdlLevel && livePrice < pdlLevel.price) { directionalBias = 'bullish_bias'; biasPenalty = 5; }
 
-      // ── ACTIVE SETUP: check invalidation ─────────────────────
-      const active = activeSetups[sym];
-      if (active) {
-        const ageCandles = Math.round((Date.now() - active.startedAt) / (5 * 60 * 1000));
+      const asset = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
+      let setup   = setups[sym];
 
-        // Time decay invalidation
-        if (ageCandles > 10) {
-          // Clear pre-signal dedup so next setup can alert fresh
-          if (active.preKey) sentPreSignals.delete(active.preKey);
-          // Also clear all pre-signal keys for this sym (belt + braces)
-          for (const k of [...sentPreSignals]) { if (k.startsWith(sym + '_')) sentPreSignals.delete(k); }
-          delete activeSetups[sym];
-          await sendInvalidation(sym, 'Setup expired — no entry within 10 candles (50 minutes).');
+      // ── INVALIDATION CHECKS on existing setup ──────────────────
+      if (setup && setup.active && !setup.invalidated) {
+        const ageMins = (Date.now() - setup.startedAt) / 60000;
+
+        // Time decay — 50 minutes max
+        if (ageMins > 50) {
+          await invalidateSetup(sym, 'Setup expired — no entry within 50 minutes.');
+          resetSetup(sym, 'Time decay');
           await delay(400); continue;
         }
 
-        // Structure break against direction
+        // Counter-structure: new sweep in opposite direction
         const sweep2 = detectSweep(m5, levels);
-        if (sweep2.found && sweep2.direction !== active.direction) {
-          for (const k of [...sentPreSignals]) { if (k.startsWith(sym + '_')) sentPreSignals.delete(k); }
-          delete activeSetups[sym];
-          await sendInvalidation(sym, 'Structure broke against trade direction. Setup cancelled.');
+        if (sweep2.found && sweep2.direction !== setup.direction) {
+          await invalidateSetup(sym, 'Structure broke against ' + setup.direction + ' direction.');
+          resetSetup(sym, 'Counter-structure');
           await delay(400); continue;
         }
+      }
 
-        // Already have active setup — skip new signal generation for this symbol
-        console.log('[auto-scan] ' + sym + ': active setup (' + active.stage + ', ' + ageCandles + ' candles old) — holding');
+      // ── DETECT MARKET STATE ────────────────────────────────────
+      if (!sessionOk || volatility.ok === false) {
         await delay(400); continue;
       }
 
-      // ── SIGNAL ENGINE ─────────────────────────────────────────
       const sweep = detectSweep(m5, levels);
-      let signal = null, near_setup = null;
+      const sweepToNow = sweep.found ? (m5.length - 1 - sweep.candleIdx) : 999;
 
-      if (sessionOk && volatility.ok !== false && sweep.found) {
-        const sweepToNow = m5.length - 1 - sweep.candleIdx;
+      // ── STAGE: APPROACHING ─────────────────────────────────────
+      // Fire once when price is near a key zone and no setup is active yet
+      if (!setup && !sweep.found) {
+        const approaching = levels
+          .filter(l => (l.type === 'EQH' || l.type === 'EQL' || l.type === 'PDH' || l.type === 'PDL'))
+          .map(l => {
+            const nearEdge = l.isZone
+              ? (livePrice > l.maxPrice ? l.maxPrice : livePrice < l.minPrice ? l.minPrice : livePrice)
+              : l.price;
+            const distPct = Math.abs(livePrice - nearEdge) / nearEdge;
+            return { ...l, distPct, dir: l.type === 'EQH' || l.type === 'PDH' ? 'SELL' : 'BUY' };
+          })
+          .filter(l => l.distPct <= 0.002) // within 0.2%
+          .sort((a,b) => a.distPct - b.distPct)[0];
 
-        if (sweepToNow > 10) {
-          // Time decay — sweep too old
-          console.log('[auto-scan] ' + sym + ': sweep expired (' + sweepToNow + ' candles ago)');
+        if (approaching) {
+          // Create setup for this zone, fire approaching event
+          const newSetup = createSetup(sym, approaching.dir, approaching);
+          setups[sym] = newSetup;
+          setup = newSetup;
+          const rangeStr = approaching.isZone
+            ? '$' + parseFloat(approaching.minPrice).toFixed(2) + '–$' + parseFloat(approaching.maxPrice).toFixed(2)
+            : '$' + parseFloat(approaching.price).toFixed(2);
+          await fireEvent(setup, 'approaching', sym, () => sendTelegram(
+            '📍 <b>' + asset + ' — KEY ZONE NEARBY</b>\n\n' +
+            asset + ' is approaching a ' + (approaching.dir === 'SELL' ? 'sell' : 'buy') +
+            ' zone at ' + rangeStr + '.\n\n' +
+            'If price sweeps through and reverses, a ' + approaching.dir + ' setup may form.\n\n' +
+            '⏳ No action yet — monitoring.\n\n─────────────────\nAurum Signals'
+          ));
+        }
+        await delay(400); continue;
+      }
+
+      // ── STAGE: SWEEP DETECTED ──────────────────────────────────
+      if (!sweep.found || sweepToNow > 10) {
+        await delay(400); continue;
+      }
+
+      // New sweep on a DIFFERENT zone than current setup → reset
+      if (setup && sweep.found) {
+        const newZoneId = sweep.level && sweep.level.isZone
+          ? Math.round(sweep.level.minPrice) + '-' + Math.round(sweep.level.maxPrice)
+          : Math.round(parseFloat(sweep.level?.price || 0));
+        if (setup.zoneId && setup.zoneId !== String(newZoneId)) {
+          console.log('[' + sym + '] New sweep on different zone — resetting setup');
+          resetSetup(sym, 'New sweep on different zone');
+          setup = null;
+        }
+      }
+
+      // Create setup if none exists yet
+      if (!setup) {
+        setup = createSetup(sym, sweep.direction, sweep.level);
+        setups[sym] = setup;
+      }
+
+      // Block if already invalidated
+      if (setup.invalidated) {
+        console.log('[' + sym + '] Setup invalidated — skipping signal engine');
+        await delay(400); continue;
+      }
+
+      const lvlDesc = sweep.level && sweep.level.isZone
+        ? sweep.level.label + ' (' + sweep.level.priceRange + ')'
+        : (sweep.level?.label || 'key level');
+
+      await fireEvent(setup, 'sweep', sym, () => sendTelegram(
+        '⚡ <b>' + asset + ' — LIQUIDITY GRAB DETECTED</b>\n\n' +
+        asset + ' swept ' + lvlDesc + ' and closed back inside.\n' +
+        'Direction: <b>' + sweep.direction + '</b>\n\n' +
+        '⏳ Waiting for a strong displacement candle.\n\n─────────────────\nAurum Signals'
+      ));
+
+      // ── STAGE: DISPLACEMENT (MOVE) ────────────────────────────
+      const disp = detectDisplacement(m5, sweep.candleIdx, sweep.direction);
+      if (!disp.found) {
+        console.log('[' + sym + '] Waiting for displacement');
+        await delay(400); continue;
+      }
+
+      await fireEvent(setup, 'move', sym, () => sendTelegram(
+        '↗️ <b>' + asset + ' — STRONG MOVE CONFIRMED</b>\n\n' +
+        'A ' + disp.ratio + '× displacement candle followed the liquidity grab.\n' +
+        'Direction: <b>' + sweep.direction + '</b>\n\n' +
+        '⏳ Waiting for break of structure.\n\n─────────────────\nAurum Signals'
+      ));
+
+      // ── STAGE: TREND SHIFT (BOS) ──────────────────────────────
+      const bos = detectBOS(m5, sweep.candleIdx, sweep.direction);
+      if (!bos.found) {
+        console.log('[' + sym + '] Waiting for BOS');
+        await delay(400); continue;
+      }
+
+      const m15bos = m15.length >= 8 ? confirmBOS_M15(m15, sweep.direction, bos.bos_level) : false;
+      await fireEvent(setup, 'trend', sym, () => sendTelegram(
+        '✅ <b>' + asset + ' — TREND SHIFT CONFIRMED</b>\n\n' +
+        'Break of structure confirmed on M5' + (m15bos ? '/M15' : '') + '.\n' +
+        'Direction: <b>' + sweep.direction + '</b>\n\n' +
+        '⏳ Waiting for 50–61.8% pullback into entry zone.\n\n─────────────────\nAurum Signals'
+      ));
+
+      // ── STAGE: PULLBACK ───────────────────────────────────────
+      const pb = detectPullback(m5, disp.candleIdx, sweep.direction, sweep.sweepExtreme);
+      if (!pb.found) {
+        if (pb.reason && pb.reason.includes('70%')) {
+          // 70% invalidation — fires once
+          await invalidateSetup(sym, 'Pullback exceeded 70% retracement.');
+          resetSetup(sym, 'Pullback > 70%');
         } else {
-          const disp = detectDisplacement(m5, sweep.candleIdx, sweep.direction);
-
-          if (!disp.found) {
-            near_setup = { stage: 'sweep_detected', direction: sweep.direction,
-              message: sweep.level.label + ' sweep confirmed — awaiting strong move',
-              alert: { context: 'Liquidity grab detected at ' + sweep.level.label + '. Waiting for displacement candle.' }};
-          } else {
-            const bos = detectBOS(m5, sweep.candleIdx, sweep.direction);
-
-            if (!bos.found) {
-              near_setup = { stage: 'displacement_confirmed', direction: sweep.direction,
-                message: 'Displacement confirmed (' + disp.ratio + 'x body) — awaiting trend shift',
-                alert: { context: 'Strong move confirmed. Waiting for break of structure.' }};
-            } else {
-              const m15bos = m15.length >= 8 ? confirmBOS_M15(m15, sweep.direction, bos.bos_level) : false;
-              const pb     = detectPullback(m5, disp.candleIdx, sweep.direction, sweep.sweepExtreme);
-
-              if (!pb.found) {
-                if (pb.reason && pb.reason.includes('70%')) {
-                  // Pullback exceeded 70% — hard invalidation, reset dedup
-                  for (const k of [...sentPreSignals]) { if (k.startsWith(sym + '_')) sentPreSignals.delete(k); }
-                  if (activeSetups[sym]) delete activeSetups[sym];
-                  await sendInvalidation(sym, 'Pullback exceeded 70% retracement. Setup invalidated.');
-                } else {
-                  near_setup = { stage: 'structure_break', direction: sweep.direction,
-                    message: 'Trend shift confirmed — waiting for pullback entry zone',
-                    alert: { context: 'BOS confirmed on M5' + (m15bos?'/M15':'') + '. Waiting for 50-61.8% pullback.' }};
-                }
-              } else {
-                // All conditions present — run full score
-                const sl  = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5);
-                const tps = calcTP(sweep.direction, pb.entry, sl, levels);
-
-                if (tps.rr1 < 1.5) {
-                  console.log('[auto-scan] ' + sym + ': R:R ' + tps.rr1 + ' below 1.5 minimum — skip');
-                } else {
-                  // ── QUALITY FILTERS ──────────────────────────────
-                  const avgRange2 = m5.slice(-10).reduce((s,c) => s + range(c), 0) / 10;
-                  const qf2 = runQualityFilters(m5, m15, sweep, disp, bos, pb,
-                    levels, sweep.direction, parseFloat(pb.entry.toFixed(3)), tps.tp1,
-                    sess, avgRange2);
-                  if (!qf2.pass) {
-                    console.log('[auto-scan] ' + sym + ': quality filter [' + qf2.failedFilter + '] — ' + qf2.reason);
-                  } else {
-                  if (qf2.notes && qf2.notes.length) console.log('[auto-scan] ' + sym + ' quality notes: ' + qf2.notes.join(' | '));
-                  // ── FULL SCORING ────────────────────────────────
-                  const scoreResult = scoreSetup(sess, sessionOk, sweep, disp, bos, pb,
-                    volatility.ok === true || volatility.ok === undefined,
-                    directionalBias, biasPenalty);
-
-                  console.log('[auto-scan] ' + sym + ' score: ' + scoreResult.total +
-                    ' (' + scoreResult.grade + ')' +
-                    (scoreResult.reason ? ' — ' + scoreResult.reason : ''));
-
-                  if (scoreResult.grade === 'REJECT') {
-                    // Silent discard — no alert for low-quality setups
-                  } else {
-                    // A or A+ setup — generate signal
-                    const expiryMs  = Date.now() + minsLeft * 60 * 1000;
-                    const expiryUTC = new Date(expiryMs).toUTCString().split(' ')[4] + ' UTC';
-                    const reasonParts = [
-                      sess + ' ' + sweep.level.label + ' sweep',
-                      (sweep.direction==='BUY'?'bullish':'bearish') + ' displacement (' + disp.ratio + '× body)',
-                      (m15bos?'M5/M15':'M5') + ' BOS',
-                      pb.retracement + '% pullback entry'
-                    ];
-                    const rawSig = {
-                      id: Date.now(), asset: sym, direction: sweep.direction,
-                      entry: parseFloat(pb.entry.toFixed(3)),
-                      stop_loss: sl, take_profit_1: tps.tp1, take_profit_2: tps.tp2,
-                      rr: tps.rr1, confidence: scoreResult.total,
-                      grade: scoreResult.grade, scoreBreakdown: scoreResult.breakdown,
-                      session: sess, reason: reasonParts.join(' → '),
-                      sweep_level: sweep.level.label, pullback_pct: pb.retracement,
-                      directional_bias: directionalBias, expiry: expiryUTC
-                    };
-                    rawSig.alert = formatSignalAlert(rawSig, currentATR);
-                    signal = rawSig;
-                  }
-                }
-              }
-            }
-          }
+          console.log('[' + sym + '] Waiting for pullback');
         }
+        await delay(400); continue;
       }
 
-                  } // end qf2.pass else
+      await fireEvent(setup, 'pullback', sym, () => sendTelegram(
+        '🎯 <b>' + asset + ' — PULLBACK INTO ENTRY ZONE</b>\n\n' +
+        'Price pulled back ' + pb.retracement + '% into the entry zone.\n' +
+        'Preparing to evaluate full signal.\n\n' +
+        '⏳ Running quality checks...\n\n─────────────────\nAurum Signals'
+      ));
 
-      // ── SEND ALERTS ───────────────────────────────────────────
+      // ── STAGE: ENTRY SIGNAL ───────────────────────────────────
+      const sl  = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5);
+      const tps = calcTP(sweep.direction, pb.entry, sl, levels);
 
-      if (signal) {
-        const sigKey = sym + '_' + signal.direction + '_' + signal.entry;
-        if (!sentSignals.has(sigKey)) {
-          sentSignals.add(sigKey);
-          setTimeout(() => sentSignals.delete(sigKey), 4 * 60 * 60 * 1000);
-
-          // Clear pre-signal dedup — setup completed, next setup starts fresh
-          for (const k of [...sentPreSignals]) { if (k.startsWith(sym + '_')) sentPreSignals.delete(k); }
-          // Register active setup — blocks new signals for this symbol
-          activeSetups[sym] = {
-            direction: signal.direction,
-            entry: signal.entry,
-            startedAt: Date.now(),
-            stage: 'entry_triggered'
-          };
-
-          console.log('[auto-scan] ' + signal.grade + ' SIGNAL: ' + sym + ' ' +
-            signal.direction + ' @ ' + signal.entry + ' (score ' + signal.confidence + ')');
-          await sendTelegram(formatTelegramSignal(signal));
-        }
+      if (tps.rr1 < 1.5) {
+        console.log('[' + sym + '] R:R ' + tps.rr1 + ' below minimum — no signal');
+        await delay(400); continue;
       }
 
-      // Pre-signal — identity-based dedup
-      // Send ONLY if: new unique setup identity (sym+stage+direction+level)
-      // Never resend same stage for same setup just because time passed.
-      if (near_setup && !signal) {
-        // Pass the full level/zone object so key uses zone range if applicable
-        const levelOrZone = near_setup.level || near_setup.alert?.level || null;
-        const preKey = preSignalKey(sym, near_setup.stage, near_setup.direction, levelOrZone);
-        const alreadySent = sentPreSignals.has(preKey);
-
-        if (!alreadySent) {
-          sentPreSignals.add(preKey);
-
-          // Track setup in activeSetups
-          if (!activeSetups[sym]) {
-            activeSetups[sym] = {
-              direction:  near_setup.direction,
-              levelPrice: levelPrice,
-              startedAt:  Date.now(),
-              stage:      near_setup.stage,
-              preKey                        // store key so we can clear it on reset
-            };
-          } else {
-            // Setup progressed to new stage — update stage, keep same startedAt
-            activeSetups[sym].stage  = near_setup.stage;
-            activeSetups[sym].preKey = preKey;
-          }
-
-          console.log('[auto-scan] PRE-SIGNAL (new): ' + preKey);
-          await sendTelegram(formatTelegramPreSignal(sym, near_setup));
-
-        } else {
-          console.log('[auto-scan] PRE-SIGNAL suppressed (already sent): ' + preKey);
-        }
+      const avgRange = m5.slice(-10).reduce((s,c) => s + range(c), 0) / 10;
+      const qf = runQualityFilters(m5, m15, sweep, disp, bos, pb,
+        levels, sweep.direction, parseFloat(pb.entry.toFixed(3)), tps.tp1, sess, avgRange);
+      if (!qf.pass) {
+        console.log('[' + sym + '] Quality filter [' + qf.failedFilter + ']: ' + qf.reason);
+        await delay(400); continue;
       }
+
+      const scoreResult = scoreSetup(sess, sessionOk, sweep, disp, bos, pb,
+        volatility.ok === true || volatility.ok === undefined, directionalBias, biasPenalty);
+
+      console.log('[' + sym + '] Score: ' + scoreResult.total + ' (' + scoreResult.grade + ')');
+
+      if (scoreResult.grade === 'REJECT') {
+        console.log('[' + sym + '] Score below threshold — no signal');
+        await delay(400); continue;
+      }
+
+      // ── GENERATE FULL SIGNAL ──────────────────────────────────
+      const sigKey = sym + '_' + sweep.direction + '_' + parseFloat(pb.entry.toFixed(2));
+      if (sentSignals.has(sigKey)) {
+        console.log('[' + sym + '] Signal already sent for this entry — blocked');
+        await delay(400); continue;
+      }
+
+      const expiryUTC = new Date(Date.now() + minsLeft * 60000).toUTCString().split(' ')[4] + ' UTC';
+      const rawSig = {
+        id: Date.now(), asset: sym, direction: sweep.direction,
+        entry: parseFloat(pb.entry.toFixed(3)),
+        stop_loss: sl, take_profit_1: tps.tp1, take_profit_2: tps.tp2,
+        rr: tps.rr1, confidence: scoreResult.total,
+        grade: scoreResult.grade, scoreBreakdown: scoreResult.breakdown,
+        session: sess, directional_bias: directionalBias,
+        sweep_level: sweep.level?.label || '—',
+        pullback_pct: pb.retracement, expiry: expiryUTC,
+        reason: sess + ' ' + (sweep.level?.label||'') + ' sweep → ' +
+          sweep.direction.toLowerCase() + ' displacement (' + disp.ratio + '×) → BOS → ' + pb.retracement + '% pullback'
+      };
+      rawSig.alert = formatSignalAlert(rawSig, currentATR);
+
+      await fireEvent(setup, 'entry', sym, async () => {
+        sentSignals.add(sigKey);
+        setTimeout(() => sentSignals.delete(sigKey), 4 * 60 * 60 * 1000);
+        // Mark setup as complete — no more events
+        setup.active = false;
+        await sendTelegram(formatTelegramSignal(rawSig));
+      });
 
     } catch(e) {
       console.error('[auto-scan] Error for ' + sym + ':', e.message);
     }
-
     await delay(400);
   }
 }
