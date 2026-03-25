@@ -858,7 +858,10 @@ app.get('/analyze/:sym', async (req, res) => {
   const currentPrice  = m5[m5.length-1].c;
   const currentATR    = atrValues?.length > 0 ? atrValues[atrValues.length-1] : null;
   const currentTS     = m5[m5.length-1].t;
-  const sess          = sessionName(currentTS);
+  // Use current wall-clock UTC time for session detection, NOT candle timestamp.
+  // Candle timestamp can be stale (SLV closes at 20:00 UTC; last candle
+  // would otherwise make London session appear closed next morning).
+  const sess          = sessionName(Date.now());
   const sessionOk     = sess !== null;
 
   // ── 2. LIQUIDITY LEVELS ────────────────────────────────────────────────
@@ -1168,6 +1171,277 @@ app.get('/', (req, res) => res.json({
   rules: ['PDH/PDL/ASH/ASL/EQH/EQL levels','0.02% sweep break required','1.5× body displacement','M5+M15 BOS','50-61.8% pullback entry','min 1:2 RR','confidence ≥ 80','10-candle time decay']
 }));
 
+// ═══════════════════════════════════════════════════════════════
+// TELEGRAM ALERT SYSTEM
+// ═══════════════════════════════════════════════════════════════
+
+// Config stored in environment variables on Railway (never hardcoded)
+// Set TG_TOKEN and TG_CHAT_ID in Railway → Variables tab
+let TG_TOKEN   = process.env.TG_TOKEN   || '';
+let TG_CHAT_ID = process.env.TG_CHAT_ID || '';
+
+// Also accept config updates from frontend via POST /config
+app.post('/config', (req, res) => {
+  const { tg_token, tg_chat_id } = req.body;
+  if (tg_token)   { TG_TOKEN   = tg_token;   console.log('[config] TG_TOKEN updated'); }
+  if (tg_chat_id) { TG_CHAT_ID = tg_chat_id; console.log('[config] TG_CHAT_ID updated'); }
+  res.json({ ok: true, tg_configured: !!(TG_TOKEN && TG_CHAT_ID) });
+});
+
+// GET /config — let frontend check if Telegram is configured
+app.get('/config', (req, res) => {
+  res.json({ tg_configured: !!(TG_TOKEN && TG_CHAT_ID),
+             tg_token_set: !!TG_TOKEN,
+             tg_chat_set:  !!TG_CHAT_ID });
+});
+
+// Send a Telegram message
+async function sendTelegram(text) {
+  if (!TG_TOKEN || !TG_CHAT_ID) return;
+  try {
+    const url  = 'https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage';
+    const body = JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: 'HTML' });
+    const resp = await fetch(url, { method:'POST',
+      headers:{'Content-Type':'application/json'}, body,
+      signal: AbortSignal.timeout(8000) });
+    const json = await resp.json();
+    if (!json.ok) console.error('[telegram] send failed:', json.description);
+    else console.log('[telegram] message sent OK');
+  } catch(e) {
+    console.error('[telegram] error:', e.message);
+  }
+}
+
+// Format full signal for Telegram
+function formatTelegramSignal(sig) {
+  const isBuy  = sig.direction === 'BUY';
+  const emoji  = isBuy ? '🟢' : '🔴';
+  const asset  = sig.asset === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  const confLbl = sig.confidence >= 85 ? 'High conviction'
+                : sig.confidence >= 75 ? 'Strong setup'
+                : 'Moderate setup';
+  return [
+    emoji + ' <b>' + asset + ' ' + sig.direction + ' SETUP</b>',
+    '',
+    '📋 <b>What happened:</b>',
+    (sig.alert && sig.alert.context) || sig.reason || '—',
+    '',
+    '📊 <b>Trade levels:</b>',
+    '• Entry:     $' + sig.entry,
+    '• Stop loss: $' + sig.stop_loss,
+    '• Target 1:  $' + sig.take_profit_1,
+    '• Target 2:  $' + sig.take_profit_2,
+    '• Risk/Reward: 1:' + sig.rr,
+    '',
+    '📈 <b>Setup strength:</b>',
+    '• Confidence: ' + sig.confidence + '% — ' + confLbl,
+    '• Session: ' + (sig.session || '—'),
+    '',
+    '💡 <b>What this means:</b>',
+    (sig.alert && sig.alert.interpretation) || '—',
+    '',
+    '⚡ <b>Execution note:</b>',
+    (sig.alert && sig.alert.execution) || 'Wait for pullback into entry zone.',
+    '',
+    '─────────────────',
+    'Signal #' + (sig.id || '—') + ' | Aurum Signals'
+  ].join('\n');
+}
+
+// Format pre-signal alert for Telegram
+function formatTelegramPreSignal(sym, ns) {
+  const asset  = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  const isBuy  = ns.direction === 'BUY';
+  const emojis = {
+    approaching_liquidity:  '📍',
+    sweep_detected:         '⚡',
+    displacement_confirmed: '↗️',
+    structure_break:        '✅'
+  };
+  const emoji = emojis[ns.stage] || '📡';
+  const stageLabel = {
+    approaching_liquidity:  'KEY LEVEL NEARBY',
+    sweep_detected:         'LIQUIDITY GRAB DETECTED',
+    displacement_confirmed: 'STRONG MOVE CONFIRMED',
+    structure_break:        'TREND SHIFT CONFIRMED'
+  }[ns.stage] || 'SETUP FORMING';
+
+  const alert = ns.alert || {};
+  return [
+    emoji + ' <b>' + asset + ' — ' + stageLabel + '</b>',
+    '',
+    alert.context || ns.message || '—',
+    '',
+    '⏳ ' + (alert.action || 'Monitoring. No action required yet.'),
+    '',
+    '─────────────────',
+    'Pre-signal | Aurum Signals'
+  ].join('\n');
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AUTO-SCAN ENGINE
+// Runs every 5 minutes during London/NY sessions.
+// Sends Telegram alerts when signals or pre-signals are detected.
+// Tracks sent signals to avoid duplicate alerts.
+// ═══════════════════════════════════════════════════════════════
+const sentSignals    = new Set(); // track signal IDs already alerted
+const sentPreSignals = {};        // track pre-signal stages already alerted per symbol
+
+async function autoScan() {
+  const h         = new Date().getUTCHours();
+  const inSession = (h >= 7 && h < 16) || (h >= 13 && h < 22);
+
+  if (!inSession) {
+    console.log('[auto-scan] Outside session (UTC ' + h + ':xx) — skipping');
+    return;
+  }
+  console.log('[auto-scan] Running — UTC ' + h + ':' + String(new Date().getUTCMinutes()).padStart(2,'0'));
+
+  const delay = ms => new Promise(r => setTimeout(r, ms));
+
+  for (const sym of ['XAUUSD', 'XAGUSD']) {
+    try {
+      // Fetch M5 candles (uses cache if fresh)
+      const m5 = await getCandles(sym, '5min', 120);
+      if (!m5 || m5.length < 50) {
+        console.log('[auto-scan] ' + sym + ': insufficient data (' + (m5?.length||0) + ' candles)');
+        await delay(400);
+        continue;
+      }
+
+      const m15       = deriveM15FromM5(m5);
+      const atrValues = calcATRFromCandles(m5, 14);
+      const currentATR = atrValues.length ? atrValues[atrValues.length-1] : null;
+      const livePrice  = m5[m5.length-1].c;
+
+      // Check volatility
+      const volatility = checkATR(sym, atrValues);
+      if (volatility.ok === false) {
+        console.log('[auto-scan] ' + sym + ': low volatility — skip');
+        await delay(400);
+        continue;
+      }
+
+      // Build levels
+      const levels = buildLevels(m5, m15);
+
+      // Directional bias
+      const pdhLevel = levels.find(l => l.type === 'PDH');
+      const pdlLevel = levels.find(l => l.type === 'PDL');
+      let directionalBias = 'neutral';
+      let biasPenalty     = 0;
+      if (pdhLevel && livePrice > pdhLevel.price)      { directionalBias = 'bearish_bias'; biasPenalty = 5; }
+      else if (pdlLevel && livePrice < pdlLevel.price) { directionalBias = 'bullish_bias'; biasPenalty = 5; }
+
+      // Session
+      const sess          = sessionName(Date.now());
+      const sessionOk     = sess !== null;
+      const sessionOverlap = sess === 'London+NY Overlap';
+
+      // Run signal engine
+      const sweep = detectSweep(m5, levels);
+      let   signal = null;
+      let   near_setup = null;
+
+      if (sessionOk && sweep.found) {
+        const sweepToNow = m5.length - 1 - sweep.candleIdx;
+        if (sweepToNow <= 10) {
+          const disp = detectDisplacement(m5, sweep.candleIdx, sweep.direction);
+          if (disp.found) {
+            const bos = detectBOS(m5, sweep.candleIdx, sweep.direction);
+            if (bos.found) {
+              const m15bos = m15.length >= 8 ? confirmBOS_M15(m15, sweep.direction, bos.bos_level) : false;
+              const pb     = detectPullback(m5, disp.candleIdx, sweep.direction, sweep.sweepExtreme);
+              if (pb.found) {
+                const sl   = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5);
+                const tps  = calcTP(sweep.direction, pb.entry, sl, levels);
+                if (tps.rr1 >= 1.5) {
+                  const confidence = calcConfidence(sessionOk, sessionOverlap,
+                    volatility.ok === true || volatility.ok === undefined,
+                    sweep, disp, bos, pb, sweep.level, sess, directionalBias, biasPenalty);
+                  if (confidence >= 80) {
+                    const reasonParts = [
+                      sess + ' ' + sweep.level.label + ' sweep',
+                      (sweep.direction==='BUY'?'bullish':'bearish') + ' displacement (' + disp.ratio + '× body)',
+                      (m15bos?'M5/M15':'M5') + ' BOS',
+                      pb.retracement + '% pullback entry'
+                    ];
+                    const rawSig = {
+                      id: Date.now(),
+                      asset: sym, direction: sweep.direction,
+                      entry: parseFloat(pb.entry.toFixed(3)),
+                      stop_loss: sl, take_profit_1: tps.tp1, take_profit_2: tps.tp2,
+                      rr: tps.rr1, confidence, session: sess,
+                      reason: reasonParts.join(' → '),
+                      sweep_level: sweep.level.label, pullback_pct: pb.retracement,
+                      directional_bias: directionalBias
+                    };
+                    rawSig.alert = formatSignalAlert(rawSig, currentATR);
+                    signal = rawSig;
+                  }
+                }
+              } else {
+                // BOS confirmed, waiting pullback
+                near_setup = { stage: 'structure_break', direction: sweep.direction,
+                  message: 'Trend shift confirmed — awaiting pullback entry',
+                  alert: { context: 'BOS confirmed on M5' + (m15bos?'/M15':'') + '. Waiting for pullback.' }};
+              }
+            } else {
+              // Displacement confirmed, waiting BOS
+              near_setup = { stage: 'displacement_confirmed', direction: sweep.direction,
+                message: 'Displacement confirmed — awaiting trend shift',
+                alert: { context: 'Strong move confirmed (' + disp.ratio + '× avg body). Waiting for BOS.' }};
+            }
+          } else {
+            // Sweep detected, waiting displacement
+            near_setup = { stage: 'sweep_detected', direction: sweep.direction,
+              message: sweep.level.label + ' sweep confirmed — awaiting strong move',
+              alert: { context: 'Liquidity grab detected at ' + sweep.level.label + '. Watching for displacement.' }};
+          }
+        }
+      }
+
+      // ── SEND TELEGRAM ALERTS ──────────────────────────────────────────
+
+      // Full signal — only alert once per signal (dedupe by entry price + direction)
+      if (signal) {
+        const sigKey = sym + '_' + signal.direction + '_' + signal.entry;
+        if (!sentSignals.has(sigKey)) {
+          sentSignals.add(sigKey);
+          // Clear old keys after 4 hours to allow re-alert if setup repeats
+          setTimeout(() => sentSignals.delete(sigKey), 4 * 60 * 60 * 1000);
+          console.log('[auto-scan] SIGNAL: ' + sym + ' ' + signal.direction + ' @ ' + signal.entry);
+          await sendTelegram(formatTelegramSignal(signal));
+        }
+      }
+
+      // Pre-signal — alert each stage once per symbol per hour
+      if (near_setup && !signal) {
+        const preKey = sym + '_' + near_setup.stage;
+        const lastSent = sentPreSignals[preKey] || 0;
+        const hourAgo  = Date.now() - 60 * 60 * 1000;
+        if (lastSent < hourAgo) {
+          sentPreSignals[preKey] = Date.now();
+          console.log('[auto-scan] PRE-SIGNAL: ' + sym + ' ' + near_setup.stage);
+          await sendTelegram(formatTelegramPreSignal(sym, near_setup));
+        }
+      }
+
+    } catch(e) {
+      console.error('[auto-scan] Error for ' + sym + ':', e.message);
+    }
+
+    await delay(400); // small gap between symbols
+  }
+}
+
+// ── WEBHOOK: frontend can trigger an immediate scan
+app.post('/scan', async (req, res) => {
+  res.json({ ok: true, message: 'Scan triggered' });
+  autoScan(); // run in background
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log('='.repeat(60));
@@ -1179,5 +1453,15 @@ app.listen(PORT, () => {
   const h = new Date().getUTCHours();
   const sess = (h>=7&&h<16&&h>=13) ? 'London+NY Overlap' : (h>=7&&h<16) ? 'London' : (h>=13&&h<22) ? 'New York' : 'Closed';
   console.log('Current session:', sess, '(UTC hour ' + h + ')');
+  console.log('Telegram configured:', !!(TG_TOKEN && TG_CHAT_ID));
   console.log('='.repeat(60));
+
+  // ── AUTO-SCAN SCHEDULER ─────────────────────────────────────
+  // Scan every 5 minutes. Session check is inside autoScan() so
+  // this interval runs 24/7 but only does work during London/NY.
+  const SCAN_INTERVAL = 5 * 60 * 1000; // 5 minutes
+  setInterval(autoScan, SCAN_INTERVAL);
+  // Run once immediately on startup (after 10s to let server settle)
+  setTimeout(autoScan, 10000);
+  console.log('[scheduler] Auto-scan started — every 5 minutes during sessions');
 });
