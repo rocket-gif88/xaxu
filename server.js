@@ -2,7 +2,13 @@ const express = require('express');
 const cors    = require('cors');
 const fetch   = require('node-fetch');
 const app     = express();
-app.use(cors());
+// CORS: allow Netlify frontend and any origin (needed for Railway free tier)
+app.use(cors({
+  origin: '*',                   // allow all origins — tighten if needed
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.options('*', cors());        // handle preflight for all routes
 app.use(express.json());
 
 const TWELVE_KEY    = '7f3fc6ca85664930ab6e687db8ff0c5d';
@@ -13,29 +19,64 @@ const SYMBOLS = { XAUUSD:'XAU/USD', XAGUSD:'XAG/USD' };
 async function tdFetch(path) {
   const sep = path.includes('?') ? '&' : '?';
   const url = `https://api.twelvedata.com${path}${sep}apikey=${TWELVE_KEY}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-  return res.json();
+  const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+  if (!res.ok) {
+    console.error('TD HTTP error:', res.status, res.statusText, 'URL:', url.replace(TWELVE_KEY, '***'));
+    throw new Error('Twelve Data HTTP ' + res.status);
+  }
+  const json = await res.json();
+  // Rate limit detection
+  if (json.code === 429 || json.message?.toLowerCase().includes('limit')) {
+    console.error('TD rate limit hit. Path:', path.split('?')[0]);
+  }
+  return json;
 }
 
 // ─── CANDLE FETCH ─────────────────────────────────────────────────────────
 async function getCandles(sym, interval, n) {
   const td = SYMBOLS[sym];
-  const d  = await tdFetch(`/time_series?symbol=${encodeURIComponent(td)}&interval=${interval}&outputsize=${n}`);
-  if (!d.values || d.values.length === 0) return null;
-  return d.values.map(c => ({
-    t: new Date(c.datetime.includes('T') ? c.datetime : c.datetime + ' UTC').getTime(),
-    o: parseFloat(c.open),
-    h: parseFloat(c.high),
-    l: parseFloat(c.low),
-    c: parseFloat(c.close)
-  })).reverse(); // oldest→newest
+  if (!td) { console.error('Unknown symbol:', sym); return null; }
+  try {
+    const d = await tdFetch(`/time_series?symbol=${encodeURIComponent(td)}&interval=${interval}&outputsize=${n}`);
+    // Twelve Data returns {code, message} on errors (rate limit, bad symbol, etc.)
+    if (d.code || d.status === 'error' || d.message) {
+      console.error(`TD candles error [${sym} ${interval}]:`, d.code, d.message || d.status);
+      return null;
+    }
+    if (!d.values || d.values.length === 0) {
+      console.warn(`TD candles empty [${sym} ${interval}]: no values in response`);
+      return null;
+    }
+    const candles = d.values.map(c => ({
+      t: new Date(c.datetime.includes('T') ? c.datetime : c.datetime + ' UTC').getTime(),
+      o: parseFloat(c.open),
+      h: parseFloat(c.high),
+      l: parseFloat(c.low),
+      c: parseFloat(c.close)
+    })).reverse();
+    console.log(`TD candles OK [${sym} ${interval}]:`, candles.length, 'candles');
+    return candles;
+  } catch(e) {
+    console.error(`TD candles exception [${sym} ${interval}]:`, e.message);
+    return null;
+  }
 }
 
 async function getATR(sym, interval, period) {
   const td = SYMBOLS[sym];
-  const d  = await tdFetch(`/atr?symbol=${encodeURIComponent(td)}&interval=${interval}&time_period=${period}&outputsize=21`);
-  if (!d.values) return [];
-  return d.values.map(v => parseFloat(v.atr)).reverse();
+  if (!td) return [];
+  try {
+    const d = await tdFetch(`/atr?symbol=${encodeURIComponent(td)}&interval=${interval}&time_period=${period}&outputsize=21`);
+    if (d.code || d.status === 'error' || d.message) {
+      console.error(`TD ATR error [${sym}]:`, d.code, d.message || d.status);
+      return [];
+    }
+    if (!d.values) return [];
+    return d.values.map(v => parseFloat(v.atr)).reverse();
+  } catch(e) {
+    console.error(`TD ATR exception [${sym}]:`, e.message);
+    return [];
+  }
 }
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────
@@ -681,13 +722,22 @@ app.get('/analyze/:sym', async (req, res) => {
   // ── 1. FETCH DATA ──────────────────────────────────────────────────────
   let m5, m15, atrValues;
   try {
-    [m5, m15, atrValues] = await Promise.all([
-      getCandles(sym, '5min',  120),  // ~10h of M5
-      getCandles(sym, '15min',  96),  // ~24h of M15
-      getATR(sym, '5min', 14)
-    ]);
+    // Sequential fetches to avoid Twelve Data rate limits on free tier.
+    // 300ms gap between requests prevents 429 errors.
+    const delay = ms => new Promise(r => setTimeout(r, ms));
+    m5        = await getCandles(sym, '5min', 120);   // ~10h of M5
+    await delay(300);
+    m15       = await getCandles(sym, '15min', 96);   // ~24h of M15
+    await delay(300);
+    atrValues = await getATR(sym, '5min', 14);
+    console.log(`[${sym}] M5: ${m5?.length||0} M15: ${m15?.length||0} ATR: ${atrValues?.length||0}`);
   } catch(e) {
-    return res.json({ success:false, error:'Data fetch failed: ' + e.message });
+    console.error(`[${sym}] Data fetch exception:`, e.message);
+    return res.json({ success: true, symbol: sym, price: null, atr: null,
+      system_state: 'data_error', session: 'Unknown', session_ok: false,
+      setup_state: 'standby', levels: [],
+      log: ['Live data temporarily unavailable — ' + e.message],
+      signal: null, m5_candles: 0 });
   }
 
   // ── SYSTEM STATE DETERMINATION ─────────────────────────────────────────────
@@ -977,6 +1027,21 @@ app.get('/analyze/:sym', async (req, res) => {
 });
 
 // ─── PRICES ROUTE ─────────────────────────────────────────────────────────
+// Health check — shows server is up and what data is available
+app.get('/health', async (req, res) => {
+  const h = new Date().getUTCHours();
+  const inSession = (h >= 7 && h < 16) || (h >= 13 && h < 22);
+  res.json({
+    status: 'ok', version: '5.0',
+    utc_hour: h, in_session: inSession,
+    session: inSession
+      ? (h >= 13 && h < 16 ? 'London+NY Overlap' : h < 16 ? 'London' : 'New York')
+      : 'Closed',
+    symbols: Object.keys(SYMBOLS),
+    ts: new Date().toUTCString()
+  });
+});
+
 app.get('/prices', async (req, res) => {
   try {
     const [xa, xg] = await Promise.all([
@@ -990,6 +1055,9 @@ app.get('/prices', async (req, res) => {
     res.status(500).json({ success:false, error:e.message });
   }
 });
+
+// Keep-alive ping — call this from frontend every 4 min to prevent Railway sleep
+app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 app.get('/', (req, res) => res.json({
   status:'ok', version:'4.0',
