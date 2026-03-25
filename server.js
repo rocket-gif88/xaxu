@@ -1308,9 +1308,11 @@ app.get('/analyze/:sym', async (req, res) => {
 
         if (!disp.found) {
           setupState = 'sweep_detected';
+          log.push('[Stage] Liquidity grab confirmed — ' + sweep.level.label + ' swept');
           log.push('Strong move: not confirmed — ' + disp.reason);
         } else {
           setupState = 'displacement_confirmed';
+          log.push('[Stage] Strong move confirmed — ' + (disp ? disp.ratio : '?') + 'x body displacement');
           log.push('Strong move confirmed: ' + disp.ratio + 'x average candle size, ' + (disp.candleIdx - sweep.candleIdx) + ' candle(s) after the liquidity grab' + (disp.weakGap ? ' (one weak candle gap tolerated)' : ''));
 
           // ── 7. BOS ────────────────────────────────────────────────
@@ -1322,6 +1324,7 @@ app.get('/analyze/:sym', async (req, res) => {
           } else {
             const m15bos = confirmBOS_M15(m15, sweep.direction, bos.bos_level);
             setupState = 'structure_break';
+          log.push('[Stage] Trend shift confirmed — ' + bos.label);
             log.push('Trend shift (M5): ' + bos.label);
             log.push('Trend shift (M15): ' + (m15bos ? 'also visible on 15-minute chart' : 'not visible on 15-minute chart — M5 confirmation used'));
 
@@ -1330,6 +1333,7 @@ app.get('/analyze/:sym', async (req, res) => {
 
             if (!pb.found) {
               setupState = 'waiting_pullback';
+          log.push('[Stage] Waiting for pullback into 50-61.8% zone');
               log.push('Pullback entry: ' + pb.reason);
             } else {
               setupState = 'entry_triggered';
@@ -1354,7 +1358,11 @@ app.get('/analyze/:sym', async (req, res) => {
                 } else {
                   if (qf.notes && qf.notes.length) log.push('Quality notes: ' + qf.notes.join(' | '));
                 // ── 10. CONFIDENCE ────────────────────────────────
+                // Hard gate: only generate signal if we reached this point through all stages
+                // (sweep → displacement → BOS → pullback → quality filters)
+                // setupState tracks progression, signal only fires at entry_triggered
                 const confidence = calcConfidence(sessionOk, sessionOverlap, volatility.ok === true || volatility.ok === undefined, sweep, disp, bos, pb, sweep.level, sess, directionalBias, biasPenalty);
+                log.push('Stage progression: sweep ✓ → displacement ✓ → BOS ✓ → pullback ✓ → quality ✓');
                 log.push('Confidence score: ' + confidence + '/100');
 
                 if (confidence < 80) {
@@ -1804,12 +1812,21 @@ async function fireEvent(setup, event, sym, alertFn) {
     return false;
   }
 
-  // Fire the event
+  // Fire the event — update state atomically before sending
   setup.events[event]  = true;
   setup.stage          = event;
   setup.lastEventAt    = Date.now();
   setup.cooldowns[event] = Date.now();
-  console.log('[' + sym + '] ' + event + ' → alert sent (setup id=' + setup.id + ')');
+  // Stage progression log (visible in Railway logs)
+  const stageLabels = {
+    approaching: 'Stage → approaching liquidity',
+    sweep:       'Stage → liquidity grab',
+    move:        'Stage → strong move confirmed',
+    trend:       'Stage → trend shift confirmed',
+    pullback:    'Stage → pullback valid',
+    entry:       '🟢 ENTRY READY — full signal generating'
+  };
+  console.log('[' + sym + '] ' + (stageLabels[event] || 'Stage → ' + event) + ' (id=' + setup.id + ')');
 
   try { await alertFn(); } catch(e) { console.error('[' + sym + '] alert error:', e.message); }
   return true;
@@ -2083,6 +2100,20 @@ async function autoScan() {
 
       if (scoreResult.grade === 'REJECT') {
         console.log('[' + sym + '] Score below threshold — no signal');
+        await delay(400); continue;
+      }
+
+      // ── HARD ENTRY GATE — ALL prior stages must be confirmed ────
+      // This is the final safety check before any signal is sent.
+      // Prevents entry if any upstream stage was skipped or not confirmed.
+      const requiredStages = ['sweep', 'move', 'trend', 'pullback'];
+      const missingStages  = requiredStages.filter(st => !setup.events[st]);
+      if (missingStages.length > 0) {
+        console.log('[' + sym + '] Entry blocked — missing confirmed stages: ' + missingStages.join(', '));
+        await delay(400); continue;
+      }
+      if (setup.invalidated) {
+        console.log('[' + sym + '] Entry blocked — setup already invalidated');
         await delay(400); continue;
       }
 
