@@ -895,9 +895,23 @@ function checkVolatility(atrValues) {
   return { ok: true, currentATR, avg20 };
 }
 
-// ─── SCORING SYSTEM (0–100) ──────────────────────────────────────────────────
-// Six components. Each has a max score and hard-fail conditions.
-// A+ = 85+, A = 75-84, discard < 75.
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFIDENCE SCORING SYSTEM (0–100)
+//
+// Components:
+//   A. Liquidity Strength   0–25  (zone touch count)
+//   B. Reaction Quality     0–20  (wick rejection strength)
+//   C. Displacement         0–20  (move strength after grab)
+//   D. Structure (BOS)      0–15  (trend shift quality)
+//   E. Pullback Quality     0–10  (entry zone refinement)
+//   F. Session Quality      0–10  (time-based weighting)
+//
+// Tiers:
+//   0–39   IGNORE  — do not display, no alerts
+//  40–59   LOW     — display only, no alerts
+//  60–74   VALID   — pre-signal Telegram allowed
+//  75–100  HIGH    — full signal allowed
+// ═══════════════════════════════════════════════════════════════════════════
 
 function scoreSetup(sessionLabel, sessionOk, sweep, displacement, bos, pullback,
                     volatilityOk, directionalBias, biasPenalty) {
@@ -905,93 +919,132 @@ function scoreSetup(sessionLabel, sessionOk, sweep, displacement, bos, pullback,
   const breakdown = {};
   let total = 0;
 
-  // ── 1. SESSION QUALITY (max 20) ──────────────────────────────
-  if (!sessionOk) return { total: 0, grade: 'REJECT', reason: 'Outside session', breakdown: {} };
-  const sessScore = sessionLabel === 'London+NY Overlap' ? 20
-                  : sessionLabel === 'New York'           ? 16
-                  : sessionLabel === 'London'             ? 13 : 0;
-  breakdown.session = { score: sessScore, max: 20, label: sessionLabel };
+  // Hard exits — cannot score without these fundamentals
+  if (!sessionOk)        return { total: 0, tier: 'IGNORE', grade: 'IGNORE', reason: 'Outside session',   breakdown: {} };
+  if (!sweep || !sweep.found) return { total: 0, tier: 'IGNORE', grade: 'IGNORE', reason: 'No sweep',     breakdown: {} };
+
+  // ── A. LIQUIDITY STRENGTH (max 25) ───────────────────────────
+  // Based on zone touch count (totalTouches for clustered zones, strengthScore for singles)
+  const touches = sweep.level
+    ? (sweep.level.totalTouches || (sweep.level.strengthScore >= 3 ? 6 : sweep.level.strengthScore >= 2 ? 3 : 2))
+    : 2;
+  const liqScore = touches >= 10 ? 25
+                 : touches >= 6  ? 22
+                 : touches >= 4  ? 18
+                 : touches === 3 ? 15
+                 :                 10; // 2 touches minimum
+  // Level type bonus: PDH/PDL = premium liquidity
+  const liqBonus = (sweep.level?.type === 'PDH' || sweep.level?.type === 'PDL') ? 3
+                 : (sweep.level?.type === 'ASH' || sweep.level?.type === 'ASL') ? 1 : 0;
+  const liqFinal = Math.min(liqScore + liqBonus, 25);
+  breakdown.liquidity = { score: liqFinal, max: 25, touches, label: sweep.level?.label || '—' };
+  total += liqFinal;
+
+  // ── B. REACTION QUALITY (max 20) ─────────────────────────────
+  // How cleanly did price reject the zone (wick size + close quality)
+  const wickPct = sweep.wickPct || 0;
+  const reactionScore = wickPct >= 0.70 ? 20   // very strong rejection + full close back
+                      : wickPct >= 0.55 ? 17   // clean wick rejection
+                      : wickPct >= 0.40 ? 14   // decent rejection
+                      : wickPct >= 0.30 ? 10   // minimum valid wick
+                      : 5;                     // below threshold (already filtered, but score low)
+  // Bonus if close was strongly back inside (not just at level)
+  const closeBonus = sweep.closePrice && sweep.level
+    ? (Math.abs(sweep.closePrice - sweep.level.price) / sweep.level.price > 0.001 ? 2 : 0)
+    : 0;
+  const reactionFinal = Math.min(reactionScore + closeBonus, 20);
+  breakdown.reaction = { score: reactionFinal, max: 20, wickPct: Math.round(wickPct * 100) };
+  total += reactionFinal;
+
+  // ── C. DISPLACEMENT / STRONG MOVE (max 20) ───────────────────
+  if (!displacement || !displacement.found) {
+    breakdown.displacement = { score: 0, max: 20, note: 'No displacement detected' };
+    // Not a hard fail for scoring — keeps partial scores for pre-signal use
+  } else {
+    const dispScore = displacement.ratio >= 3.0 ? 20
+                    : displacement.ratio >= 2.5 ? 18
+                    : displacement.ratio >= 2.0 ? 15
+                    : displacement.ratio >= 1.5 ? 11
+                    : 6;
+    const dispFinal = displacement.weakGap ? Math.max(dispScore - 3, 5) : dispScore;
+    breakdown.displacement = { score: dispFinal, max: 20, ratio: displacement.ratio };
+    total += dispFinal;
+  }
+
+  // ── D. STRUCTURE BREAK / BOS (max 15) ────────────────────────
+  if (!bos || !bos.found) {
+    breakdown.structure = { score: 0, max: 15, note: 'No BOS detected' };
+  } else {
+    const bosScore = bos.structure_type === 'internal' && bos.method === 'close' ? 15
+                   : bos.structure_type === 'internal'                            ? 13
+                   : bos.method === 'close'                                       ? 11
+                   : 8;
+    breakdown.structure = { score: bosScore, max: 15, type: bos.structure_type, method: bos.method };
+    total += bosScore;
+  }
+
+  // ── E. PULLBACK QUALITY (max 10) ─────────────────────────────
+  if (!pullback || !pullback.found) {
+    breakdown.pullback = { score: 0, max: 10, note: 'No pullback yet' };
+  } else {
+    const pb = parseFloat(pullback.retracement);
+    if (pb > 70) return { total: 0, tier: 'IGNORE', grade: 'IGNORE', reason: 'Pullback > 70%', breakdown };
+    const pbScore = (pb >= 50 && pb <= 61.8) ? 10
+                  : (pb >= 45 && pb <  50)    ? 7
+                  : (pb >  61.8 && pb <= 70)  ? 5
+                  : 3;
+    breakdown.pullback = { score: pbScore, max: 10, retracement: pb };
+    total += pbScore;
+  }
+
+  // ── F. SESSION QUALITY (max 10) ──────────────────────────────
+  const sessScore = sessionLabel === 'London+NY Overlap' ? 10
+                  : sessionLabel === 'New York'           ? 8
+                  : sessionLabel === 'London'             ? 6
+                  : 0;
+  breakdown.session = { score: sessScore, max: 10, label: sessionLabel || 'Unknown' };
   total += sessScore;
 
-  // ── 2. LIQUIDITY QUALITY (max 20) ────────────────────────────
-  if (!sweep.found) return { total: 0, grade: 'REJECT', reason: 'No sweep', breakdown };
-  const liqScore = sweep.level
-    ? (sweep.level.type === 'PDH' || sweep.level.type === 'PDL' ? 20   // strongest levels
-    : sweep.level.type === 'ASH' || sweep.level.type === 'ASL'  ? 16
-    : sweep.level.strengthScore >= 3                            ? 14   // EQH/EQL x4+
-    : sweep.level.strengthScore >= 2                            ? 10   // x3
-    : 6)                                                               // x2 weak
-    : 6;
-  breakdown.liquidity = { score: liqScore, max: 20, label: sweep.level?.label || '—' };
-  total += liqScore;
-
-  // ── 3. SWEEP QUALITY (max 20) ────────────────────────────────
-  // Wick must be >= 30% of range (already enforced), score by wick size
-  const wickPct = sweep.wickPct || 0;
-  const sweepScore = wickPct >= 0.6 ? 20   // very clean sweep
-                   : wickPct >= 0.45 ? 16
-                   : wickPct >= 0.30 ? 12   // minimum valid
-                   : 0;                     // below minimum = hard fail
-  if (sweepScore === 0) return { total: 0, grade: 'REJECT', reason: 'Weak sweep wick', breakdown };
-  breakdown.sweep = { score: sweepScore, max: 20, wickPct: Math.round(wickPct*100) };
-  total += sweepScore;
-
-  // ── 4. DISPLACEMENT STRENGTH (max 15) ────────────────────────
-  if (!displacement.found) return { total: 0, grade: 'REJECT', reason: 'No displacement', breakdown };
-  const dispScore = displacement.ratio >= 2.5 ? 15
-                  : displacement.ratio >= 2.0 ? 13
-                  : displacement.ratio >= 1.5 ? 10   // minimum
-                  : 0;
-  if (dispScore === 0) return { total: 0, grade: 'REJECT', reason: 'Displacement too weak', breakdown };
-  const dispFinal = displacement.weakGap ? Math.max(dispScore - 3, 6) : dispScore;
-  breakdown.displacement = { score: dispFinal, max: 15, ratio: displacement.ratio, weakGap: displacement.weakGap };
-  total += dispFinal;
-
-  // ── 5. STRUCTURE BREAK (max 15) ──────────────────────────────
-  if (!bos.found) return { total: 0, grade: 'REJECT', reason: 'No BOS', breakdown };
-  const bosScore = bos.structure_type === 'internal' && bos.method === 'close' ? 15
-                 : bos.structure_type === 'internal'                            ? 13
-                 : bos.method === 'close'                                       ? 11
-                 : 9; // external + wick method = weakest valid
-  breakdown.structure = { score: bosScore, max: 15, type: bos.structure_type, method: bos.method };
-  total += bosScore;
-
-  // ── 6. PULLBACK QUALITY (max 10) ─────────────────────────────
-  if (!pullback.found) return { total: 0, grade: 'REJECT', reason: 'No pullback', breakdown };
-  const pb = parseFloat(pullback.retracement);
-  if (pb > 70) return { total: 0, grade: 'REJECT', reason: 'Pullback exceeded 70%', breakdown };
-  const pbScore = (pb >= 50 && pb <= 61.8) ? 10   // ideal Fibonacci zone
-                : (pb >= 45 && pb < 50)    ? 7    // slightly early
-                : (pb > 61.8 && pb <= 70)  ? 5    // late but valid
-                : 0;
-  if (pbScore === 0) return { total: 0, grade: 'REJECT', reason: 'Pullback outside valid zone', breakdown };
-  breakdown.pullback = { score: pbScore, max: 10, retracement: pb };
-  total += pbScore;
-
-  // ── VOLATILITY PENALTY ───────────────────────────────────────
+  // ── PENALTIES ────────────────────────────────────────────────
   if (!volatilityOk) {
     total -= 8;
     breakdown.volatility = { penalty: -8 };
   }
-
-  // ── DIRECTIONAL BIAS PENALTY ─────────────────────────────────
   if (biasPenalty > 0 && sweep.found) {
     const isCounter = (directionalBias === 'bearish_bias' && sweep.direction === 'BUY') ||
                       (directionalBias === 'bullish_bias' && sweep.direction === 'SELL');
     if (isCounter) {
       total -= biasPenalty;
-      breakdown.bias = { penalty: -biasPenalty, note: 'Counter-trend' };
+      breakdown.bias = { penalty: -biasPenalty, note: 'Counter-trend setup' };
     }
   }
 
-  total = Math.min(Math.max(total, 0), 100);
-  const grade = total >= 85 ? 'A+' : total >= 75 ? 'A' : 'REJECT';
+  total = Math.min(Math.max(Math.round(total), 0), 100);
 
-  return { total, grade, breakdown,
-           reason: grade === 'REJECT' ? 'Score ' + total + ' below threshold 75' : null };
+  // ── TIER CLASSIFICATION ───────────────────────────────────────
+  const tier  = total >= 75 ? 'HIGH'   // full signal allowed
+              : total >= 60 ? 'VALID'  // pre-signal Telegram allowed
+              : total >= 40 ? 'LOW'    // display only, no alerts
+              :               'IGNORE'; // discard
+  // Legacy grade compatibility
+  const grade = total >= 85 ? 'A+' : total >= 75 ? 'A' : total >= 60 ? 'B' : 'REJECT';
+
+  // Debug log
+  const bdStr = [
+    'Liq '  + liqFinal,
+    'React ' + reactionFinal,
+    'Move '  + (breakdown.displacement?.score || 0),
+    'BOS '   + (breakdown.structure?.score || 0),
+    'PB '    + (breakdown.pullback?.score || 0),
+    'Sess '  + sessScore
+  ].join(' + ');
+  console.log('[score] ' + (sweep.level?.label || '—') + ' → ' + total + '/100 (' + tier + ') = ' + bdStr);
+
+  return { total, tier, grade, breakdown,
+           reason: tier === 'IGNORE' ? 'Score ' + total + ' below threshold (40)' : null };
 }
 
-// Backwards-compatible wrapper used in /analyze route
+// Backwards-compatible wrapper — returns total score (number)
 function calcConfidence(sessionOk, sessionOverlap, volatilityOk, sweep, displacement, bos,
                         pullback, sweepLevel, sessionLabel, directionalBias, biasPenalty) {
   const result = scoreSetup(sessionLabel, sessionOk, sweep, displacement, bos, pullback,
@@ -1365,9 +1418,12 @@ app.get('/analyze/:sym', async (req, res) => {
                 log.push('Stage progression: sweep ✓ → displacement ✓ → BOS ✓ → pullback ✓ → quality ✓');
                 log.push('Confidence score: ' + confidence + '/100');
 
-                if (confidence < 80) {
+                // Full signal requires HIGH tier (≥75). Grade: A+ ≥85, A ≥75.
+                const scoreResult2 = scoreSetup(sess, sessionOk, sweep, disp, bos, pb,
+                  volatility.ok === true || volatility.ok === undefined, directionalBias, biasPenalty);
+                if (scoreResult2.tier !== 'HIGH') {
                   setupState = 'invalidated';
-                  log.push('Signal not generated — confidence score ' + confidence + ' is below the required minimum of 80.');
+                  log.push('Signal not generated — score ' + confidence + '/100 tier=' + scoreResult2.tier + ' (requires HIGH ≥75)');
                 } else {
                   // ── SIGNAL GENERATED ──────────────────────────────
                   const reasonParts = [
@@ -1397,6 +1453,7 @@ app.get('/analyze/:sym', async (req, res) => {
                     take_profit_2:  tps.tp2,
                     rr:             tps.rr1,
                     confidence,
+                    tier:           scoreResult2.tier || (confidence >= 75 ? 'HIGH' : 'VALID'),
                     session:        sess,
                     reason:         reasonParts.join(' → '),
                     setup_type:     'Liquidity Sweep Reversal',
@@ -1667,7 +1724,8 @@ function formatTelegramSignal(sig) {
   };
 
   return [
-    emoji + ' <b>' + asset + ' ' + sig.direction + ' — ' + gradeEmoji + ' ' + grade + ' SETUP (' + sig.confidence + '/100)</b>',
+    emoji + ' <b>' + asset + ' ' + sig.direction + ' — ' + gradeEmoji + ' ' + grade + ' SETUP</b>',
+    '📊 Confidence: ' + sig.confidence + '/100 — ' + (sig.tier || (sig.confidence >= 75 ? 'HIGH' : 'VALID')),
     '',
     '📋 <b>What happened:</b>',
     (alert.context || sig.reason || '—'),
@@ -2098,8 +2156,11 @@ async function autoScan() {
 
       console.log('[' + sym + '] Score: ' + scoreResult.total + ' (' + scoreResult.grade + ')');
 
-      if (scoreResult.grade === 'REJECT') {
-        console.log('[' + sym + '] Score below threshold — no signal');
+      // Tier gate: only HIGH (≥75) gets a full signal
+      // VALID (60-74) → pre-signal already fired, no full entry
+      // LOW / IGNORE → silent discard
+      if (scoreResult.tier !== 'HIGH') {
+        console.log('[' + sym + '] Score ' + scoreResult.total + ' tier=' + scoreResult.tier + ' — full signal requires HIGH (≥75)');
         await delay(400); continue;
       }
 
@@ -2130,7 +2191,7 @@ async function autoScan() {
         entry: parseFloat(pb.entry.toFixed(3)),
         stop_loss: sl, take_profit_1: tps.tp1, take_profit_2: tps.tp2,
         rr: tps.rr1, confidence: scoreResult.total,
-        grade: scoreResult.grade, scoreBreakdown: scoreResult.breakdown,
+        grade: scoreResult.grade, tier: scoreResult.tier, scoreBreakdown: scoreResult.breakdown,
         session: sess, directional_bias: directionalBias,
         sweep_level: sweep.level?.label || '—',
         pullback_pct: pb.retracement, expiry: expiryUTC,
