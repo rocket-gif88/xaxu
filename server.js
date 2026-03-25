@@ -13,7 +13,11 @@ app.use(express.json());
 
 const TWELVE_KEY    = '7f3fc6ca85664930ab6e687db8ff0c5d';
 const ANTHROPIC_KEY = ['sk-ant-','api03-PSBtiCb9gNCUnpxHjEl2sqWVtfNop5DtO1WCW2pdUw_upi3Zl0VDjCT7Yyk','W9bboA3Bxnq2ucHBFyuNrNx6CL','w-qYuk4wAA'].join('');
-const SYMBOLS = { XAUUSD:'XAU/USD', XAGUSD:'XAG/USD' };
+const SYMBOLS = {
+  XAUUSD: 'XAU/USD',   // Gold spot — free tier
+  XAGUSD: 'SLV'        // Silver via iShares Silver Trust ETF (SLV) — free tier
+                        // XAG/USD requires Twelve Data paid plan; SLV tracks silver 1:1
+};
 
 // ─── IN-MEMORY CACHE ────────────────────────────────────────────────────────
 // Cache candle data for 60 seconds to avoid hitting Twelve Data rate limits
@@ -149,8 +153,8 @@ function deriveM15FromM5(m5Candles) {
 // --- ATR RANGE VALIDATION ----------------------------------------------------
 // Valid ATR range per M5 candle. Outside either bound = ignore volatility filter.
 const ATR_RANGE = {
-  XAUUSD: { min: 0.30, max: 8.0  },  // $0.30-$8.00 per M5 candle
-  XAGUSD: { min: 0.005, max: 0.30 }  // $0.005-$0.30 per M5 candle
+  XAUUSD: { min: 0.30, max: 8.0  },  // $0.30-$8.00 per M5 candle — XAU/USD spot
+  XAGUSD: { min: 0.03, max: 1.50 }   // $0.03-$1.50 per M5 candle — SLV ETF (~$28-32/share)
 };
 function checkATR(sym, atrValues) {
   if (!atrValues || atrValues.length < 5 || !ATR_RANGE[sym]) {
@@ -180,6 +184,7 @@ function checkATR(sym, atrValues) {
 // ─── SESSION ──────────────────────────────────────────────────────────────
 // SESSION DETECTION — UTC only. Never uses device local time.
 // London: 07:00–16:00 UTC   New York: 13:00–22:00 UTC
+// Note: SLV ETF trades NYSE hours (13:30–20:00 UTC) — fully within NY session window
 function sessionName(tsMs) {
   const utcH = new Date(tsMs).getUTCHours(); // explicitly UTC
   const lnd  = utcH >= 7  && utcH < 16;
@@ -264,7 +269,7 @@ function buildLevels(m5Candles, m15Candles) {
 
 // --- PROXIMITY DETECTION ---------------------------------------------------
 // Threshold: price within 0.20% of a liquidity level = "approaching"
-const APPROACH_PCT = { XAUUSD: 0.0020, XAGUSD: 0.0020 };
+const APPROACH_PCT = { XAUUSD: 0.0020, XAGUSD: 0.0015 }; // SLV slightly tighter
 
 function detectApproaching(price, levels, sym) {
   const threshold = APPROACH_PCT[sym] || 0.0020;
@@ -523,8 +528,8 @@ function detectPullback(candles, dispIdx, direction, sweepExtreme) {
 // ─── STOP LOSS ─────────────────────────────────────────────────────────────
 function calcSL(direction, sweepExtreme, atr) {
   const PIP_BUFFER = direction === 'BUY'
-    ? (sweepExtreme.includes('.') && sweepExtreme.toString().split('.')[1].length >= 3 ? 0.003 : 0.03) // XAU vs XAG
-    : (sweepExtreme.includes('.') && sweepExtreme.toString().split('.')[1].length >= 3 ? 0.003 : 0.03);
+    ? (sym === 'XAUUSD' ? 0.50 : 0.05)  // XAU: ~50c buffer, SLV: ~5c buffer
+    : (sym === 'XAUUSD' ? 0.50 : 0.05);
 
   const atrBuffer  = atr * 0.10;
   const buffer     = Math.max(parseFloat(PIP_BUFFER), atrBuffer);
@@ -1102,7 +1107,7 @@ app.get('/health', async (req, res) => {
     session: inSession
       ? (h >= 13 && h < 16 ? 'London+NY Overlap' : h < 16 ? 'London' : 'New York')
       : 'Closed',
-    symbols: Object.keys(SYMBOLS),
+    symbols: { XAUUSD: 'XAU/USD (Gold spot)', XAGUSD: 'SLV ETF (Silver proxy)' },
     ts: new Date().toUTCString()
   });
 });
@@ -1134,6 +1139,7 @@ app.get('/debug/:sym', async (req, res) => {
   if (!td) return res.status(400).json({ error: 'Unknown symbol' });
   try {
     // Test the simplest possible request: last 5 M5 candles
+    // Note: XAGUSD uses SLV ETF as free-tier silver proxy
     const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(td)}&interval=5min&outputsize=5&apikey=${TWELVE_KEY}`;
     console.log('[debug] fetching:', url.replace(TWELVE_KEY, '***'));
     const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
