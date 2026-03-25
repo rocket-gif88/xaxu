@@ -75,21 +75,22 @@ function checkATR(sym, atrValues) {
 }
 
 // ─── SESSION ──────────────────────────────────────────────────────────────
+// SESSION DETECTION — UTC only. Never uses device local time.
+// London: 07:00–16:00 UTC   New York: 13:00–22:00 UTC
 function sessionName(tsMs) {
-  const h = new Date(tsMs).getUTCHours();
-  const lnd = h >= 8  && h < 17;
-  const ny  = h >= 13 && h < 22;
+  const utcH = new Date(tsMs).getUTCHours(); // explicitly UTC
+  const lnd  = utcH >= 7  && utcH < 16;
+  const ny   = utcH >= 13 && utcH < 22;
   if (lnd && ny) return 'London+NY Overlap';
   if (lnd)       return 'London';
   if (ny)        return 'New York';
-  return null;
+  return null; // outside both sessions
 }
 function sessionWeight(name) {
-  // Returns confidence bonus for session type
-  if (!name)                      return 0;
-  if (name === 'London+NY Overlap') return 10; // maximum
-  if (name === 'New York')          return 7;  // high
-  if (name === 'London')            return 5;  // medium
+  if (!name)                        return 0;
+  if (name === 'London+NY Overlap') return 10;
+  if (name === 'New York')          return 7;
+  if (name === 'London')            return 5;
   return 0;
 }
 function isActiveSession(tsMs) { return sessionName(tsMs) !== null; }
@@ -689,17 +690,50 @@ app.get('/analyze/:sym', async (req, res) => {
     return res.json({ success:false, error:'Data fetch failed: ' + e.message });
   }
 
-  if (!m5 || m5.length < 20) {
+  // ── SYSTEM STATE DETERMINATION ─────────────────────────────────────────────
+  // State is independent of session. Data issues ≠ session closed.
+  const nowUtc   = Date.now();
+  const utcHour  = new Date(nowUtc).getUTCHours();
+  const inSession= (utcHour >= 7 && utcHour < 16) || (utcHour >= 13 && utcHour < 22);
+  const m5Count  = m5?.length || 0;
+  const m15Count = m15?.length || 0;
+
+  // No data at all → data_error (not session closed)
+  if (!m5 || m5Count === 0) {
+    const errState = inSession ? 'data_error' : 'session_closed';
+    const errMsg   = inSession
+      ? 'Live data temporarily unavailable — API may be slow or unreachable'
+      : 'Outside trading session (London 07:00–16:00 UTC / New York 13:00–22:00 UTC)';
     return res.json({ success: true, symbol: sym, price: null, atr: null,
-      session: 'Unknown', session_ok: false, setup_state: 'standby',
-      levels: [], log: ['Waiting for data: not enough price history available. Market may be closed or outside trading hours.'],
-      signal: null, m5_candles: m5?.length || 0 });
+      system_state: errState, session: inSession ? 'Active' : 'Closed',
+      session_ok: inSession, setup_state: 'standby',
+      levels: [], log: [errMsg], signal: null, m5_candles: 0 });
   }
-  if (!m15 || m15.length < 8) {
-    return res.json({ success: true, symbol: sym, price: null, atr: null,
-      session: 'Unknown', session_ok: false, setup_state: 'standby',
-      levels: [], log: ['Waiting for data: not enough 15-minute price history available.'],
-      signal: null, m5_candles: m5?.length || 0 });
+
+  // Fewer than 50 candles → warming up (not error)
+  if (m5Count < 50) {
+    return res.json({ success: true, symbol: sym, price: m5[m5Count-1]?.c || null,
+      system_state: 'loading_data',
+      session: inSession ? sessionName(nowUtc) || 'Active' : 'Closed',
+      session_ok: inSession, setup_state: 'standby',
+      levels: [], log: ['Collecting enough data to analyze — ' + m5Count + '/50 candles loaded'],
+      signal: null, m5_candles: m5Count });
+  }
+
+  // Check candle staleness — latest candle should be within 30 minutes
+  const latestCandleAge = (nowUtc - m5[m5Count - 1].t) / 60000; // minutes
+  if (latestCandleAge > 30 && inSession) {
+    return res.json({ success: true, symbol: sym, price: m5[m5Count-1]?.c || null,
+      system_state: 'data_error',
+      session: sessionName(nowUtc) || 'Active',
+      session_ok: true, setup_state: 'standby',
+      levels: [], log: ['Live data temporarily unavailable — latest candle is ' + Math.round(latestCandleAge) + ' minutes old'],
+      signal: null, m5_candles: m5Count });
+  }
+
+  // M15 low — warn but do not block
+  if (!m15 || m15Count < 8) {
+    console.warn(sym + ': low M15 data (' + m15Count + ' candles) — M15 BOS confirmation disabled');
   }
 
   const currentPrice  = m5[m5.length-1].c;
@@ -736,7 +770,7 @@ app.get('/analyze/:sym', async (req, res) => {
 
   if (!sessionOk) {
     setupState = 'idle';
-    log.push('Session: Outside active hours (London 08:00-17:00 UTC / New York 13:00-22:00 UTC) — no signals generated');
+    log.push('Outside active trading sessions (London 07:00–16:00 UTC / New York 13:00–22:00 UTC) — signal engine paused');
   } else if (volatility.ok === false) {
     setupState = 'idle';
     log.push('Volatility check: ' + volatility.note);
@@ -924,6 +958,7 @@ app.get('/analyze/:sym', async (req, res) => {
   res.json({
     success:      true,
     symbol:       sym,
+    system_state: 'active',
     price:        livePrice,
     atr:          currentATR,
     session:      sess || 'Closed',
