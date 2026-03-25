@@ -245,12 +245,19 @@ function clusterEQLevels(rawLevels, currentPrice, zoneType) {
       const allTouches  = cl.reduce((s, l) => s + (l.touches || 1), 0);
       const maxStr      = cl.reduce((s, l) => Math.max(s, l.strengthScore || 1), 0);
       const avgPrice    = cl.reduce((s, l) => s + l.price, 0) / cl.length;
+      const clMin = Math.min(...cl.map(l => l.price));
+      const clMax = Math.max(...cl.map(l => l.price));
+      // Reject single-point zones (min === max) — not real zones
+      if (clMin === clMax && cl.length < 2) {
+        console.log('[levels] Skipping degenerate zone (min=max) at $' + clMin.toFixed(3));
+        continue; // skip this cluster
+      }
       merged.push({
         type:          zoneType,
         zoneType:      zoneType === 'EQH' ? 'sell_zone' : 'buy_zone',
         price:         avgPrice,           // representative price (for sweep detection)
-        minPrice:      Math.min(...cl.map(l => l.price)),
-        maxPrice:      Math.max(...cl.map(l => l.price)),
+        minPrice:      clMin,
+        maxPrice:      clMax,
         totalTouches:  allTouches,
         levelCount:    cl.length,
         levels:        cl,
@@ -1930,6 +1937,138 @@ function sessionMinutesRemaining() {
   return 0;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SIGNAL VALIDATION ENGINE
+// Runs before any setup is created or any alert is sent.
+// All 8 rules are hard blocks — not filters, not suggestions.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const MIN_ZONE_WIDTH_PCT = 0.0002;  // 0.02% minimum zone width (≈$0.90 on gold)
+const MAX_CANDLE_AGE_MINS = 15;     // stale data threshold
+
+function validateSignal(sym, sweep, m5, levels, existingSetup) {
+  const reasons = [];
+
+  // ── RULE 1: DIRECTION CONSISTENCY ─────────────────────────────
+  // Equal Highs (EQH) = stop cluster ABOVE price = sweep up → SELL reversal
+  // Equal Lows  (EQL) = stop cluster BELOW price = sweep down → BUY reversal
+  // PDH/ASH = resistance above → sweep up → SELL
+  // PDL/ASL = support below → sweep down → BUY
+  if (sweep && sweep.found && sweep.level) {
+    const lvlType = sweep.level.type;
+    const expectedDir = (lvlType === 'EQH' || lvlType === 'PDH' || lvlType === 'ASH') ? 'SELL'
+                      : (lvlType === 'EQL' || lvlType === 'PDL' || lvlType === 'ASL') ? 'BUY'
+                      : null;
+    if (expectedDir && sweep.direction !== expectedDir) {
+      reasons.push('Direction mismatch: ' + lvlType + ' zone requires ' + expectedDir +
+        ' but got ' + sweep.direction);
+    }
+  }
+
+  // ── RULE 2: ZONE VALIDITY ──────────────────────────────────────
+  if (sweep && sweep.level && sweep.level.isZone) {
+    const z = sweep.level;
+    const refPrice = z.minPrice || z.price || 1;
+    // min === max means single price point, not a real zone
+    if (!z.minPrice || !z.maxPrice || z.minPrice === z.maxPrice) {
+      reasons.push('Zone invalid: min === max (single price point, not a zone)');
+    } else {
+      const width = (z.maxPrice - z.minPrice) / refPrice;
+      if (width < MIN_ZONE_WIDTH_PCT) {
+        reasons.push('Zone too narrow: ' + (width*100).toFixed(4) + '% width (min ' + (MIN_ZONE_WIDTH_PCT*100) + '%)');
+      }
+    }
+    // Must have at least 2 distinct touch levels
+    if ((z.totalTouches || 0) < 2) {
+      reasons.push('Insufficient touches: ' + (z.totalTouches || 0) + ' (min 2)');
+    }
+  }
+
+  // ── RULE 3: MINIMUM TOUCH QUALITY ─────────────────────────────
+  if (sweep && sweep.level) {
+    const touches = sweep.level.totalTouches || sweep.level.strengthScore || 1;
+    if (touches < 2) {
+      reasons.push('Touch quality too low: only ' + touches + ' touch(es)');
+    }
+  }
+
+  // ── RULE 4: DUPLICATE SETUP ───────────────────────────────────
+  if (existingSetup && existingSetup.active && !existingSetup.invalidated) {
+    // If same zone and same direction → duplicate
+    if (existingSetup.direction === sweep?.direction) {
+      const newZoneId  = sweep?.level?.isZone
+        ? Math.round(sweep.level.minPrice) + '-' + Math.round(sweep.level.maxPrice)
+        : Math.round(parseFloat(sweep?.level?.price || 0));
+      if (String(existingSetup.zoneId) === String(newZoneId)) {
+        reasons.push('Duplicate: setup already active for same zone ' + existingSetup.zoneId);
+      }
+    }
+  }
+
+  // ── RULE 5: ZONE ALREADY SWEPT RECENTLY ───────────────────────
+  // If this same zone was swept in the last 2 scans (10 min) and price hasn't moved away
+  // → block to prevent re-triggering on the same sweep candle
+  // (handled by the state machine's event lock — belt+braces here)
+  if (existingSetup && existingSetup.events?.sweep && existingSetup.active) {
+    reasons.push('Zone already swept in current setup — state machine handles progression');
+  }
+
+  // ── RULE 6: DATA FRESHNESS ─────────────────────────────────────
+  if (m5 && m5.length > 0) {
+    const lastCandleAge = (Date.now() - m5[m5.length - 1].t) / 60000; // minutes
+    if (lastCandleAge > MAX_CANDLE_AGE_MINS) {
+      reasons.push('Stale data: last candle ' + Math.round(lastCandleAge) + ' minutes old (max ' + MAX_CANDLE_AGE_MINS + ')');
+    }
+  }
+
+  // ── RULE 7: STRUCTURE SEQUENCE INTEGRITY ──────────────────────
+  // sweep must be detected before displacement, BOS, pullback
+  // (the state machine enforces this in order — this catches edge cases
+  //  where data arrives out of order or functions are called in wrong context)
+  if (!sweep || !sweep.found) {
+    // Without a sweep there is no valid setup origin
+    if (existingSetup && !existingSetup.events?.sweep) {
+      reasons.push('Sequence violation: no liquidity grab detected (cannot progress)');
+    }
+  }
+
+  // ── RULE 8: VOLATILITY / SWEEP STRENGTH ───────────────────────
+  if (sweep && sweep.found) {
+    const wickPct = sweep.wickPct || 0;
+    if (wickPct < 0.25) {
+      reasons.push('Sweep too weak: wick ' + Math.round(wickPct * 100) + '% of range (min 25%)');
+    }
+    if (m5 && m5.length >= 10) {
+      const avg10 = m5.slice(-10).reduce((s,c) => s + range(c), 0) / 10;
+      const sweepCandle = m5[sweep.candleIdx];
+      if (sweepCandle && avg10 > 0 && range(sweepCandle) < avg10 * 0.3) {
+        reasons.push('Sweep candle too small: ' + (range(sweepCandle)/avg10*100).toFixed(0) + '% of avg range (min 30%)');
+      }
+    }
+  }
+
+  const valid = reasons.length === 0;
+  if (!valid) {
+    reasons.forEach(r => console.log('[validate] ' + sym + ' REJECTED: ' + r));
+  }
+  return { valid, reasons };
+}
+
+// Fix sweep direction to always match zone type
+// Called after detectSweep — overrides geometry-based direction with zone-type direction
+function correctSweepDirection(sweep) {
+  if (!sweep || !sweep.found || !sweep.level) return sweep;
+  const lvlType = sweep.level.type;
+  const correct  = (lvlType === 'EQH' || lvlType === 'PDH' || lvlType === 'ASH') ? 'SELL'
+                 : (lvlType === 'EQL' || lvlType === 'PDL' || lvlType === 'ASL') ? 'BUY'
+                 : sweep.direction; // no override for unknown types
+  if (correct !== sweep.direction) {
+    console.log('[validate] Direction corrected: ' + sweep.direction + ' → ' + correct +
+      ' (zone type: ' + lvlType + ')');
+  }
+  return { ...sweep, direction: correct };
+}
+
 async function autoScan() {
   const h         = new Date().getUTCHours();
   const inSession = (h >= 7 && h < 16) || (h >= 13 && h < 22);
@@ -2008,7 +2147,9 @@ async function autoScan() {
         await delay(400); continue;
       }
 
-      const sweep = detectSweep(m5, levels);
+      // Detect sweep, then correct direction based on zone type (Rule 1 fix)
+      let sweep = detectSweep(m5, levels);
+      if (sweep.found) sweep = correctSweepDirection(sweep);
       const sweepToNow = sweep.found ? (m5.length - 1 - sweep.candleIdx) : 999;
 
       // ── STAGE: APPROACHING ─────────────────────────────────────
@@ -2028,6 +2169,16 @@ async function autoScan() {
 
         if (approaching) {
           // Create setup for this zone, fire approaching event
+          // Validate approaching zone before creating setup
+          const vApproach = validateSignal(sym, { found: true, level: approaching, direction: approaching.dir,
+            wickPct: 0.5 }, m5, levels, setups[sym]);
+          // For approaching, we only check Rules 1-4 (zone not swept yet, so R5-8 N/A)
+          const approachBlocked = vApproach.reasons.filter(r =>
+            !r.includes('Sweep too weak') && !r.includes('candle') && !r.includes('already swept'));
+          if (approachBlocked.length > 0) {
+            console.log('[validate] ' + sym + ': approaching blocked — ' + approachBlocked.join(', '));
+            await delay(400); continue;
+          }
           const newSetup = createSetup(sym, approaching.dir, approaching);
           setups[sym] = newSetup;
           setup = newSetup;
@@ -2062,10 +2213,16 @@ async function autoScan() {
         }
       }
 
-      // Create setup if none exists yet
+      // Validate before creating any setup
       if (!setup) {
+        const vResult = validateSignal(sym, sweep, m5, levels, null);
+        if (!vResult.valid) {
+          console.log('[validate] ' + sym + ': setup creation blocked (' + vResult.reasons.length + ' failures)');
+          await delay(400); continue;
+        }
         setup = createSetup(sym, sweep.direction, sweep.level);
         setups[sym] = setup;
+        console.log('[validate] ' + sym + ': setup passed all 8 rules — created id=' + setup.id);
       }
 
       // Block if already invalidated
