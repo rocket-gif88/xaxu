@@ -1778,6 +1778,9 @@ function formatTelegramSignal(sig) {
   const asset  = sig.asset === 'XAUUSD' ? 'GOLD' : 'SILVER';
   const grade  = sig.grade || (sig.confidence >= 85 ? 'A+' : 'A');
   const gradeEmoji = grade === 'A+' ? '⭐' : '✅';
+  const modeLabel  = sig.entry_mode === 'AGGRESSIVE_EARLY' ? ' ⚡ EARLY'
+                   : sig.entry_mode === 'AGGRESSIVE'       ? ' 🎯 AGGRESSIVE'
+                   : '';
   const alert  = sig.alert || {};
   const expiry = alert.expiry || '—';
   const bd     = sig.scoreBreakdown || {};
@@ -1798,7 +1801,7 @@ function formatTelegramSignal(sig) {
   };
 
   return [
-    emoji + ' <b>' + asset + ' ' + sig.direction + ' — ' + gradeEmoji + ' ' + grade + ' SETUP</b>',
+    emoji + ' <b>' + asset + ' ' + sig.direction + ' — ' + gradeEmoji + ' ' + grade + ' SETUP' + modeLabel + '</b>',
     '📊 Confidence: ' + sig.confidence + '/100 — ' + (sig.tier || (sig.confidence >= 75 ? 'HIGH' : 'VALID')),
     '',
     '📋 <b>What happened:</b>',
@@ -2002,6 +2005,218 @@ function sessionMinutesRemaining() {
   if (nowMins >= 7*60  && nowMins < 16*60) return 16*60 - nowMins;
   if (nowMins >= 13*60 && nowMins < 22*60) return 22*60 - nowMins;
   return 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AGGRESSIVE ENTRY ENGINE
+// Evaluates ONLY the primary zone. One setup per asset.
+// Confirmation: sweep → rejection → momentum (3 conditions, fast)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function aggressiveEntryEngine(sym, m5, primaryZone, sess) {
+  if (!primaryZone || !m5 || m5.length < 10) {
+    return { type: 'NO_SETUP', reason: 'No primary zone or insufficient data' };
+  }
+
+  const direction  = primaryZone.direction; // already set by selectPrimaryZone
+  const zoneLow    = primaryZone.minPrice;
+  const zoneHigh   = primaryZone.maxPrice;
+  const zoneRef    = direction === 'BUY' ? zoneLow : zoneHigh;
+  const CLOSE_TOL  = 0.001; // 0.1% tolerance for close condition
+  const SWEEP_MIN  = 0.0002; // 0.02% minimum sweep beyond zone
+
+  // Rolling average candle size (last 20)
+  const recent20 = m5.slice(-20);
+  const avgSize  = recent20.reduce((s, c) => s + range(c), 0) / recent20.length;
+  if (avgSize === 0) return { type: 'NO_SETUP', reason: 'Zero average candle size' };
+
+  // Scan recent candles for a valid sweep candle (last 6)
+  for (let i = m5.length - 6; i < m5.length; i++) {
+    if (i < 1) continue;
+    const c = m5[i];
+    const r = range(c);
+    if (r === 0) continue;
+
+    // ── INVALIDATION: candle too small ───────────────────────────
+    if (r < avgSize * 0.7) continue; // skip tiny candles
+    const wickFraction = direction === 'BUY'
+      ? (Math.min(c.o, c.c) - c.l) / r
+      : (c.h - Math.max(c.o, c.c)) / r;
+    if (wickFraction < 0.15) continue; // wick < 15% = no rejection
+
+    // ── CONDITION 1: LIQUIDITY SWEEP ─────────────────────────────
+    let sweptBeyond = false;
+    if (direction === 'BUY') {
+      // Price must trade BELOW zone low (wick OR body)
+      sweptBeyond = c.l < zoneLow * (1 - SWEEP_MIN);
+    } else {
+      // Price must trade ABOVE zone high (wick OR body)
+      sweptBeyond = c.h > zoneHigh * (1 + SWEEP_MIN);
+    }
+    if (!sweptBeyond) continue;
+
+    // ── INVALIDATION: barely touches zone ────────────────────────
+    const sweepDepth = direction === 'BUY'
+      ? (zoneLow - c.l) / zoneLow
+      : (c.h - zoneHigh) / zoneHigh;
+    if (sweepDepth < SWEEP_MIN) continue;
+
+    // ── CONDITION 2: CLOSE CONDITION ─────────────────────────────
+    let validClose = false;
+    if (direction === 'BUY') {
+      // Close inside zone OR within 0.1% below zone low
+      validClose = c.c >= zoneLow * (1 - CLOSE_TOL);
+    } else {
+      // Close inside zone OR within 0.1% above zone high
+      validClose = c.c <= zoneHigh * (1 + CLOSE_TOL);
+    }
+    if (!validClose) continue;
+
+    // ── CONDITION 3: REJECTION WICK ──────────────────────────────
+    const wickPct = direction === 'BUY'
+      ? (Math.min(c.o, c.c) - c.l) / r
+      : (c.h - Math.max(c.o, c.c)) / r;
+    if (wickPct < 0.25) continue; // wick must be ≥ 25% of range
+
+    // ── MICRO-STRUCTURE: no immediate lower-low / higher-high ────
+    if (i + 1 < m5.length) {
+      const next = m5[i + 1];
+      if (direction === 'BUY'  && next.l < c.l) continue; // lower low = cancel
+      if (direction === 'SELL' && next.h > c.h) continue; // higher high = cancel
+    }
+
+    // ── CONDITION 4: EARLY MOMENTUM (within next 2 candles) ──────
+    let momentumCandle = null;
+    let momentumDelay  = 0;
+    for (let j = i + 1; j <= Math.min(i + 2, m5.length - 1); j++) {
+      const mc2  = m5[j];
+      const bull = mc2.c > mc2.o;
+      const bear = mc2.c < mc2.o;
+      const big  = range(mc2) >= avgSize * 1.2;
+      // Condition A: single large candle in direction
+      if (direction === 'BUY'  && bull && big) { momentumCandle = mc2; momentumDelay = j - i; break; }
+      if (direction === 'SELL' && bear && big) { momentumCandle = mc2; momentumDelay = j - i; break; }
+      // Condition B: 2 consecutive candles in direction
+      if (j > i + 1) {
+        const prev2 = m5[j - 1];
+        if (direction === 'BUY'  && bull && prev2.c > prev2.o) { momentumCandle = mc2; momentumDelay = j - i; break; }
+        if (direction === 'SELL' && bear && prev2.c < prev2.o) { momentumCandle = mc2; momentumDelay = j - i; break; }
+      }
+    }
+
+    // ── TIME FILTER: momentum must occur within 2 candles ────────
+    if (!momentumCandle) {
+      const candlesSinceSweep = m5.length - 1 - i;
+
+      // ── EARLY ENTRY CONDITION ─────────────────────────────────
+      // If sweep candle itself is strong enough, skip momentum wait.
+      // All three sub-conditions must pass — weak sweeps never qualify.
+      const earlyWickOk  = wickPct >= 0.35;                   // wick ≥ 35% of range
+      const earlySizeOk  = r >= avgSize * 1.2;                // candle ≥ 1.2x average
+      // Strong close back inside zone (not just touching edge)
+      const earlyCloseOk = direction === 'BUY'
+        ? c.c >= zoneLow + (zoneHigh - zoneLow) * 0.25        // closed at least 25% into zone
+        : c.c <= zoneHigh - (zoneHigh - zoneLow) * 0.25;
+
+      if (earlyWickOk && earlySizeOk && earlyCloseOk) {
+        // Strong sweep candle — trigger early entry immediately
+        let earlyConf = primaryZone.confidence?.total || 50;
+        earlyConf += sweepDepth >= 0.003 ? 10 : 5;  // sweep depth bonus
+        // No momentum bonus — penalise slightly for no follow-through yet
+        earlyConf -= 5;
+        earlyConf = Math.min(Math.max(Math.round(earlyConf), 0), 100);
+
+        console.log('[entry] ' + sym + ' ' + direction + ' AGGRESSIVE_EARLY — wick=' +
+          (wickPct*100).toFixed(1) + '% size=' + (r/avgSize).toFixed(2) + 'x confidence=' + earlyConf);
+
+        return {
+          type:         'ENTRY_READY',
+          direction,
+          mode:         'AGGRESSIVE_EARLY',
+          zone:         { low: zoneLow, high: zoneHigh },
+          sweepCandle:  i,
+          sweepDepth:   parseFloat((sweepDepth * 100).toFixed(3)),
+          wickPct:      parseFloat((wickPct * 100).toFixed(1)),
+          momentumDelay: 0,
+          dispRatio:    parseFloat((r / avgSize).toFixed(2)),
+          entry_reason: [
+            'Liquidity sweep confirmed (depth ' + (sweepDepth*100).toFixed(3) + '%)',
+            'Strong rejection: ' + (wickPct*100).toFixed(1) + '% wick (≥35% required)',
+            'Candle size: ' + (r/avgSize).toFixed(2) + 'x average (≥1.2x required)',
+            'Strong close back inside zone — early entry triggered'
+          ],
+          confidence:   earlyConf,
+          primaryZone
+        };
+      }
+
+      // Weak sweep — wait for momentum (max 2 candles)
+      if (candlesSinceSweep <= 2) {
+        return {
+          type:        'SWEEP_FORMING',
+          direction,
+          sweepCandle: i,
+          wickPct:     parseFloat((wickPct * 100).toFixed(1)),
+          reason:      'Sweep confirmed — awaiting momentum (' + (2 - candlesSinceSweep) + ' candles remaining)' +
+                       ' | Early entry blocked: ' +
+                       (!earlyWickOk  ? 'wick ' + (wickPct*100).toFixed(1) + '% < 35%' :
+                        !earlySizeOk  ? 'candle ' + (r/avgSize).toFixed(2) + 'x < 1.2x avg' :
+                        !earlyCloseOk ? 'close not deep enough inside zone' : '?')
+        };
+      }
+      continue; // momentum window expired — cancel
+    }
+
+    // ── ALL 3 CONDITIONS MET → ENTRY CONFIRMED ───────────────────
+
+    // Confidence score adjustment
+    let confidence = primaryZone.confidence?.total || 50;
+
+    // Sweep depth bonus
+    if (sweepDepth >= 0.003)     confidence += 10; // deep sweep
+    else if (sweepDepth >= 0.001) confidence += 5;
+
+    // Momentum speed bonus/penalty
+    if (momentumDelay === 1)     confidence += 10; // confirmed in 1 candle
+    else                          confidence -= 10; // took 2 candles
+
+    // Displacement bonus
+    const dispRatio = range(momentumCandle) / avgSize;
+    if (dispRatio >= 1.5)        confidence += 5;
+
+    // Wick quality penalty
+    if (wickPct < 0.20)          confidence -= 15;
+
+    confidence = Math.min(Math.max(Math.round(confidence), 0), 100);
+
+    const entryReasons = [
+      'Liquidity sweep: ' + direction === 'BUY'
+        ? 'price swept below $' + zoneLow.toFixed(3) + ' (depth ' + (sweepDepth*100).toFixed(3) + '%)'
+        : 'price swept above $' + zoneHigh.toFixed(3) + ' (depth ' + (sweepDepth*100).toFixed(3) + '%)',
+      'Rejection: ' + (wickPct * 100).toFixed(1) + '% wick confirmed',
+      'Momentum: ' + (momentumDelay === 1 ? 'confirmed in 1 candle (' + dispRatio.toFixed(2) + 'x avg)' : '2 consecutive candles')
+    ];
+
+    console.log('[entry] ' + sym + ' ' + direction + ' ENTRY_READY — confidence=' + confidence +
+      ' sweep=' + (sweepDepth*100).toFixed(3) + '% wick=' + (wickPct*100).toFixed(1) + '% delay=' + momentumDelay);
+
+    return {
+      type:         'ENTRY_READY',
+      direction,
+      mode:         'AGGRESSIVE',
+      zone:         { low: zoneLow, high: zoneHigh },
+      sweepCandle:  i,
+      sweepDepth:   parseFloat((sweepDepth * 100).toFixed(3)),
+      wickPct:      parseFloat((wickPct * 100).toFixed(1)),
+      momentumDelay,
+      dispRatio:    parseFloat(dispRatio.toFixed(2)),
+      entry_reason: entryReasons,
+      confidence,
+      primaryZone
+    };
+  }
+
+  return { type: 'NO_ENTRY', direction, reason: 'No valid sweep/rejection/momentum pattern found' };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2212,25 +2427,29 @@ async function autoScan() {
         await delay(400); continue;
       }
 
-      // Detect sweep, then correct direction based on zone type (Rule 1 fix)
-      let sweep = detectSweep(m5, levels);
+      // ── PRIMARY ZONE SELECTION — only this zone matters ─────────
+      const primaryZone = selectPrimaryZone(levels, livePrice, sess);
+      if (!primaryZone) {
+        console.log('[' + sym + '] No primary zone found — skip');
+        await delay(400); continue;
+      }
+      console.log('[' + sym + '] Primary zone: ' + primaryZone.direction +
+        ' ' + primaryZone.priceRange + ' confidence=' + (primaryZone.confidence?.total||0));
+
+      // Detect sweep from primary zone only — non-primary zones ignored
+      let sweep = detectSweep(m5, [primaryZone]); // only check primary zone
       if (sweep.found) sweep = correctSweepDirection(sweep);
       const sweepToNow = sweep.found ? (m5.length - 1 - sweep.candleIdx) : 999;
 
       // ── STAGE: APPROACHING ─────────────────────────────────────
       // Fire once when price is near a key zone and no setup is active yet
       if (!setup && !sweep.found) {
-        const approaching = levels
-          .filter(l => (l.type === 'EQH' || l.type === 'EQL' || l.type === 'PDH' || l.type === 'PDL'))
-          .map(l => {
-            const nearEdge = l.isZone
-              ? (livePrice > l.maxPrice ? l.maxPrice : livePrice < l.minPrice ? l.minPrice : livePrice)
-              : l.price;
-            const distPct = Math.abs(livePrice - nearEdge) / nearEdge;
-            return { ...l, distPct, dir: l.type === 'EQH' || l.type === 'PDH' ? 'SELL' : 'BUY' };
-          })
-          .filter(l => l.distPct <= 0.002) // within 0.2%
-          .sort((a,b) => a.distPct - b.distPct)[0];
+        // Only approach the PRIMARY ZONE — not random levels
+        const nearEdgePz = primaryZone.direction === 'SELL' ? primaryZone.minPrice : primaryZone.maxPrice;
+        const distPctPz  = Math.abs(livePrice - nearEdgePz) / nearEdgePz;
+        const approaching = distPctPz <= 0.005 // within 0.5% of primary zone
+          ? { ...primaryZone, distPct: parseFloat((distPctPz*100).toFixed(3)), dir: primaryZone.direction }
+          : null;
 
         if (approaching) {
           // Create setup for this zone, fire approaching event
@@ -2357,6 +2576,28 @@ async function autoScan() {
       ));
 
       // ── STAGE: ENTRY SIGNAL ───────────────────────────────────
+      // Run aggressive entry engine NOW — after full multi-stage confirmation
+      // All 4 prior stages (sweep/move/trend/pullback) are confirmed at this point.
+      // Engine acts as final execution layer, not a replacement for structure.
+      const entryResult = aggressiveEntryEngine(sym, m5, primaryZone, sess);
+
+      // If engine sees no valid entry pattern at this exact moment, defer
+      // SWEEP_FORMING = engine sees sweep but momentum not yet confirmed → wait
+      if (entryResult.type === 'SWEEP_FORMING') {
+        console.log('[' + sym + '] Aggressive engine: sweep forming — ' + entryResult.reason);
+        await delay(400); continue;
+      }
+      if (entryResult.type === 'NO_ENTRY') {
+        console.log('[' + sym + '] Aggressive engine: no entry pattern — ' + entryResult.reason);
+        // Don't block — fall through to standard score gate
+        // (engine adds timing precision but doesn't veto a structurally valid setup)
+      }
+      if (entryResult.type === 'ENTRY_READY') {
+        const modeLabel = entryResult.mode === 'AGGRESSIVE_EARLY' ? 'AGGRESSIVE_EARLY' : 'AGGRESSIVE';
+        console.log('[' + sym + '] Engine: ' + modeLabel + ' ENTRY_READY — confidence=' +
+          entryResult.confidence + ' | ' + (entryResult.entry_reason?.[0] || ''));
+      }
+
       const sl  = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5);
       const tps = calcTP(sweep.direction, pb.entry, sl, levels);
 
@@ -2376,13 +2617,26 @@ async function autoScan() {
       const scoreResult = scoreSetup(sess, sessionOk, sweep, disp, bos, pb,
         volatility.ok === true || volatility.ok === undefined, directionalBias, biasPenalty);
 
-      console.log('[' + sym + '] Score: ' + scoreResult.total + ' (' + scoreResult.grade + ')');
+      // Aggressive engine boosts score when it confirms — additive, not replacement
+      // Standard score gate still applies regardless
+      let finalScore = scoreResult.total;
+      if (entryResult.type === 'ENTRY_READY') {
+        // Blend: average of structural score and aggressive confidence, +5 bonus
+        finalScore = Math.min(Math.round((scoreResult.total + entryResult.confidence) / 2) + 5, 100);
+        scoreResult.total = finalScore;
+        scoreResult.grade = finalScore >= 85 ? 'A+' : finalScore >= 75 ? 'A' : scoreResult.grade;
+        scoreResult.tier  = finalScore >= 75 ? 'HIGH' : scoreResult.tier;
+        console.log('[' + sym + '] Score: ' + scoreResult.total + ' → ' + finalScore +
+          ' (structural + aggressive confirmation) (' + scoreResult.grade + ')');
+      } else {
+        finalScore = scoreResult.total;
+        console.log('[' + sym + '] Score: ' + finalScore + ' (' + scoreResult.grade + ')' +
+          (entryResult.type === 'NO_ENTRY' ? ' [aggressive engine: no pattern]' : ''));
+      }
 
       // Tier gate: only HIGH (≥75) gets a full signal
-      // VALID (60-74) → pre-signal already fired, no full entry
-      // LOW / IGNORE → silent discard
       if (scoreResult.tier !== 'HIGH') {
-        console.log('[' + sym + '] Score ' + scoreResult.total + ' tier=' + scoreResult.tier + ' — full signal requires HIGH (≥75)');
+        console.log('[' + sym + '] Score ' + finalScore + ' tier=' + scoreResult.tier + ' — below 75 threshold');
         await delay(400); continue;
       }
 
@@ -2414,6 +2668,7 @@ async function autoScan() {
         stop_loss: sl, take_profit_1: tps.tp1, take_profit_2: tps.tp2,
         rr: tps.rr1, confidence: scoreResult.total,
         grade: scoreResult.grade, tier: scoreResult.tier, scoreBreakdown: scoreResult.breakdown,
+        entry_mode: entryResult.type === 'ENTRY_READY' ? entryResult.mode : 'STANDARD',
         session: sess, directional_bias: directionalBias,
         sweep_level: sweep.level?.label || '—',
         pullback_pct: pb.retracement, expiry: expiryUTC,
