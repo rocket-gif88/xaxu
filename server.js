@@ -1066,4 +1066,15 @@ app.get('/', (req, res) => res.json({
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Aurum Signal Engine v4 — Liquidity Sweep (port ${PORT})`));
+app.listen(PORT, () => {
+  console.log('='.repeat(60));
+  console.log('Aurum Signal Engine v5 — Liquidity Sweep');
+  console.log('Port:', PORT);
+  console.log('UTC time:', new Date().toUTCString());
+  console.log('Symbols:', Object.keys(SYMBOLS).join(', '));
+  console.log('Twelve Data key:', TWELVE_KEY.slice(0,8) + '...');
+  const h = new Date().getUTCHours();
+  const sess = (h>=7&&h<16&&h>=13) ? 'London+NY Overlap' : (h>=7&&h<16) ? 'London' : (h>=13&&h<22) ? 'New York' : 'Closed';
+  console.log('Current session:', sess, '(UTC hour ' + h + ')');
+  console.log('='.repeat(60));
+});
