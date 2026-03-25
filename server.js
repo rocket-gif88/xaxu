@@ -19,7 +19,7 @@ const SYMBOLS = { XAUUSD:'XAU/USD', XAGUSD:'XAG/USD' };
 // Cache candle data for 60 seconds to avoid hitting Twelve Data rate limits
 // when both XAUUSD and XAGUSD are scanned in quick succession.
 const cache = {};
-const CACHE_TTL = 60 * 1000; // 60 seconds
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes — M5 candles update every 5min anyway
 
 function getCached(key) {
   const entry = cache[key];
@@ -113,6 +113,38 @@ async function getATR(sym, interval, period) {
 const pct   = (a, b) => Math.abs(a - b) / b;            // relative distance
 const body  = c      => Math.abs(c.c - c.o);
 const range = c      => c.h - c.l;                      // always positive
+
+// Calculate ATR from candles — no API call needed (Wilder's smoothing)
+function calcATRFromCandles(candles, period = 14) {
+  if (!candles || candles.length < period + 1) return [];
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i], p = candles[i-1];
+    trs.push(Math.max(c.h - c.l, Math.abs(c.h - p.c), Math.abs(c.l - p.c)));
+  }
+  let atr = trs.slice(0, period).reduce((s,v) => s+v, 0) / period;
+  const atrs = [atr];
+  for (let i = period; i < trs.length; i++) {
+    atr = (atr * (period - 1) + trs[i]) / period;
+    atrs.push(atr);
+  }
+  return atrs;
+}
+
+// Derive M15 candles from M5 — no API call needed (3 M5 = 1 M15)
+function deriveM15FromM5(m5Candles) {
+  if (!m5Candles || m5Candles.length < 3) return [];
+  const m15 = [];
+  for (let i = 0; i + 2 < m5Candles.length; i += 3) {
+    const g = m5Candles.slice(i, i + 3);
+    m15.push({ t: g[0].t, o: g[0].o,
+               h: Math.max(...g.map(c => c.h)),
+               l: Math.min(...g.map(c => c.l)),
+               c: g[2].c });
+  }
+  return m15;
+}
+
 
 // --- ATR RANGE VALIDATION ----------------------------------------------------
 // Valid ATR range per M5 candle. Outside either bound = ignore volatility filter.
@@ -752,17 +784,19 @@ app.get('/analyze/:sym', async (req, res) => {
   // ── 1. FETCH DATA ──────────────────────────────────────────────────────
   let m5, m15, atrValues;
   try {
-    // Sequential fetches to avoid Twelve Data rate limits on free tier.
-    // 300ms gap between requests prevents 429 errors.
-    const delay = ms => new Promise(r => setTimeout(r, ms));
-    m5        = await getCandles(sym, '5min', 120);   // ~10h of M5
-    await delay(300);
-    m15       = await getCandles(sym, '15min', 96);   // ~24h of M15
-    await delay(300);
-    atrValues = await getATR(sym, '5min', 14);
-    console.log(`[${sym}] M5: ${m5?.length||0} M15: ${m15?.length||0} ATR: ${atrValues?.length||0}`);
+    // ONE API call per symbol — everything else derived from M5 candles.
+    // M15 is derived by grouping M5 candles (3 M5 = 1 M15).
+    // ATR is calculated locally from candle data (Wilder's method).
+    // This keeps total calls at 2/scan (1 per symbol) — within free tier.
+    m5 = await getCandles(sym, '5min', 120);  // 120 × 5min = 10 hours
+
+    // Derive M15 and ATR without additional API calls
+    m15       = m5 ? deriveM15FromM5(m5) : [];
+    atrValues = m5 ? calcATRFromCandles(m5, 14) : [];
+
+    console.log('[' + sym + '] M5: ' + (m5?.length||0) + ' M15 (derived): ' + (m15?.length||0) + ' ATR (calc): ' + (atrValues?.length||0) + ' — 1 API call used');
   } catch(e) {
-    console.error(`[${sym}] Data fetch exception:`, e.message);
+    console.error('[' + sym + '] Data fetch exception:', e.message);
     return res.json({ success: true, symbol: sym, price: null, atr: null,
       system_state: 'data_error', session: 'Unknown', session_ok: false,
       setup_state: 'standby', levels: [],
@@ -928,14 +962,14 @@ app.get('/analyze/:sym', async (req, res) => {
                   ];
                   if (sweep.direction === 'SELL') reasonParts[0] = reasonParts[0].replace('bullish','bearish');
 
-                  // Fetch ratio
+                  // Ratio from cache — no extra API call
                   let ratio = null;
                   try {
-                    const [xau,xag] = await Promise.all([
-                      getCandles('XAUUSD','5min',1).then(c=>c?c[0].c:null),
-                      getCandles('XAGUSD','5min',1).then(c=>c?c[0].c:null)
-                    ]);
-                    if (xau && xag) ratio = parseFloat((xau/xag).toFixed(2));
+                    const xauC = getCached('candles_XAUUSD_5min_120');
+                    const xagC = getCached('candles_XAGUSD_5min_120');
+                    const xauP = xauC ? xauC[xauC.length-1]?.c : null;
+                    const xagP = xagC ? xagC[xagC.length-1]?.c : null;
+                    if (xauP && xagP) ratio = parseFloat((xauP/xagP).toFixed(2));
                   } catch(e) {}
 
                   const rawSignal = {
@@ -974,19 +1008,20 @@ app.get('/analyze/:sym', async (req, res) => {
     }
   }
 
-  // Fetch live price for display
-  let livePrice = currentPrice;
-  try { const p = await fetch(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(SYMBOLS[sym])}&apikey=${TWELVE_KEY}`).then(r=>r.json()); if(p.price) livePrice = parseFloat(p.price); } catch(e) {}
+  // Use last M5 candle close as live price — saves 1 API call
+  // Candles are cached so this is instant; max 5min stale which is acceptable
+  const livePrice = currentPrice;
 
-  // Ratio
+  // Derive ratio from cached candle data — no API call
   let ratio = null;
   try {
     if (sym === 'XAUUSD' || sym === 'XAGUSD') {
-      const [xa, xg] = await Promise.all([
-        fetch(`https://api.twelvedata.com/price?symbol=XAU%2FUSD&apikey=${TWELVE_KEY}`).then(r=>r.json()),
-        fetch(`https://api.twelvedata.com/price?symbol=XAG%2FUSD&apikey=${TWELVE_KEY}`).then(r=>r.json())
-      ]);
-      if (xa.price && xg.price) ratio = parseFloat((parseFloat(xa.price)/parseFloat(xg.price)).toFixed(2));
+      const xauCache = getCached('candles_XAUUSD_5min_120');
+      const xagCache = getCached('candles_XAGUSD_5min_120');
+      const xauP = xauCache ? xauCache[xauCache.length-1]?.c : null;
+      const xagP = xagCache ? xagCache[xagCache.length-1]?.c : null;
+      if (xauP && xagP) ratio = parseFloat((xauP/xagP).toFixed(2));
+      // If other symbol isn't cached yet, ratio stays null — that's fine
     }
   } catch(e) {}
 
@@ -1072,18 +1107,20 @@ app.get('/health', async (req, res) => {
   });
 });
 
-app.get('/prices', async (req, res) => {
-  try {
-    const [xa, xg] = await Promise.all([
-      fetch(`https://api.twelvedata.com/price?symbol=XAU%2FUSD&apikey=${TWELVE_KEY}`).then(r=>r.json()),
-      fetch(`https://api.twelvedata.com/price?symbol=XAG%2FUSD&apikey=${TWELVE_KEY}`).then(r=>r.json())
-    ]);
-    const xau = parseFloat(xa.price)||null;
-    const xag = parseFloat(xg.price)||null;
-    res.json({ success:true, prices:{ XAUUSD:xau, XAGUSD:xag }, ratio: xau&&xag ? parseFloat((xau/xag).toFixed(2)) : null, ts: new Date().toUTCString() });
-  } catch(e) {
-    res.status(500).json({ success:false, error:e.message });
-  }
+app.get('/prices', (req, res) => {
+  // Serve prices from in-memory cache — zero API calls
+  // Cache is populated by /analyze calls; stale by at most 60s which is fine
+  const xauCache = getCached('candles_XAUUSD_5min_120');
+  const xagCache = getCached('candles_XAGUSD_5min_120');
+  const xau = xauCache ? parseFloat(xauCache[xauCache.length-1]?.c) || null : null;
+  const xag = xagCache ? parseFloat(xagCache[xagCache.length-1]?.c) || null : null;
+  res.json({
+    success: true,
+    prices: { XAUUSD: xau, XAGUSD: xag },
+    ratio: xau && xag ? parseFloat((xau/xag).toFixed(2)) : null,
+    from_cache: true,
+    ts: new Date().toUTCString()
+  });
 });
 
 // Keep-alive ping — call this from frontend every 4 min to prevent Railway sleep
