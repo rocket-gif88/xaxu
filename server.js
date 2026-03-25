@@ -15,6 +15,24 @@ const TWELVE_KEY    = '7f3fc6ca85664930ab6e687db8ff0c5d';
 const ANTHROPIC_KEY = ['sk-ant-','api03-PSBtiCb9gNCUnpxHjEl2sqWVtfNop5DtO1WCW2pdUw_upi3Zl0VDjCT7Yyk','W9bboA3Bxnq2ucHBFyuNrNx6CL','w-qYuk4wAA'].join('');
 const SYMBOLS = { XAUUSD:'XAU/USD', XAGUSD:'XAG/USD' };
 
+// ─── IN-MEMORY CACHE ────────────────────────────────────────────────────────
+// Cache candle data for 60 seconds to avoid hitting Twelve Data rate limits
+// when both XAUUSD and XAGUSD are scanned in quick succession.
+const cache = {};
+const CACHE_TTL = 60 * 1000; // 60 seconds
+
+function getCached(key) {
+  const entry = cache[key];
+  if (entry && (Date.now() - entry.ts) < CACHE_TTL) {
+    console.log(`[cache hit] ${key} (${Math.round((Date.now()-entry.ts)/1000)}s old)`);
+    return entry.data;
+  }
+  return null;
+}
+function setCached(key, data) {
+  cache[key] = { ts: Date.now(), data };
+}
+
 // ─── SAFE FETCH ────────────────────────────────────────────────────────────
 async function tdFetch(path) {
   const sep = path.includes('?') ? '&' : '?';
@@ -36,6 +54,12 @@ async function tdFetch(path) {
 async function getCandles(sym, interval, n) {
   const td = SYMBOLS[sym];
   if (!td) { console.error('Unknown symbol:', sym); return null; }
+  
+  // Check cache first
+  const cacheKey = `candles_${sym}_${interval}_${n}`;
+  const cached = getCached(cacheKey);
+  if (cached) return cached;
+  
   try {
     const d = await tdFetch(`/time_series?symbol=${encodeURIComponent(td)}&interval=${interval}&outputsize=${n}`);
     // Twelve Data returns {code, message} on errors (rate limit, bad symbol, etc.)
@@ -55,6 +79,7 @@ async function getCandles(sym, interval, n) {
       c: parseFloat(c.close)
     })).reverse();
     console.log(`TD candles OK [${sym} ${interval}]:`, candles.length, 'candles');
+    setCached(cacheKey, candles);
     return candles;
   } catch(e) {
     console.error(`TD candles exception [${sym} ${interval}]:`, e.message);
@@ -65,6 +90,9 @@ async function getCandles(sym, interval, n) {
 async function getATR(sym, interval, period) {
   const td = SYMBOLS[sym];
   if (!td) return [];
+  const cacheKey = `atr_${sym}_${interval}_${period}`;
+  const cached = getCached(cacheKey);
+  if (cached) return cached;
   try {
     const d = await tdFetch(`/atr?symbol=${encodeURIComponent(td)}&interval=${interval}&time_period=${period}&outputsize=21`);
     if (d.code || d.status === 'error' || d.message) {
@@ -72,7 +100,9 @@ async function getATR(sym, interval, period) {
       return [];
     }
     if (!d.values) return [];
-    return d.values.map(v => parseFloat(v.atr)).reverse();
+    const atrVals = d.values.map(v => parseFloat(v.atr)).reverse();
+    setCached(cacheKey, atrVals);
+    return atrVals;
   } catch(e) {
     console.error(`TD ATR exception [${sym}]:`, e.message);
     return [];
@@ -1058,6 +1088,36 @@ app.get('/prices', async (req, res) => {
 
 // Keep-alive ping — call this from frontend every 4 min to prevent Railway sleep
 app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
+// Debug endpoint — shows raw Twelve Data response for a symbol
+// Usage: /debug/XAUUSD or /debug/XAGUSD
+app.get('/debug/:sym', async (req, res) => {
+  const sym = req.params.sym.toUpperCase();
+  const td  = SYMBOLS[sym];
+  if (!td) return res.status(400).json({ error: 'Unknown symbol' });
+  try {
+    // Test the simplest possible request: last 5 M5 candles
+    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(td)}&interval=5min&outputsize=5&apikey=${TWELVE_KEY}`;
+    console.log('[debug] fetching:', url.replace(TWELVE_KEY, '***'));
+    const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    const json = await resp.json();
+    console.log('[debug] response:', JSON.stringify(json).slice(0, 500));
+    res.json({
+      symbol: sym,
+      td_symbol: td,
+      http_status: resp.status,
+      has_values: !!(json.values && json.values.length > 0),
+      candle_count: json.values?.length || 0,
+      first_candle: json.values?.[0] || null,
+      error_code: json.code || null,
+      error_msg: json.message || null,
+      status: json.status || null,
+      raw_keys: Object.keys(json)
+    });
+  } catch(e) {
+    res.json({ error: e.message });
+  }
+});
 
 app.get('/', (req, res) => res.json({
   status:'ok', version:'4.0',
