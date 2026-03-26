@@ -2098,10 +2098,17 @@ function createSetup(sym, direction, levelOrZone) {
       entry:        false,
       invalidated:  false,
     },
+    // Candle index at which each stage was confirmed — enforces stage separation
+    stageCandleIdx: {
+      sweep:    -1,
+      move:     -1,
+      trend:    -1,
+      pullback: -1,
+      entry:    -1,
+    },
     startedAt:       Date.now(),
     lastEventAt:     Date.now(),
-    earlyLockUntil:  0,   // timestamp — ignore new sweeps until this passes (post early-entry)
-    // Cooldown per event type (ms) — safety net against edge-case re-triggers
+    earlyLockUntil:  0,
     cooldowns: {}
   };
   console.log('[setup] Created id=' + id + ' dir=' + direction + ' zone=' + zoneId);
@@ -2129,6 +2136,21 @@ async function fireEvent(setup, event, sym, alertFn) {
     console.log('[' + sym + '] fireEvent ' + event + ' blocked — already fired for this setup (id=' + setup.id + ')');
     return false;
   }
+  // ── Candle separation: each stage must confirm on a LATER candle than previous
+  // candleIdx is passed as optional 5th arg — if provided, enforce separation
+  const candleIdx = arguments[4] !== undefined ? arguments[4] : -1;
+  const stageOrder = ['sweep','move','trend','pullback','entry'];
+  const prevStageIdx = stageOrder.indexOf(event) - 1;
+  if (candleIdx >= 0 && prevStageIdx >= 0 && setup.stageCandleIdx) {
+    const prevStage = stageOrder[prevStageIdx];
+    const prevCandle = setup.stageCandleIdx[prevStage] ?? -1;
+    if (prevCandle >= 0 && candleIdx <= prevCandle) {
+      console.log('[' + sym + '] fireEvent ' + event + ' BLOCKED — same candle as ' +
+        prevStage + ' (idx=' + candleIdx + '). Must wait for next candle.');
+      return false;
+    }
+  }
+
   // 15-minute cooldown per event type as safety net
   const COOLDOWN_MS = 15 * 60 * 1000;
   const lastFired = setup.cooldowns[event] || 0;
@@ -2143,6 +2165,10 @@ async function fireEvent(setup, event, sym, alertFn) {
   setup.stage          = event;
   setup.lastEventAt    = Date.now();
   setup.cooldowns[event] = Date.now();
+  // Record which candle confirmed this stage (for separation enforcement)
+  if (setup.stageCandleIdx && arguments[4] !== undefined) {
+    setup.stageCandleIdx[event] = arguments[4];
+  }
   // Stage progression log (visible in Railway logs)
   const stageLabels = {
     approaching: 'Stage → approaching liquidity',
@@ -2767,7 +2793,7 @@ async function autoScan() {
         asset + ' swept ' + lvlDesc + ' and closed back inside.\n' +
         'Direction: <b>' + sweep.direction + '</b>\n\n' +
         '⏳ Waiting for a strong displacement candle.\n\n─────────────────\nAurum Signals'
-      ));
+      ), sweep.candleIdx);
 
       // ── STAGE: DISPLACEMENT (MOVE) ────────────────────────────
       const disp = detectDisplacement(m5, sweep.candleIdx, sweep.direction);
@@ -2781,7 +2807,7 @@ async function autoScan() {
         'A ' + disp.ratio + '× displacement candle followed the liquidity grab.\n' +
         'Direction: <b>' + sweep.direction + '</b>\n\n' +
         '⏳ Waiting for break of structure.\n\n─────────────────\nAurum Signals'
-      ));
+      ), disp.candleIdx);
 
       // ── STAGE: TREND SHIFT (BOS) ──────────────────────────────
       const bos = detectBOS(m5, sweep.candleIdx, sweep.direction);
@@ -2796,13 +2822,22 @@ async function autoScan() {
         'Break of structure confirmed on M5' + (m15bos ? '/M15' : '') + '.\n' +
         'Direction: <b>' + sweep.direction + '</b>\n\n' +
         '⏳ Waiting for 50–61.8% pullback into entry zone.\n\n─────────────────\nAurum Signals'
-      ));
+      ), bos.candleIdx);
 
       // ── STAGE: PULLBACK ───────────────────────────────────────
+      // Invalidation delay: after trend shift, wait at least 1 candle before
+      // evaluating pullback. Prevents instant invalidation on same scan as BOS.
+      const trendCandleIdx = setup.stageCandleIdx?.trend ?? bos.candleIdx;
+      const candlesSinceTrend = (m5.length - 1) - trendCandleIdx;
+      if (candlesSinceTrend < 1) {
+        console.log('[' + sym + '] Trend confirmed at candle ' + trendCandleIdx +
+          ' — waiting 1 candle before pullback evaluation (anti-instant-invalidation)');
+        await delay(400); continue;
+      }
+
       const pb = detectPullback(m5, disp.candleIdx, sweep.direction, sweep.sweepExtreme);
       if (!pb.found) {
         if (pb.reason && pb.reason.includes('70%')) {
-          // 70% invalidation — fires once
           await invalidateSetup(sym, 'Pullback exceeded 70% retracement.');
           resetSetup(sym, 'Pullback > 70%');
         } else {
@@ -2816,7 +2851,7 @@ async function autoScan() {
         'Price pulled back ' + pb.retracement + '% into the entry zone.\n' +
         'Preparing to evaluate full signal.\n\n' +
         '⏳ Running quality checks...\n\n─────────────────\nAurum Signals'
-      ));
+      ), pb.candleIdx);
 
       // ── STAGE: ENTRY SIGNAL ───────────────────────────────────
       // Run aggressive entry engine — gated by zone score
