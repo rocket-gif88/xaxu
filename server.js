@@ -252,10 +252,12 @@ function clusterEQLevels(rawLevels, currentPrice, zoneType) {
         console.log('[levels] Skipping degenerate zone (min=max) at $' + clMin.toFixed(3));
         continue; // skip this cluster
       }
+      const avgWickZone = cl.reduce((s,l) => s + (l.avgWick||0), 0) / cl.length;
+      const lastIdxZone = Math.max(...cl.map(l => l.lastCandleIdx || 0));
       merged.push({
         type:          zoneType,
         zoneType:      zoneType === 'EQH' ? 'sell_zone' : 'buy_zone',
-        price:         avgPrice,           // representative price (for sweep detection)
+        price:         avgPrice,
         minPrice:      clMin,
         maxPrice:      clMax,
         totalTouches:  allTouches,
@@ -263,12 +265,13 @@ function clusterEQLevels(rawLevels, currentPrice, zoneType) {
         levels:        cl,
         strengthScore: maxStr,
         strength:      maxStr >= 3 ? 'strong' : maxStr >= 2 ? 'medium' : 'weak',
-        isZone:        true,               // flag: this is a clustered zone, not a single level
+        isZone:        true,
+        avgWick:       avgWickZone,       // for reaction scoring
+        lastCandleIdx: lastIdxZone,       // for recency scoring (index within recent20)
         label:         zoneType === 'EQH'
           ? 'Equal Highs zone (' + allTouches + ' touches)'
           : 'Equal Lows zone ('  + allTouches + ' touches)',
-        priceRange:    parseFloat(Math.min(...cl.map(l=>l.price)).toFixed(3)) + '–' +
-                       parseFloat(Math.max(...cl.map(l=>l.price)).toFixed(3))
+        priceRange:    parseFloat(clMin.toFixed(3)) + '–' + parseFloat(clMax.toFixed(3))
       });
     }
   }
@@ -317,17 +320,25 @@ function buildLevels(m5Candles, m15Candles) {
     if (!placed) eqLowGroups.push([c]);
   });
 
-  // Build raw EQH levels (filter singles)
+  // Build raw EQH levels — attach candle indices for recency + reaction scoring
   const rawEQH = eqHighGroups.filter(g => g.length >= 2).map(g => {
-    const avg = g.reduce((s,c)=>s+c.h,0)/g.length;
-    return { price: avg, type:'EQH', touches: g.length,
-             strengthScore: g.length >= 4 ? 3 : g.length === 3 ? 2 : 1 };
+    const avg      = g.reduce((s,c)=>s+c.h,0)/g.length;
+    // Find index of most recent candle in this group within recent20
+    const lastIdx  = recent20.length - 1 - [...recent20].reverse().findIndex(c =>
+      g.some(gc => Math.abs(gc.h - c.h) < avg * 0.0005));
+    // Average wick size as proxy for reaction strength
+    const avgWick  = g.reduce((s,c) => s + (c.h - Math.max(c.o, c.c)), 0) / g.length;
+    return { price: avg, type:'EQH', touches: g.length, lastCandleIdx: lastIdx,
+             avgWick, strengthScore: g.length >= 4 ? 3 : g.length === 3 ? 2 : 1 };
   });
 
   const rawEQL = eqLowGroups.filter(g => g.length >= 2).map(g => {
-    const avg = g.reduce((s,c)=>s+c.l,0)/g.length;
-    return { price: avg, type:'EQL', touches: g.length,
-             strengthScore: g.length >= 4 ? 3 : g.length === 3 ? 2 : 1 };
+    const avg      = g.reduce((s,c)=>s+c.l,0)/g.length;
+    const lastIdx  = recent20.length - 1 - [...recent20].reverse().findIndex(c =>
+      g.some(gc => Math.abs(gc.l - c.l) < avg * 0.0005));
+    const avgWick  = g.reduce((s,c) => s + (Math.min(c.o, c.c) - c.l), 0) / g.length;
+    return { price: avg, type:'EQL', touches: g.length, lastCandleIdx: lastIdx,
+             avgWick, strengthScore: g.length >= 4 ? 3 : g.length === 3 ? 2 : 1 };
   });
 
   // Current price for clustering threshold
@@ -380,80 +391,168 @@ function detectApproaching(price, levels, sym) {
 // ── ZONE CONFIDENCE SCORING (0–100) ──────────────────────────────────────────
 // Used for pre-signal gating and UI display.
 // Separate from full signal scoreSetup() — zones don't have BOS/pullback yet.
-function scoreZone(z, price, sess) {
-  let total = 0;
+// ═══════════════════════════════════════════════════════════════════════════
+// ZONE RANKING & SELECTION ENGINE
+// Scores all valid zones, selects ONE primary zone per symbol.
+// Secondary zones are ignored for all signal logic.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Hard filter — discard before scoring
+function passesHardFilter(z, m5Candles) {
+  // 1. Minimum touch count
+  if ((z.totalTouches || 0) < 3) return { pass: false, reason: 'touches < 3 (' + (z.totalTouches||0) + ')' };
+  // 2. Zero-width zone
+  if (!z.minPrice || !z.maxPrice || z.minPrice === z.maxPrice)
+    return { pass: false, reason: 'zero-width zone' };
+  // 3. Zone age — last touch within 150 candles
+  const candlesSinceLast = (m5Candles.length - 1) - (z.lastCandleIdx || 0);
+  if (candlesSinceLast > 150) return { pass: false, reason: 'too old (' + candlesSinceLast + ' candles)' };
+  return { pass: true };
+}
+
+// Zone scoring model — 0 to 100
+function rankZone(z, price, sess, m5Candles) {
   const breakdown = {};
+  let total = 0;
 
-  // A. Liquidity Strength (0–25)
-  const touches = z.totalTouches || z.touches || 1;
-  const liqScore = touches >= 8 ? 25 : touches >= 6 ? 22 : touches >= 4 ? 18
-                 : touches >= 3 ? 15 : touches >= 2 ? 10 : 5;
-  breakdown.liquidity = { score: liqScore, max: 25, touches };
-  total += liqScore;
+  // ── A. TOUCH COUNT (max 30) ───────────────────────────────────
+  const touches = z.totalTouches || 0;
+  const touchScore = touches >= 15 ? 30
+                   : touches >= 10 ? 24
+                   : touches >= 6  ? 18
+                   : touches >= 3  ? 10 : 0;
+  breakdown.touches = { score: touchScore, max: 30, count: touches };
+  total += touchScore;
 
-  // B. Zone Width — tighter zone = cleaner level (0–25)
-  // Narrow zone (< 0.1%) = strong, wide zone (> 0.3%) = weak
-  const zoneWidth = z.maxPrice && z.minPrice ? (z.maxPrice - z.minPrice) / z.minPrice : 0;
-  const widthScore = zoneWidth <= 0.001 ? 25 : zoneWidth <= 0.002 ? 20
-                   : zoneWidth <= 0.003 ? 15 : 10;
-  breakdown.zone_width = { score: widthScore, max: 25, widthPct: parseFloat((zoneWidth*100).toFixed(3)) };
-  total += widthScore;
+  // ── B. RECENCY (max 20) ───────────────────────────────────────
+  const recent20Len = Math.min(m5Candles.length, 20);
+  const candlesSinceLast = recent20Len - 1 - (z.lastCandleIdx || 0);
+  const recencyScore = candlesSinceLast <= 20  ? 20
+                     : candlesSinceLast <= 50  ? 12
+                     : candlesSinceLast <= 100 ? 6 : 0;
+  breakdown.recency = { score: recencyScore, max: 20, candlesSinceLast };
+  total += recencyScore;
 
-  // C. Proximity (0–25) — how close is price to zone
-  const nearEdge  = z.type === 'EQH' ? z.minPrice : z.maxPrice;
-  const distPct   = Math.abs(price - nearEdge) / nearEdge;
-  const inside    = price >= z.minPrice && price <= z.maxPrice;
-  const proxScore = inside ? 25 : distPct <= 0.001 ? 22 : distPct <= 0.002 ? 18
-                  : distPct <= 0.003 ? 13 : distPct <= 0.005 ? 8 : 3;
-  breakdown.proximity = { score: proxScore, max: 25, distPct: parseFloat((distPct*100).toFixed(3)), inside };
-  total += proxScore;
+  // ── C. REACTION STRENGTH (max 20) ────────────────────────────
+  // Use avgWick relative to average candle range
+  const avgCandle = m5Candles.slice(-20).reduce((s,c) => s + range(c), 0) / Math.min(m5Candles.length, 20);
+  const wickRatio = avgCandle > 0 ? (z.avgWick || 0) / avgCandle : 0;
+  const reactionScore = wickRatio >= 1.5 ? 20
+                      : wickRatio >= 0.8 ? 12
+                      : wickRatio >= 0.3 ? 5 : 0;
+  breakdown.reaction = { score: reactionScore, max: 20, wickRatio: parseFloat(wickRatio.toFixed(2)) };
+  total += reactionScore;
 
-  // D. Session Quality (0–15)
-  const sessScore = sess === 'London+NY Overlap' ? 15 : sess === 'New York' ? 10
-                  : sess === 'London' ? 10 : 0;
-  breakdown.session = { score: sessScore, max: 15, session: sess };
-  total += sessScore;
+  // ── D. ZONE TIGHTNESS (max 15) ────────────────────────────────
+  const refPrice = z.minPrice || price;
+  const widthPct = refPrice > 0 ? (z.maxPrice - z.minPrice) / refPrice : 0;
+  const tightScore = widthPct <= 0.001 ? 15
+                   : widthPct <= 0.0025 ? 10
+                   : widthPct <= 0.005  ? 5 : 0;
+  breakdown.tightness = { score: tightScore, max: 15, widthPct: parseFloat((widthPct*100).toFixed(3)) };
+  total += tightScore;
 
-  // E. Level Count Bonus (0–10) — more clustered levels = stronger confirmation
-  const levelCount = z.levelCount || 1;
-  const lvlScore   = levelCount >= 4 ? 10 : levelCount >= 3 ? 7 : levelCount >= 2 ? 4 : 0;
-  breakdown.level_count = { score: lvlScore, max: 10, levelCount };
-  total += lvlScore;
+  // ── E. CONFLUENCE (max 15) ────────────────────────────────────
+  let confScore = 0;
+  // Round number confluence — does the zone overlap a 00 or 50 handle?
+  const zoneCenter = (z.minPrice + z.maxPrice) / 2;
+  const roundFifty = Math.round(zoneCenter / 50) * 50;
+  if (Math.abs(zoneCenter - roundFifty) / zoneCenter < 0.002) {
+    confScore += 5; breakdown.confluence_round = true;
+  }
+  // Session level confluence — score keeps track of PDH/PDL/ASH/ASL proximity
+  // (passed in via the levels array from buildLevels — checked at call site)
+  breakdown.confluence = { score: Math.min(confScore, 15), max: 15 };
+  total += Math.min(confScore, 15);
 
-  total = Math.min(Math.max(total, 0), 100);
-
+  total = Math.min(Math.max(Math.round(total), 0), 100);
   const grade = total >= 80 ? 'HIGH' : total >= 60 ? 'MEDIUM' : total >= 40 ? 'LOW' : 'IGNORE';
   const emoji = total >= 80 ? '🟢' : total >= 60 ? '🟡' : '🔴';
 
   return { total, grade, emoji, breakdown };
 }
 
-// ── SELECT PRIMARY ZONE ─────────────────────────────────────────────────────
-// Scores each zone, selects highest, attaches confidence object.
-function selectPrimaryZone(levels, price, sess) {
+// Legacy wrapper — used by existing code that calls scoreZone()
+function scoreZone(z, price, sess) {
+  return rankZone(z, price, sess, []);
+}
+
+
+// ── ZONE RANKING ENGINE — selects ONE primary zone per symbol ───────────────
+function selectPrimaryZone(levels, price, sess, m5Candles) {
+  const m5 = m5Candles || [];
+
+  // 1. Pull only EQH/EQL clustered zones
   const zones = levels.filter(l => l.isZone && (l.type === 'EQH' || l.type === 'EQL'));
   if (!zones.length) return null;
 
-  const scored = zones.map(z => {
-    const direction  = z.type === 'EQH' ? 'SELL' : 'BUY';
-    const nearEdge   = z.type === 'EQH' ? z.minPrice : z.maxPrice;
-    const distPct    = Math.abs(price - nearEdge) / nearEdge;
-    const inside     = price >= z.minPrice && price <= z.maxPrice;
-    const confidence = scoreZone(z, price, sess);
-    // Selection score (for ranking only — not shown to user)
-    const selScore   = confidence.total;
-    return { ...z, direction,
-             distPct: parseFloat((distPct*100).toFixed(3)),
-             inside, confidence, score: selScore };
+  // 2. Hard filter — discard invalid zones before scoring
+  const valid = [];
+  for (const z of zones) {
+    const hf = passesHardFilter(z, m5);
+    if (!hf.pass) {
+      console.log('[zone] DISCARD ' + z.type + ' ' + z.priceRange + ': ' + hf.reason);
+      continue;
+    }
+    valid.push(z);
+  }
+  if (!valid.length) return null;
+
+  // 3. Score + add confluence from structural levels (PDH/PDL/ASH/ASL)
+  const structural = levels.filter(l => ['PDH','PDL','ASH','ASL'].includes(l.type));
+  const scored = valid.map(z => {
+    const direction = getZoneDirection(z);
+    const nearEdge  = direction === 'SELL' ? z.minPrice : z.maxPrice;
+    const distPct   = Math.abs(price - nearEdge) / nearEdge;
+    const inside    = price >= z.minPrice && price <= z.maxPrice;
+
+    // Run ranking model
+    const confidence = rankZone(z, price, sess, m5);
+
+    // Confluence bonus: add +5 for each nearby structural level (within 0.2%)
+    let confBonus = 0;
+    for (const sl of structural) {
+      if (Math.abs(sl.price - z.price) / z.price <= 0.002) {
+        confBonus = Math.min(confBonus + 5, 15);
+      }
+    }
+    if (confBonus > 0) {
+      confidence.total = Math.min(confidence.total + confBonus, 100);
+      confidence.breakdown.confluence = { score: confBonus, sources: structural
+        .filter(sl => Math.abs(sl.price - z.price) / z.price <= 0.002)
+        .map(sl => sl.type) };
+    }
+
+    // Debug log for every valid zone
+    console.log('[zone] ' + z.type + ' ' + z.priceRange +
+      ' score=' + confidence.total + '/100' +
+      ' touches=' + z.totalTouches +
+      ' recency=' + confidence.breakdown.recency?.candlesSinceLast + 'c' +
+      ' reaction=' + confidence.breakdown.reaction?.wickRatio + 'x' +
+      ' tight=' + confidence.breakdown.tightness?.widthPct + '%' +
+      (confBonus ? ' +' + confBonus + ' confluence' : ''));
+
+    return { ...z, direction, distPct: parseFloat((distPct*100).toFixed(3)),
+             inside, confidence, score: confidence.total };
   });
 
+  // 4. Sort by score descending — highest score = primary zone
   scored.sort((a, b) => b.score - a.score);
+
   const primary = scored[0];
-  console.log('[XAUUSD-like] Primary zone: ' + primary.direction +
-    ' (' + primary.priceRange + ') confidence=' + primary.confidence.total +
-    ' (' + primary.confidence.grade + ') touches=' + primary.totalTouches);
+  console.log('[zone] PRIMARY ZONE SELECTED: ' + primary.direction +
+    ' ' + primary.priceRange +
+    ' score=' + primary.score + '/100' +
+    ' touches=' + primary.totalTouches);
+
+  // Mark others as secondary (for debug/UI only — signal logic ignores them)
+  scored.slice(1).forEach(z => {
+    console.log('[zone] SECONDARY (ignored): ' + z.type + ' ' + z.priceRange + ' score=' + z.score);
+  });
+
   return primary;
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // UNIFIED DIRECTION FUNCTION
@@ -1573,7 +1672,7 @@ app.get('/analyze/:sym', async (req, res) => {
   // --- PRIMARY ZONE SELECTION + PRE-SIGNAL ALERTS --------------------------
   // Select ONE primary zone — highest scored EQH/EQL cluster.
   // All pre-signals derive from this single zone to prevent conflicting directions.
-  const primaryZone     = selectPrimaryZone(levels, livePrice, sess);
+  const primaryZone     = selectPrimaryZone(levels, livePrice, sess, m5);
   const approachingLevels = primaryZone
     ? [{ ...primaryZone,
          distPct: primaryZone.distPct,
@@ -1583,11 +1682,16 @@ app.get('/analyze/:sym', async (req, res) => {
   // Gate pre-signals: only generate if zone confidence >= 40 (not IGNORE)
   const pzConf  = primaryZone?.confidence?.total || 0;
   const pzGrade = primaryZone?.confidence?.grade || 'IGNORE';
+  if (primaryZone) {
+    log.push('[Zone] PRIMARY ' + primaryZone.direction + ' ZONE $' + primaryZone.priceRange +
+      ' score=' + pzConf + '/100 touches=' + primaryZone.totalTouches +
+      (pzConf >= 60 ? ' ✓' : ' ⚠ low'));
+  }
   const sweepPotentials = (primaryZone && pzConf >= 40 && approachingLevels.length)
     ? detectSweepPotential(livePrice, approachingLevels, m5)
     : [];
   if (primaryZone && pzConf < 40) {
-    log.push('Zone confidence too low (' + pzConf + ') — pre-signal suppressed');
+    log.push('Zone score ' + pzConf + '/100 — below threshold, pre-signals suppressed');
   }
 
   // Build near_setup — always inherits direction from primary zone (no conflicts)
@@ -2435,7 +2539,7 @@ async function autoScan() {
       }
 
       // ── PRIMARY ZONE SELECTION — only this zone matters ─────────
-      const primaryZone = selectPrimaryZone(levels, livePrice, sess);
+      const primaryZone = selectPrimaryZone(levels, livePrice, sess, m5);
       if (!primaryZone) {
         console.log('[' + sym + '] No primary zone found — skip');
         await delay(400); continue;
@@ -2477,9 +2581,11 @@ async function autoScan() {
             ? '$' + parseFloat(approaching.minPrice).toFixed(2) + '–$' + parseFloat(approaching.maxPrice).toFixed(2)
             : '$' + parseFloat(approaching.price).toFixed(2);
           await fireEvent(setup, 'approaching', sym, () => sendTelegram(
-            '📍 <b>' + asset + ' — KEY ZONE NEARBY</b>\n\n' +
-            asset + ' is approaching a ' + (approaching.dir === 'SELL' ? 'sell' : 'buy') +
-            ' zone at ' + rangeStr + '.\n\n' +
+            '🎯 <b>PRIMARY ZONE IDENTIFIED</b>\n\n' +
+            asset + ' ' + approaching.dir + ' ZONE\n' +
+            'Range: $' + parseFloat(approaching.minPrice||approaching.price).toFixed(2) + ' – $' + parseFloat(approaching.maxPrice||approaching.price).toFixed(2) + '\n' +
+            'Strength: ' + (approaching.confidence?.total || approaching.score || '—') + '/100\n' +
+            'Touches: ' + (approaching.totalTouches || '—') + '\n\n' +
             'If price sweeps through and reverses, a ' + approaching.dir + ' setup may form.\n\n' +
             '⏳ No action yet — monitoring.\n\n─────────────────\nAurum Signals'
           ));
