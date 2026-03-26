@@ -15,8 +15,7 @@ const TWELVE_KEY    = '7f3fc6ca85664930ab6e687db8ff0c5d';
 const ANTHROPIC_KEY = ['sk-ant-','api03-PSBtiCb9gNCUnpxHjEl2sqWVtfNop5DtO1WCW2pdUw_upi3Zl0VDjCT7Yyk','W9bboA3Bxnq2ucHBFyuNrNx6CL','w-qYuk4wAA'].join('');
 const SYMBOLS = {
   XAUUSD: 'XAU/USD',   // Gold spot — free tier
-  XAGUSD: 'SLV'        // Silver via iShares Silver Trust ETF (SLV) — free tier
-                        // XAG/USD requires Twelve Data paid plan; SLV tracks silver 1:1
+  XAGUSD: 'XAG/USD'    // Silver spot — Twelve Data forex endpoint (24/5)
 };
 
 // ─── IN-MEMORY CACHE ────────────────────────────────────────────────────────
@@ -154,7 +153,7 @@ function deriveM15FromM5(m5Candles) {
 // Valid ATR range per M5 candle. Outside either bound = ignore volatility filter.
 const ATR_RANGE = {
   XAUUSD: { min: 0.30, max: 8.0  },  // $0.30-$8.00 per M5 candle — XAU/USD spot
-  XAGUSD: { min: 0.03, max: 1.50 }   // $0.03-$1.50 per M5 candle — SLV ETF (~$28-32/share)
+  XAGUSD: { min: 0.05, max: 2.00 }   // $0.05-$2.00 per M5 candle — XAG/USD spot (~$30-35/oz)
 };
 function checkATR(sym, atrValues) {
   if (!atrValues || atrValues.length < 5 || !ATR_RANGE[sym]) {
@@ -184,7 +183,7 @@ function checkATR(sym, atrValues) {
 // ─── SESSION ──────────────────────────────────────────────────────────────
 // SESSION DETECTION — UTC only. Never uses device local time.
 // London: 07:00–16:00 UTC   New York: 13:00–22:00 UTC
-// Note: SLV ETF trades NYSE hours (13:30–20:00 UTC) — fully within NY session window
+// Note: XAG/USD spot trades 24/5 — available during all sessions including London
 function sessionName(tsMs) {
   const utcH = new Date(tsMs).getUTCHours(); // explicitly UTC
   const lnd  = utcH >= 7  && utcH < 16;
@@ -399,7 +398,7 @@ function buildLevels(m5Candles, m15Candles) {
 
 // --- PROXIMITY DETECTION ---------------------------------------------------
 // Threshold: price within 0.20% of a liquidity level = "approaching"
-const APPROACH_PCT = { XAUUSD: 0.0020, XAGUSD: 0.0015 }; // SLV slightly tighter
+const APPROACH_PCT = { XAUUSD: 0.0020, XAGUSD: 0.0020 }; // XAG/USD spot same as XAU
 
 function detectApproaching(price, levels, sym) {
   const threshold = APPROACH_PCT[sym] || 0.0020;
@@ -1051,7 +1050,7 @@ function runQualityFilters(candles, m15Candles, sweep, disp, bos, pullback,
 // ─── STOP LOSS ─────────────────────────────────────────────────────────────
 function calcSL(direction, sweepExtreme, atr) {
   const PIP_BUFFER = direction === 'BUY'
-    ? (sym === 'XAUUSD' ? 0.50 : 0.05)  // XAU: ~50c buffer, SLV: ~5c buffer
+    ? (sym === 'XAUUSD' ? 0.50 : 0.15)  // XAU: ~50c buffer, XAG spot: ~15c buffer
     : (sym === 'XAUUSD' ? 0.50 : 0.05);
 
   const atrBuffer  = atr * 0.10;
@@ -1482,34 +1481,15 @@ app.get('/analyze/:sym', async (req, res) => {
       signal: null, m5_candles: m5Count });
   }
 
-  // Check candle staleness — latest candle should be within 30 minutes
+  // Check candle staleness — XAG/USD is 24/5 spot forex, so stale = API issue only
   const latestCandleAge = (nowUtc - m5[m5Count - 1].t) / 60000; // minutes
-  if (latestCandleAge > 30) {
-    // SLV (silver proxy) is a US ETF — trades 13:30-20:00 UTC only.
-    // After 20:00 UTC the last candle will be stale — this is expected, not an error.
-    const isSLV       = sym === 'XAGUSD'; // SLV proxy
-    const slvClosed   = isSLV && (utcHour >= 20 || utcHour < 13);
-    const staleState  = slvClosed ? 'session_closed' : 'data_error';
-    const staleMsg    = slvClosed
-      ? 'Silver market closed — SLV ETF trades 13:30–20:00 UTC. Last price: $' + m5[m5Count-1].c.toFixed(3)
-      : 'Live data temporarily unavailable — latest candle is ' + Math.round(latestCandleAge) + ' minutes old';
-    if (!slvClosed && inSession) {
-      return res.json({ success: true, symbol: sym, price: m5[m5Count-1]?.c || null,
-        system_state: staleState, session: sessionName(nowUtc) || 'Active',
-        session_ok: false, setup_state: 'standby',
-        levels: [], log: [staleMsg], signal: null, m5_candles: m5Count });
-    }
-    if (slvClosed) {
-      const lastPrice = m5[m5Count-1]?.c || null;
-      const lastATR   = calcATRFromCandles(m5, 14);
-      return res.json({ success: true, symbol: sym, price: lastPrice,
-        system_state: 'session_closed', session: 'Closed',
-        session_ok: false, setup_state: 'standby',
-        volatility_atr: lastATR.length ? parseFloat(lastATR[lastATR.length-1].toFixed(4)) : null,
-        m5_candles: m5Count,
-        levels: [], log: [staleMsg], signal: null,
-        note: 'SLV market closed. Showing last known price. Opens 13:30 UTC.' });
-    }
+  if (latestCandleAge > 30 && inSession) {
+    const staleMsg = 'Live data temporarily unavailable — latest candle is ' +
+      Math.round(latestCandleAge) + ' minutes old';
+    return res.json({ success: true, symbol: sym, price: m5[m5Count-1]?.c || null,
+      system_state: 'data_error', session: sessionName(nowUtc) || 'Active',
+      session_ok: false, setup_state: 'standby',
+      levels: [], log: [staleMsg], signal: null, m5_candles: m5Count });
   }
 
   // M15 low — warn but do not block
@@ -1521,7 +1501,7 @@ app.get('/analyze/:sym', async (req, res) => {
   const currentATR    = atrValues?.length > 0 ? atrValues[atrValues.length-1] : null;
   const currentTS     = m5[m5.length-1].t;
   // Use current wall-clock UTC time for session detection, NOT candle timestamp.
-  // Candle timestamp can be stale (SLV closes at 20:00 UTC; last candle
+  // Candle timestamp — XAG/USD is 24/5 spot, stale data = API issue
   // would otherwise make London session appear closed next morning).
   const sess          = sessionName(Date.now());
   const sessionOk     = sess !== null;
@@ -1841,7 +1821,7 @@ app.get('/health', async (req, res) => {
     session: inSession
       ? (h >= 13 && h < 16 ? 'London+NY Overlap' : h < 16 ? 'London' : 'New York')
       : 'Closed',
-    symbols: { XAUUSD: 'XAU/USD (Gold spot)', XAGUSD: 'SLV ETF (Silver proxy)' },
+    symbols: { XAUUSD: 'XAU/USD (Gold spot)', XAGUSD: 'XAG/USD (Silver spot)' },
     ts: new Date().toUTCString()
   });
 });
@@ -1918,7 +1898,7 @@ app.get('/debug/:sym', async (req, res) => {
   if (!td) return res.status(400).json({ error: 'Unknown symbol' });
   try {
     // Test the simplest possible request: last 5 M5 candles
-    // Note: XAGUSD uses SLV ETF as free-tier silver proxy
+    // Note: XAGUSD uses XAG/USD spot forex via Twelve Data
     const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(td)}&interval=5min&outputsize=5&apikey=${TWELVE_KEY}`;
     console.log('[debug] fetching:', url.replace(TWELVE_KEY, '***'));
     const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
