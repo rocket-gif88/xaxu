@@ -275,7 +275,44 @@ function clusterEQLevels(rawLevels, currentPrice, zoneType) {
       });
     }
   }
-  return merged;
+  // ── POST-CLUSTER OVERLAP MERGE ────────────────────────────────
+  // Zones from different raw groups can still overlap if their price ranges intersect.
+  // Example: zone 4430–4449 and zone 4439–4443 are the same structure.
+  // Merge any overlapping zones, keeping the strongest properties.
+  const deduped = [];
+  for (const z of merged) {
+    let absorbed = false;
+    for (const existing of deduped) {
+      // Overlap condition: ranges intersect
+      if (z.minPrice <= existing.maxPrice && z.maxPrice >= existing.minPrice) {
+        // Merge into existing — expand range, take max touches, keep most recent
+        const prevRange = (existing.maxPrice - existing.minPrice).toFixed(3);
+        existing.minPrice     = Math.min(existing.minPrice, z.minPrice);
+        existing.maxPrice     = Math.max(existing.maxPrice, z.maxPrice);
+        existing.totalTouches = Math.max(existing.totalTouches, z.totalTouches);
+        existing.avgWick      = Math.max(existing.avgWick || 0, z.avgWick || 0);
+        existing.lastCandleIdx= Math.max(existing.lastCandleIdx || 0, z.lastCandleIdx || 0);
+        existing.strengthScore= Math.max(existing.strengthScore, z.strengthScore);
+        existing.levelCount   = (existing.levelCount || 1) + (z.levelCount || 1);
+        existing.price        = (existing.minPrice + existing.maxPrice) / 2;
+        existing.label        = zoneType === 'EQH'
+          ? 'Equal Highs zone (' + existing.totalTouches + ' touches)'
+          : 'Equal Lows zone ('  + existing.totalTouches + ' touches)';
+        existing.priceRange   = parseFloat(existing.minPrice.toFixed(3)) + '–' +
+                                parseFloat(existing.maxPrice.toFixed(3));
+        existing.strength     = existing.strengthScore >= 3 ? 'strong'
+                              : existing.strengthScore >= 2 ? 'medium' : 'weak';
+        console.log('[zone-merge] ' + zoneType + ' overlap merged: ' +
+          prevRange + ' + ' + (z.maxPrice - z.minPrice).toFixed(3) +
+          ' → ' + (existing.maxPrice - existing.minPrice).toFixed(3) +
+          ' touches: ' + existing.totalTouches);
+        absorbed = true;
+        break;
+      }
+    }
+    if (!absorbed) deduped.push(z);
+  }
+  return deduped;
 }
 
 function buildLevels(m5Candles, m15Candles) {
@@ -2127,12 +2164,16 @@ const setups = { XAUUSD: null, XAGUSD: null };
 // Tracks cooldowns for zone detection, bias flips, invalidation windows
 const symTiming = {
   XAUUSD: {
-    zoneDetectionAllowedAt:  0,  // ms timestamp — no new zones until this passes
-    biasFlipAllowedAt:       0,  // ms timestamp — no opposite bias until this
-    lastInvalidatedAt:       0,  // ms timestamp of last invalidation
-    lastInvalidatedDir:      null, // direction of last invalidated setup
-    pullbackStartCandleIdx:  -1, // candle index when pullback first detected
-    pullbackCandleCount:     0,  // candles since pullback began
+    zoneDetectionAllowedAt:  0,
+    biasFlipAllowedAt:       0,
+    lastInvalidatedAt:       0,
+    lastInvalidatedDir:      null,
+    pullbackStartCandleIdx:  -1,
+    pullbackCandleCount:     0,
+    // Sweep alert cooldown — prevents duplicate grab alerts on overlapping zones
+    lastSweepAlertAt:        0,    // ms timestamp of last sweep Telegram
+    lastSweepDir:            null, // direction of last sweep alert
+    lastSweepZoneKey:        null, // zone ID of last sweep alert
   },
   XAGUSD: {
     zoneDetectionAllowedAt:  0,
@@ -2141,6 +2182,9 @@ const symTiming = {
     lastInvalidatedDir:      null,
     pullbackStartCandleIdx:  -1,
     pullbackCandleCount:     0,
+    lastSweepAlertAt:        0,
+    lastSweepDir:            null,
+    lastSweepZoneKey:        null,
   }
 };
 
@@ -2847,12 +2891,36 @@ async function autoScan() {
         ? sweep.level.label + ' (' + sweep.level.priceRange + ')'
         : (sweep.level?.label || 'key level');
 
-      await fireEvent(setup, 'sweep', sym, () => sendTelegram(
-        '⚡ <b>' + asset + ' — LIQUIDITY GRAB DETECTED</b>\n\n' +
-        asset + ' swept ' + lvlDesc + ' and closed back inside.\n' +
-        'Direction: <b>' + sweep.direction + '</b>\n\n' +
-        '⏳ Waiting for a strong displacement candle.\n\n─────────────────\nAurum Signals'
-      ), sweep.candleIdx);
+      // Track timing for cooldown
+      const newSweepKey = sweep.direction + '_' +
+        (sweep.level?.isZone ? Math.round(sweep.level.minPrice) + '-' + Math.round(sweep.level.maxPrice)
+                             : Math.round(sweep.level?.price || 0));
+      const SWEEP_COOLDOWN_MS = 3 * CANDLE_MS;
+      const isDupeSweep = timing &&
+          timing.lastSweepDir === sweep.direction &&
+          timing.lastSweepZoneKey !== newSweepKey &&
+          Date.now() - timing.lastSweepAlertAt < SWEEP_COOLDOWN_MS;
+
+      if (isDupeSweep) {
+        console.log('[zone-merge] ' + sym + ': sweep alert suppressed (same direction, overlapping zone, within cooldown)');
+      }
+
+      await fireEvent(setup, 'sweep', sym, async () => {
+        // Record sweep alert timing
+        if (timing) {
+          timing.lastSweepAlertAt  = Date.now();
+          timing.lastSweepDir      = sweep.direction;
+          timing.lastSweepZoneKey  = newSweepKey;
+        }
+        if (!isDupeSweep) {
+          await sendTelegram(
+            '⚡ <b>' + asset + ' — LIQUIDITY GRAB DETECTED</b>\n\n' +
+            asset + ' swept ' + lvlDesc + ' and closed back inside.\n' +
+            'Direction: <b>' + sweep.direction + '</b>\n\n' +
+            '⏳ Waiting for a strong displacement candle.\n\n─────────────────\nAurum Signals'
+          );
+        }
+      }, sweep.candleIdx);
 
       // ── STAGE: DISPLACEMENT (MOVE) ────────────────────────────
       const disp = detectDisplacement(m5, sweep.candleIdx, sweep.direction);
