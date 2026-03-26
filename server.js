@@ -1504,6 +1504,12 @@ app.get('/analyze/:sym', async (req, res) => {
   let signal      = null;
   const log       = [];
 
+  // ── PRIMARY ZONE SELECTION (before sweep detection) ────────────────────
+  // Must happen here so detectSweep can be locked to primary zone only.
+  // Prevents secondary zones from triggering conflicting signals.
+  const primaryZoneEarly = selectPrimaryZone(levels, currentPrice, sess, m5);
+  const sweepLevels = primaryZoneEarly ? [primaryZoneEarly] : [];
+
   if (!sessionOk) {
     setupState = 'idle';
     log.push('Outside active trading sessions (London 07:00–16:00 UTC / New York 13:00–22:00 UTC) — signal engine paused');
@@ -1511,15 +1517,21 @@ app.get('/analyze/:sym', async (req, res) => {
     setupState = 'idle';
     log.push('Volatility check: ' + volatility.note);
   } else {
-    // ── 4. SWEEP DETECTION ──────────────────────────────────────────────
-    const sweep = detectSweep(m5, levels);
+    // ── 4. SWEEP DETECTION — PRIMARY ZONE ONLY ──────────────────────────
+    let sweep = detectSweep(m5, sweepLevels); // locked to primary zone
+    if (sweep.found) sweep = correctSweepDirection(sweep); // enforce direction from zone type
 
     if (!sweep.found) {
       setupState = 'idle';
       log.push('No liquidity grab detected on current M5 data');
     } else {
       setupState = 'sweep_detected';
-      log.push('Liquidity grab: ' + sweep.direction + ' — price swept ' + sweep.level.label + ' at $' + sweep.level.price.toFixed(3) + ' (wick ' + (sweep.wickPct*100).toFixed(1) + '% of candle range)');
+      // Direction comes from zone type (correctSweepDirection enforces this)
+      const lvlDir = sweep.direction; // already corrected to match zone type
+      log.push('[Stage] Liquidity grab confirmed — ' + sweep.level.label + ' swept');
+      log.push('Liquidity grab: ' + lvlDir + ' — price swept ' + sweep.level.label +
+        ' at $' + sweep.level.price.toFixed(3) +
+        ' (wick ' + (sweep.wickPct*100).toFixed(1) + '% of candle range)');
 
       // ── 5. TIME DECAY CHECK: max 10 M5 candles for full setup ───────
       const sweepToNow = m5.length - 1 - sweep.candleIdx;
@@ -1669,10 +1681,10 @@ app.get('/analyze/:sym', async (req, res) => {
     }
   } catch(e) {}
 
-  // --- PRIMARY ZONE SELECTION + PRE-SIGNAL ALERTS --------------------------
-  // Select ONE primary zone — highest scored EQH/EQL cluster.
-  // All pre-signals derive from this single zone to prevent conflicting directions.
-  const primaryZone     = selectPrimaryZone(levels, livePrice, sess, m5);
+  // --- PRIMARY ZONE + PRE-SIGNAL ALERTS ------------------------------------
+  // primaryZone was already selected before sweep detection (primaryZoneEarly).
+  // Alias it here for the pre-signal and response sections.
+  const primaryZone = primaryZoneEarly;
   const approachingLevels = primaryZone
     ? [{ ...primaryZone,
          distPct: primaryZone.distPct,
