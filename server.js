@@ -2195,7 +2195,7 @@ const sentSignals = new Set();
 
 // Transition: advance stage and fire alert if event not yet sent
 // Returns true if alert was sent, false if blocked
-async function fireEvent(setup, event, sym, alertFn) {
+async function fireEvent(setup, event, sym, alertFn, candleIdx = -1) {
   if (!setup || !setup.active) {
     console.log('[' + sym + '] fireEvent ' + event + ' blocked — setup inactive');
     return false;
@@ -2208,9 +2208,7 @@ async function fireEvent(setup, event, sym, alertFn) {
     console.log('[' + sym + '] fireEvent ' + event + ' blocked — already fired for this setup (id=' + setup.id + ')');
     return false;
   }
-  // ── Candle separation: each stage must confirm on a LATER candle than previous
-  // candleIdx is passed as optional 5th arg — if provided, enforce separation
-  const candleIdx = arguments[4] !== undefined ? arguments[4] : -1;
+  // ── Candle separation: each stage must confirm on a strictly later candle
   const stageOrder = ['sweep','move','trend','pullback','entry'];
   const prevStageIdx = stageOrder.indexOf(event) - 1;
   if (candleIdx >= 0 && prevStageIdx >= 0 && setup.stageCandleIdx) {
@@ -2238,8 +2236,8 @@ async function fireEvent(setup, event, sym, alertFn) {
   setup.lastEventAt    = Date.now();
   setup.cooldowns[event] = Date.now();
   // Record which candle confirmed this stage (for separation enforcement)
-  if (setup.stageCandleIdx && arguments[4] !== undefined) {
-    setup.stageCandleIdx[event] = arguments[4];
+  if (setup.stageCandleIdx && candleIdx >= 0) {
+    setup.stageCandleIdx[event] = candleIdx;
   }
   // Stage progression log (visible in Railway logs)
   const stageLabels = {
@@ -2905,7 +2903,7 @@ async function autoScan() {
         console.log('[zone-merge] ' + sym + ': sweep alert suppressed (same direction, overlapping zone, within cooldown)');
       }
 
-      await fireEvent(setup, 'sweep', sym, async () => {
+      const sweepFired = await fireEvent(setup, 'sweep', sym, async () => {
         // Record sweep alert timing
         if (timing) {
           timing.lastSweepAlertAt  = Date.now();
@@ -2922,6 +2920,14 @@ async function autoScan() {
         }
       }, sweep.candleIdx);
 
+      // ── STAGE GATE: if sweep just fired this scan, stop here ──
+      // Forces each stage to be confirmed on a separate scan cycle.
+      // Prevents bulk-confirmation of multiple stages from historical data.
+      if (sweepFired) {
+        console.log('[' + sym + '] Sweep fired this scan — waiting for next scan before displacement');
+        await delay(400); continue;
+      }
+
       // ── STAGE: DISPLACEMENT (MOVE) ────────────────────────────
       const disp = detectDisplacement(m5, sweep.candleIdx, sweep.direction);
       if (!disp.found) {
@@ -2929,12 +2935,17 @@ async function autoScan() {
         await delay(400); continue;
       }
 
-      await fireEvent(setup, 'move', sym, () => sendTelegram(
+      const moveFired = await fireEvent(setup, 'move', sym, () => sendTelegram(
         '↗️ <b>' + asset + ' — STRONG MOVE CONFIRMED</b>\n\n' +
         'A ' + disp.ratio + '× displacement candle followed the liquidity grab.\n' +
         'Direction: <b>' + sweep.direction + '</b>\n\n' +
         '⏳ Waiting for break of structure.\n\n─────────────────\nAurum Signals'
       ), disp.candleIdx);
+
+      if (moveFired) {
+        console.log('[' + sym + '] Move fired this scan — waiting for next scan before BOS');
+        await delay(400); continue;
+      }
 
       // ── STAGE: TREND SHIFT (BOS) ──────────────────────────────
       const bos = detectBOS(m5, sweep.candleIdx, sweep.direction);
@@ -2944,12 +2955,17 @@ async function autoScan() {
       }
 
       const m15bos = m15.length >= 8 ? confirmBOS_M15(m15, sweep.direction, bos.bos_level) : false;
-      await fireEvent(setup, 'trend', sym, () => sendTelegram(
+      const trendFired = await fireEvent(setup, 'trend', sym, () => sendTelegram(
         '✅ <b>' + asset + ' — TREND SHIFT CONFIRMED</b>\n\n' +
         'Break of structure confirmed on M5' + (m15bos ? '/M15' : '') + '.\n' +
         'Direction: <b>' + sweep.direction + '</b>\n\n' +
         '⏳ Waiting for 50–61.8% pullback into entry zone.\n\n─────────────────\nAurum Signals'
       ), bos.candleIdx);
+
+      if (trendFired) {
+        console.log('[' + sym + '] Trend fired this scan — waiting for next scan before pullback');
+        await delay(400); continue;
+      }
 
       // ── STAGE: PULLBACK ───────────────────────────────────────
       // Invalidation delay: after trend shift, wait at least 1 candle before
