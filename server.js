@@ -2118,6 +2118,29 @@ function createSetup(sym, direction, levelOrZone) {
 // Setups keyed by symbol
 const setups = { XAUUSD: null, XAGUSD: null };
 
+// Per-symbol timing state — persists through setup resets
+// Tracks cooldowns for zone detection, bias flips, invalidation windows
+const symTiming = {
+  XAUUSD: {
+    zoneDetectionAllowedAt:  0,  // ms timestamp — no new zones until this passes
+    biasFlipAllowedAt:       0,  // ms timestamp — no opposite bias until this
+    lastInvalidatedAt:       0,  // ms timestamp of last invalidation
+    lastInvalidatedDir:      null, // direction of last invalidated setup
+    pullbackStartCandleIdx:  -1, // candle index when pullback first detected
+    pullbackCandleCount:     0,  // candles since pullback began
+  },
+  XAGUSD: {
+    zoneDetectionAllowedAt:  0,
+    biasFlipAllowedAt:       0,
+    lastInvalidatedAt:       0,
+    lastInvalidatedDir:      null,
+    pullbackStartCandleIdx:  -1,
+    pullbackCandleCount:     0,
+  }
+};
+
+const CANDLE_MS = 5 * 60 * 1000; // 5 minutes per M5 candle
+
 // Legacy compat — sentSignals dedup by entry price
 const sentSignals = new Set();
 
@@ -2210,6 +2233,17 @@ function resetSetup(sym, reason) {
   const existing = setups[sym];
   if (existing) {
     console.log('[' + sym + '] Setup reset (id=' + existing.id + '): ' + reason);
+    // Record cooldowns on invalidation — 2 candles (10 min) before new zone detection
+    const now = Date.now();
+    if (symTiming[sym]) {
+      symTiming[sym].lastInvalidatedAt      = now;
+      symTiming[sym].lastInvalidatedDir     = existing.direction;
+      symTiming[sym].zoneDetectionAllowedAt = now + 2 * CANDLE_MS;
+      symTiming[sym].biasFlipAllowedAt      = now + 2 * CANDLE_MS;
+      symTiming[sym].pullbackStartCandleIdx = -1;
+      symTiming[sym].pullbackCandleCount    = 0;
+      console.log('[timing] ' + sym + ': cooldown set — zone detection blocked for 10min after ' + reason);
+    }
   }
   setups[sym] = null;
 }
@@ -2668,6 +2702,26 @@ async function autoScan() {
         ' ' + primaryZone.priceRange + ' score=' + zoneScore + '/100' +
         (zoneScore >= 75 ? ' [FULL]' : zoneScore >= 60 ? ' [STANDARD]' : ' [BLOCKED]'));
 
+      // ── ZONE DETECTION COOLDOWN ────────────────────────────────
+      // After invalidation, block new zone detection for 2 candles (10 min)
+      const timing = symTiming[sym];
+      if (timing && Date.now() < timing.zoneDetectionAllowedAt) {
+        const waitMins = Math.ceil((timing.zoneDetectionAllowedAt - Date.now()) / 60000);
+        console.log('[timing] ' + sym + ': zone detection cooldown active (' + waitMins + 'min remaining) — skipping');
+        await delay(400); continue;
+      }
+
+      // ── BIAS FLIP PROTECTION ────────────────────────────────────
+      // After a BUY setup is invalidated, don't allow a SELL setup for 2 candles (vice versa)
+      if (timing && timing.lastInvalidatedDir && Date.now() < timing.biasFlipAllowedAt) {
+        if (primaryZone && primaryZone.direction !== timing.lastInvalidatedDir) {
+          const waitMins = Math.ceil((timing.biasFlipAllowedAt - Date.now()) / 60000);
+          console.log('[timing] ' + sym + ': bias flip blocked — last setup was ' +
+            timing.lastInvalidatedDir + ', opposite direction locked for ' + waitMins + 'min');
+          await delay(400); continue;
+        }
+      }
+
       // ── ZONE SCORE GATE ────────────────────────────────────────
       // < 60  → no signals at all — zone not strong enough
       // 60–74 → standard entry only, aggressive engine suppressed
@@ -2829,19 +2883,38 @@ async function autoScan() {
       // evaluating pullback. Prevents instant invalidation on same scan as BOS.
       const trendCandleIdx = setup.stageCandleIdx?.trend ?? bos.candleIdx;
       const candlesSinceTrend = (m5.length - 1) - trendCandleIdx;
-      if (candlesSinceTrend < 1) {
-        console.log('[' + sym + '] Trend confirmed at candle ' + trendCandleIdx +
-          ' — waiting 1 candle before pullback evaluation (anti-instant-invalidation)');
+      if (candlesSinceTrend < 2) {
+        console.log('[timing] ' + sym + ': trend confirmed at candle ' + trendCandleIdx +
+          ' — invalidation blocked (' + candlesSinceTrend + '/2 candles elapsed)');
         await delay(400); continue;
       }
 
       const pb = detectPullback(m5, disp.candleIdx, sweep.direction, sweep.sweepExtreme);
+
+      // Track pullback candle count — need min 2 candles of structure before 70% invalidation
+      const curCandleIdx = m5.length - 1;
+      if (timing) {
+        if (!pb.found && timing.pullbackStartCandleIdx < 0) {
+          // First scan where pullback is being evaluated
+          timing.pullbackStartCandleIdx = curCandleIdx;
+          timing.pullbackCandleCount    = 0;
+        } else if (!pb.found && timing.pullbackStartCandleIdx >= 0) {
+          timing.pullbackCandleCount = curCandleIdx - timing.pullbackStartCandleIdx;
+        }
+      }
+      const pullbackCandles = timing ? timing.pullbackCandleCount : 99;
+
       if (!pb.found) {
         if (pb.reason && pb.reason.includes('70%')) {
+          if (pullbackCandles < 2) {
+            console.log('[timing] ' + sym + ': 70% invalidation skipped — only ' +
+              pullbackCandles + ' pullback candle(s) formed (min 2 required)');
+            await delay(400); continue;
+          }
           await invalidateSetup(sym, 'Pullback exceeded 70% retracement.');
           resetSetup(sym, 'Pullback > 70%');
         } else {
-          console.log('[' + sym + '] Waiting for pullback');
+          console.log('[' + sym + '] Waiting for pullback (candle ' + curCandleIdx + ')');
         }
         await delay(400); continue;
       }
