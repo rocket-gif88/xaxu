@@ -1463,10 +1463,15 @@ app.get('/analyze/:sym', async (req, res) => {
         levels: [], log: [staleMsg], signal: null, m5_candles: m5Count });
     }
     if (slvClosed) {
-      return res.json({ success: true, symbol: sym, price: m5[m5Count-1]?.c || null,
+      const lastPrice = m5[m5Count-1]?.c || null;
+      const lastATR   = calcATRFromCandles(m5, 14);
+      return res.json({ success: true, symbol: sym, price: lastPrice,
         system_state: 'session_closed', session: 'Closed',
         session_ok: false, setup_state: 'standby',
-        levels: [], log: [staleMsg], signal: null, m5_candles: m5Count });
+        volatility_atr: lastATR.length ? parseFloat(lastATR[lastATR.length-1].toFixed(4)) : null,
+        m5_candles: m5Count,
+        levels: [], log: [staleMsg], signal: null,
+        note: 'SLV market closed. Showing last known price. Opens 13:30 UTC.' });
     }
   }
 
