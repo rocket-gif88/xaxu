@@ -1823,6 +1823,51 @@ app.get('/prices', (req, res) => {
 // Keep-alive ping — call this from frontend every 4 min to prevent Railway sleep
 app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
+// Test signal — fires a mock ENTRY_READY through the full Telegram formatter
+// Usage: GET /test-signal  (or /test-signal?dir=BUY)
+app.get('/test-signal', async (req, res) => {
+  const dir   = (req.query.dir || 'SELL').toUpperCase();
+  const asset = req.query.sym === 'XAGUSD' ? 'XAGUSD' : 'XAUUSD';
+  const isBuy = dir === 'BUY';
+
+  const mockSig = {
+    id:            'TEST_' + Date.now(),
+    asset,
+    direction:     dir,
+    entry:         isBuy ? 4430.50  : 4434.20,
+    live_price:    isBuy ? 4432.10  : 4434.20,
+    stop_loss:     isBuy ? 4421.00  : 4441.50,
+    take_profit_1: isBuy ? 4450.00  : 4418.00,
+    take_profit_2: isBuy ? 4465.00  : 4404.00,
+    rr:            '2.1',
+    confidence:    82,
+    grade:         'A',
+    tier:          'HIGH',
+    entry_mode:    'AGGRESSIVE',
+    session:       'London',
+    directional_bias: 'neutral',
+    sweep_level:   'Equal ' + (isBuy ? 'Lows' : 'Highs') + ' zone (15 touches)',
+    pullback_pct:  '54.2',
+    expiry:        '10:45 UTC',
+    primaryZone:   { low: isBuy ? 4425.00 : 4431.35, high: isBuy ? 4432.00 : 4438.79 },
+    scoreBreakdown: {
+      sweep:        { score: 17, wickPct: 70 },
+      displacement: { score: 13, ratio: 1.93 },
+      structure:    { score: 15, type: 'internal', method: 'close' },
+      pullback:     { score: 10, retracement: 54.2 }
+    }
+  };
+
+  const msg = formatTelegramSignal(mockSig);
+  // Show in response AND send to Telegram if configured
+  let tgSent = false;
+  if (TG_TOKEN && TG_CHAT_ID) {
+    await sendTelegram(msg);
+    tgSent = true;
+  }
+  res.json({ ok: true, tg_sent: tgSent, preview: msg });
+});
+
 // Debug endpoint — shows raw Twelve Data response for a symbol
 // Usage: /debug/XAUUSD or /debug/XAGUSD
 app.get('/debug/:sym', async (req, res) => {
