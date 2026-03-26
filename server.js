@@ -1604,7 +1604,11 @@ app.get('/analyze/:sym', async (req, res) => {
                 // Full signal requires HIGH tier (≥75). Grade: A+ ≥85, A ≥75.
                 const scoreResult2 = scoreSetup(sess, sessionOk, sweep, disp, bos, pb,
                   volatility.ok === true || volatility.ok === undefined, directionalBias, biasPenalty);
-                if (scoreResult2.tier !== 'HIGH') {
+                // Zone score gate applies here too
+                if (!analyzeZoneAllowSignal) {
+                  setupState = 'invalidated';
+                  log.push('Signal blocked — zone score ' + pzConf + '/100 < 60 (zone too weak)');
+                } else if (scoreResult2.tier !== 'HIGH') {
                   setupState = 'invalidated';
                   log.push('Signal not generated — score ' + confidence + '/100 tier=' + scoreResult2.tier + ' (requires HIGH ≥75)');
                 } else {
@@ -1699,11 +1703,19 @@ app.get('/analyze/:sym', async (req, res) => {
       ' score=' + pzConf + '/100 touches=' + primaryZone.totalTouches +
       (pzConf >= 60 ? ' ✓' : ' ⚠ low'));
   }
-  const sweepPotentials = (primaryZone && pzConf >= 40 && approachingLevels.length)
+  // Zone score gate for analyze route
+  // < 60  → no pre-signals, no signals
+  // 60–74 → pre-signals allowed, no aggressive entry
+  // ≥ 75  → full system
+  const analyzeZoneAllowAggressive = pzConf >= 75;
+  const analyzeZoneAllowSignal     = pzConf >= 60;
+  const sweepPotentials = (primaryZone && analyzeZoneAllowSignal && approachingLevels.length)
     ? detectSweepPotential(livePrice, approachingLevels, m5)
     : [];
-  if (primaryZone && pzConf < 40) {
-    log.push('Zone score ' + pzConf + '/100 — below threshold, pre-signals suppressed');
+  if (!analyzeZoneAllowSignal && primaryZone) {
+    log.push('Zone score ' + pzConf + '/100 < 60 — signals suppressed (zone not strong enough)');
+  } else if (!analyzeZoneAllowAggressive && primaryZone) {
+    log.push('Zone score ' + pzConf + '/100 [60–74] — standard entry only, aggressive suppressed');
   }
 
   // Build near_setup — always inherits direction from primary zone (no conflicts)
@@ -2556,8 +2568,19 @@ async function autoScan() {
         console.log('[' + sym + '] No primary zone found — skip');
         await delay(400); continue;
       }
+      const zoneScore = primaryZone.confidence?.total || 0;
       console.log('[' + sym + '] Primary zone: ' + primaryZone.direction +
-        ' ' + primaryZone.priceRange + ' confidence=' + (primaryZone.confidence?.total||0));
+        ' ' + primaryZone.priceRange + ' score=' + zoneScore + '/100' +
+        (zoneScore >= 75 ? ' [FULL]' : zoneScore >= 60 ? ' [STANDARD]' : ' [BLOCKED]'));
+
+      // ── ZONE SCORE GATE ────────────────────────────────────────
+      // < 60  → no signals at all — zone not strong enough
+      // 60–74 → standard entry only, aggressive engine suppressed
+      // ≥ 75  → full system: standard + aggressive
+      if (zoneScore < 60) {
+        console.log('[' + sym + '] Zone score ' + zoneScore + ' < 60 — all signals suppressed');
+        await delay(400); continue;
+      }
 
       // Detect sweep from primary zone only — non-primary zones ignored
       let sweep = detectSweep(m5, [primaryZone]); // PRIMARY ZONE ONLY — all secondary zones ignored
@@ -2709,10 +2732,16 @@ async function autoScan() {
       ));
 
       // ── STAGE: ENTRY SIGNAL ───────────────────────────────────
-      // Run aggressive entry engine NOW — after full multi-stage confirmation
-      // All 4 prior stages (sweep/move/trend/pullback) are confirmed at this point.
-      // Engine acts as final execution layer, not a replacement for structure.
-      const entryResult = aggressiveEntryEngine(sym, m5, primaryZone, sess);
+      // Run aggressive entry engine — gated by zone score
+      // Zone score < 75 → aggressive engine suppressed, standard only
+      // Zone score ≥ 75 → full aggressive engine enabled
+      const allowAggressive = zoneScore >= 75;
+      const entryResult = allowAggressive
+        ? aggressiveEntryEngine(sym, m5, primaryZone, sess)
+        : { type: 'NO_ENTRY', reason: 'Zone score ' + zoneScore + ' < 75 — aggressive suppressed' };
+      if (!allowAggressive) {
+        console.log('[' + sym + '] Zone score ' + zoneScore + ' — aggressive engine suppressed (standard only)');
+      }
 
       // If engine sees no valid entry pattern at this exact moment, defer
       // SWEEP_FORMING: sweep valid, momentum not yet confirmed — wait
