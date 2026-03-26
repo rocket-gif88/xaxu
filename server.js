@@ -1903,102 +1903,117 @@ async function sendTelegram(text) {
 
 // Format full signal for Telegram — includes grade, score, expiry
 function formatTelegramSignal(sig) {
-  const isBuy  = sig.direction === 'BUY';
-  const emoji  = isBuy ? '🟢' : '🔴';
-  const asset  = sig.asset === 'XAUUSD' ? 'GOLD' : 'SILVER';
-  const grade  = sig.grade || (sig.confidence >= 85 ? 'A+' : 'A');
-  const gradeEmoji = grade === 'A+' ? '⭐' : '✅';
-  const modeLabel  = sig.entry_mode === 'AGGRESSIVE_EARLY' ? ' ⚡ EARLY'
-                   : sig.entry_mode === 'AGGRESSIVE'       ? ' 🎯 CONFIRMED'
-                   : '';
-  const alert  = sig.alert || {};
-  const expiry = alert.expiry || '—';
-  const bd     = sig.scoreBreakdown || {};
+  const isBuy   = sig.direction === 'BUY';
+  const dir     = sig.direction;
+  const asset   = sig.asset === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  const dirEmoji = isBuy ? '🟢' : '🔴';
 
-  // Score breakdown lines
-  const bdLines = [];
-  if (bd.session)      bdLines.push('  Session:      ' + bd.session.score + '/20 (' + bd.session.label + ')');
-  if (bd.liquidity)    bdLines.push('  Liquidity:    ' + bd.liquidity.score + '/20 (' + bd.liquidity.label + ')');
-  if (bd.sweep)        bdLines.push('  Sweep:        ' + bd.sweep.score + '/20 (wick ' + bd.sweep.wickPct + '%)');
-  if (bd.displacement) bdLines.push('  Displacement: ' + bd.displacement.score + '/15 (' + bd.displacement.ratio + 'x body)');
-  if (bd.structure)    bdLines.push('  Structure:    ' + bd.structure.score + '/15 (' + bd.structure.type + ' ' + bd.structure.method + ')');
-  if (bd.pullback)     bdLines.push('  Pullback:     ' + bd.pullback.score + '/10 (' + bd.pullback.retracement + '% retrace)');
+  // ── Grade & mode ──────────────────────────────────────────────
+  const conf    = sig.confidence || 0;
+  const grade   = conf >= 85 ? 'A+' : conf >= 75 ? 'A' : conf >= 65 ? 'B' : 'C';
+  const gradeEmoji = conf >= 85 ? '⭐' : conf >= 75 ? '✅' : '🔵';
 
-  const biasMap = {
-    bullish_bias: '↑ Bullish — price below prior day low',
-    bearish_bias: '↓ Bearish — price above prior day high',
-    neutral:      'Neutral — within prior day range'
-  };
+  const modeKey = sig.entry_mode || 'STANDARD';
+  const modeStr = modeKey === 'AGGRESSIVE_EARLY' ? '⚡ EARLY'
+                : modeKey === 'AGGRESSIVE'        ? '🎯 STANDARD'
+                : '🚀 MOMENTUM';
 
-  return [
-    emoji + ' <b>' + asset + ' ' + sig.direction + ' — ' + gradeEmoji + ' ' + grade + ' SETUP' + modeLabel + '</b>',
-    '📊 Confidence: ' + sig.confidence + '/100 — ' + (sig.tier || (sig.confidence >= 75 ? 'HIGH' : 'VALID')),
-    '',
-    '📋 <b>What happened:</b>',
-    (alert.context || sig.reason || '—'),
-    '',
-    '📊 <b>Trade levels:</b>',
-    '• Entry zone: $' + sig.entry,
-    '• Stop loss:  $' + sig.stop_loss,
-    '• Target 1:   $' + sig.take_profit_1,
-    '• Target 2:   $' + sig.take_profit_2,
-    '• Risk/Reward: 1:' + sig.rr,
-    '• Expires:    ' + expiry,
-    '',
-    '📈 <b>Score breakdown (' + sig.confidence + '/100):</b>',
-    ...bdLines,
-    '',
-    '🧭 <b>Market bias:</b> ' + (biasMap[sig.directional_bias] || 'Neutral'),
-    '📍 <b>Session:</b> ' + (sig.session || '—'),
-    '',
-    '💡 <b>What this means:</b>',
-    (alert.interpretation || '—'),
-    '',
-    '⚡ <b>Action:</b>',
-    (alert.execution || 'Wait for pullback into entry zone before executing.'),
-    '',
-    '─────────────────',
-    gradeEmoji + ' ' + grade + ' Signal #' + (sig.id || '—') + ' | Aurum Signals'
-  ].join('\n');
-}
-
-// Format pre-signal alert for Telegram
-function formatTelegramPreSignal(sym, ns) {
-  const asset  = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
-  const isBuy  = ns.direction === 'BUY';
-  const emojis = {
-    approaching_liquidity:  '📍',
-    sweep_detected:         '⚡',
-    displacement_confirmed: '↗️',
-    structure_break:        '✅'
-  };
-  const emoji = emojis[ns.stage] || '📡';
-  const stageLabel = {
-    approaching_liquidity:  'KEY LEVEL NEARBY',
-    sweep_detected:         'LIQUIDITY GRAB DETECTED',
-    displacement_confirmed: 'STRONG MOVE CONFIRMED',
-    structure_break:        'TREND SHIFT CONFIRMED'
-  }[ns.stage] || 'SETUP FORMING';
-
-  const alert = ns.alert || {};
-  // Zone confidence badge for approaching_liquidity
-  const zoneConf  = ns.zone_confidence;
-  const confLine  = zoneConf
-    ? zoneConf.emoji + ' Zone confidence: ' + zoneConf.total + '/100 (' + zoneConf.grade + ')'
+  // ── Entry zone ────────────────────────────────────────────────
+  const entryPrice  = sig.entry;
+  const livePrice   = sig.live_price || entryPrice;
+  const distFromEntry = livePrice && entryPrice
+    ? Math.abs(((livePrice - entryPrice) / entryPrice) * 100).toFixed(3)
     : null;
 
+  // Zone range from primary zone if available
+  const zone = sig.primaryZone || sig.zone || null;
+  const zoneRange = zone
+    ? '$' + parseFloat(zone.low || zone.minPrice || entryPrice).toFixed(2) +
+      ' – $' + parseFloat(zone.high || zone.maxPrice || entryPrice).toFixed(2)
+    : '$' + entryPrice;
+
+  // ── Risk management ───────────────────────────────────────────
+  const sl     = sig.stop_loss;
+  const riskDist = Math.abs(entryPrice - sl);
+  // Risk % assumes 0.5% of account per trade (configurable)
+  const RISK_PCT = 0.5;
+
+  // ── Take profit ───────────────────────────────────────────────
+  const tp1 = sig.take_profit_1;
+  const tp2 = sig.take_profit_2;
+  const rr1 = sig.rr || (tp1 ? (Math.abs(tp1 - entryPrice) / riskDist).toFixed(1) : '—');
+
+  // ── Validity / invalidation ───────────────────────────────────
+  const validity = modeKey === 'AGGRESSIVE_EARLY'
+    ? 'Valid for 2 candles (10 min) — early entry window'
+    : 'Valid until zone $' + (zone ? parseFloat(zone.low||zone.minPrice||sl).toFixed(2) : parseFloat(sl).toFixed(2)) + ' breaks';
+
+  const invalidation = isBuy
+    ? 'Close below $' + sl + ' · Pullback > 70% · Time expiry'
+    : 'Close above $' + sl + ' · Pullback > 70% · Time expiry';
+
+  // ── Reason bullets ────────────────────────────────────────────
+  const bd = sig.scoreBreakdown || {};
+  const reasons = [];
+  if (sig.sweep_level) reasons.push('• ' + sig.sweep_level + ' swept');
+  if (bd.sweep)        reasons.push('• Rejection wick: ' + (bd.sweep.wickPct || '—') + '%');
+  if (bd.displacement) reasons.push('• Displacement: ' + (bd.displacement.ratio || '—') + '× avg body');
+  if (bd.structure)    reasons.push('• BOS: ' + (bd.structure.type || '') + ' (' + (bd.structure.method || '') + ')');
+  if (sig.pullback_pct)reasons.push('• Pullback: ' + sig.pullback_pct + '% retracement');
+  if (!reasons.length && sig.reason) reasons.push('• ' + sig.reason);
+
+  // ── Session ───────────────────────────────────────────────────
+  const sess = sig.session || '—';
+
   return [
-    emoji + ' <b>' + asset + ' — ' + stageLabel + '</b>',
+    dirEmoji + ' <b>' + asset + ' ' + dir + '</b>  ' + gradeEmoji + ' <b>' + grade + '</b>  ' + modeStr,
+    '─────────────────────────────',
     '',
-    alert.context || ns.message || '—',
+    '<b>ENTRY</b>',
+    'Zone:    ' + zoneRange,
+    'Price:   $' + entryPrice + (distFromEntry ? '  (' + distFromEntry + '% from zone)' : ''),
     '',
-    ...(confLine ? [confLine, ''] : []),
-    '⏳ ' + (alert.action || 'Monitoring. No action required yet.'),
+    '<b>RISK MANAGEMENT</b>',
+    'Stop:    $' + sl + '  (risk ' + RISK_PCT + '% of account)',
+    'TP1:     $' + tp1 + '  (1:' + rr1 + 'R)',
+    'TP2:     $' + tp2,
     '',
-    '─────────────────',
-    'Pre-signal | Aurum Signals'
+    '<b>CONFIDENCE: ' + conf + '/100 — ' + grade + '</b>',
+    'Session: ' + sess,
+    '',
+    '<b>WHY</b>',
+    ...reasons,
+    '',
+    '<b>VALID:  </b>' + validity,
+    '<b>CANCEL: </b>' + invalidation,
+    '',
+    '─────────────────────────────',
+    'Aurum Signals · #' + (sig.id || '—')
   ].join('\n');
 }
+
+
+// Format pre-signal alert for Telegram
+// Format pre-signal alert for Telegram — short, readable in <5 seconds
+function formatTelegramPreSignal(sym, ns) {
+  const asset = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  const dir   = ns.direction || '—';
+
+  const stageConfig = {
+    approaching_liquidity:  { emoji: '📍', line: 'Approaching key zone — watch for sweep' },
+    sweep_detected:         { emoji: '⚡', line: 'Liquidity grab detected — waiting for displacement' },
+    displacement_confirmed: { emoji: '↗️', line: 'Strong move confirmed — waiting for trend shift' },
+    structure_break:        { emoji: '✅', line: 'Trend shift confirmed — waiting for pullback entry' },
+    waiting_pullback:       { emoji: '🎯', line: 'Pullback zone reached — entry evaluating' },
+  };
+
+  const cfg     = stageConfig[ns.stage] || { emoji: '📡', line: ns.message || 'Setup forming' };
+  const zoneConf = ns.zone_confidence;
+  const confStr  = zoneConf ? '  Zone: ' + zoneConf.total + '/100' : '';
+
+  return cfg.emoji + ' <b>' + asset + ' ' + dir + '</b> — ' + cfg.line + confStr + '\n─────────────────\nAurum Signals';
+}
+
 
 // ═══════════════════════════════════════════════════════════════
 // AUTO-SCAN ENGINE
@@ -2865,6 +2880,7 @@ async function autoScan() {
       const rawSig = {
         id: Date.now(), asset: sym, direction: sweep.direction,
         entry: parseFloat(pb.entry.toFixed(3)),
+        live_price: livePrice,
         stop_loss: sl, take_profit_1: tps.tp1, take_profit_2: tps.tp2,
         rr: tps.rr1, confidence: scoreResult.total,
         grade: scoreResult.grade, tier: scoreResult.tier, scoreBreakdown: scoreResult.breakdown,
@@ -2872,6 +2888,9 @@ async function autoScan() {
         session: sess, directional_bias: directionalBias,
         sweep_level: sweep.level?.label || '—',
         pullback_pct: pb.retracement, expiry: expiryUTC,
+        primaryZone: primaryZone
+          ? { low: primaryZone.minPrice, high: primaryZone.maxPrice }
+          : null,
         reason: sess + ' ' + (sweep.level?.label||'') + ' sweep → ' +
           sweep.direction.toLowerCase() + ' displacement (' + disp.ratio + '×) → BOS → ' + pb.retracement + '% pullback'
       };
