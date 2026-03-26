@@ -1776,6 +1776,8 @@ app.get('/analyze/:sym', async (req, res) => {
     sweep_potentials:  sweepPotentials,
     primary_zone:      primaryZone,
     zone_confidence:   pzConf,
+    zone_direction:    primaryZone?.direction || null,
+    zone_score_tier:   pzConf >= 75 ? 'FULL' : pzConf >= 60 ? 'STANDARD' : 'BLOCKED',
     zone_grade:        pzGrade,
     directional_bias:  directionalBias,
     bias_score:        analyzeGlobalBias?.score || 0,
@@ -2548,12 +2550,19 @@ async function autoScan() {
           await delay(400); continue;
         }
 
-        // Counter-structure: new sweep in opposite direction
-        const sweep2 = detectSweep(m5, levels);
-        if (sweep2.found && sweep2.direction !== setup.direction) {
-          await invalidateSetup(sym, 'Structure broke against ' + setup.direction + ' direction.');
-          resetSetup(sym, 'Counter-structure');
-          await delay(400); continue;
+        // Counter-structure: only check PRIMARY ZONE for opposing sweep
+        // (using all levels caused secondary zones to trigger false invalidations)
+        const primaryZoneForCheck = selectPrimaryZone(levels, livePrice, sess, m5);
+        if (primaryZoneForCheck) {
+          const sweep2 = detectSweep(m5, [primaryZoneForCheck]);
+          if (sweep2.found) {
+            const sweep2Corrected = correctSweepDirection(sweep2);
+            if (sweep2Corrected.direction !== setup.direction) {
+              await invalidateSetup(sym, 'Structure broke against ' + setup.direction + ' direction on primary zone.');
+              resetSetup(sym, 'Counter-structure');
+              await delay(400); continue;
+            }
+          }
         }
       }
 
@@ -2579,7 +2588,25 @@ async function autoScan() {
       // ≥ 75  → full system: standard + aggressive
       if (zoneScore < 60) {
         console.log('[' + sym + '] Zone score ' + zoneScore + ' < 60 — all signals suppressed');
+        // Cancel any active setup that depended on this zone
+        if (setup && setup.active) {
+          console.log('[' + sym + '] Cancelling active setup — zone score ' + zoneScore + ' fell below 60');
+          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 60).');
+          resetSetup(sym, 'Zone score below 60');
+        }
         await delay(400); continue;
+      }
+
+      // ── ZONE STRENGTH CHECK AT TREND SHIFT+ STAGES ─────────────
+      // If setup has progressed past trend shift but zone score is now < 60,
+      // cancel — do not proceed to pullback or entry with a weak zone.
+      if (setup && setup.active && setup.events?.trend) {
+        if (zoneScore < 60) {
+          console.log('[' + sym + '] Setup cancelled at trend+ stage — zone score ' + zoneScore + ' < 60');
+          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 60).');
+          resetSetup(sym, 'Zone too weak at trend+ stage');
+          await delay(400); continue;
+        }
       }
 
       // Detect sweep from primary zone only — non-primary zones ignored
