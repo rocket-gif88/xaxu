@@ -2829,6 +2829,7 @@ async function autoScan() {
       }
 
       // ── PRIMARY ZONE SELECTION — only this zone matters ─────────
+      const timing    = symTiming[sym];  // declared here — used throughout this block
       const structBias = timing
         ? { dir: timing.structuralBiasDir, stage: timing.structuralBiasStage }
         : null;
@@ -2843,7 +2844,7 @@ async function autoScan() {
         (zoneScore >= 75 ? ' [FULL]' : zoneScore >= 60 ? ' [STANDARD]' : ' [BLOCKED]'));
 
       // ── ZONE DETECTION COOLDOWN ────────────────────────────────
-      const timing = symTiming[sym];
+      // (timing already declared above)
       if (timing && Date.now() < timing.zoneDetectionAllowedAt) {
         const waitMins = Math.ceil((timing.zoneDetectionAllowedAt - Date.now()) / 60000);
         console.log('[timing] ' + sym + ': zone detection cooldown active (' + waitMins + 'min remaining) — skipping');
