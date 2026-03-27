@@ -11,8 +11,166 @@ app.use(cors({
 app.options('*', cors());        // handle preflight for all routes
 app.use(express.json());
 
+const fs   = require('fs');
+const path = require('path');
+
 const TWELVE_KEY    = '7f3fc6ca85664930ab6e687db8ff0c5d';
 const ANTHROPIC_KEY = ['sk-ant-','api03-PSBtiCb9gNCUnpxHjEl2sqWVtfNop5DtO1WCW2pdUw_upi3Zl0VDjCT7Yyk','W9bboA3Bxnq2ucHBFyuNrNx6CL','w-qYuk4wAA'].join('');
+// ═══════════════════════════════════════════════════════════════════════════
+// SETUP LOGGING & ANALYTICS SYSTEM
+// Passive, non-blocking, append-only. Never touches trading logic.
+// Logs every setup lifecycle event to logs.jsonl
+// ═══════════════════════════════════════════════════════════════════════════
+
+const LOG_FILE = path.join(__dirname, 'logs.jsonl');
+
+// In-memory log store — keyed by setup.id, flushed on update
+const _setupLogs = {};
+
+function detectSessionTag(utcHour) {
+  if (utcHour >= 0  && utcHour < 7)  return 'ASIA';
+  if (utcHour >= 7  && utcHour < 13) return 'LONDON';
+  if (utcHour >= 13 && utcHour < 22) return 'NY';
+  return 'OFF';
+}
+
+// Write or update a log entry (non-blocking)
+function flushLog(id) {
+  try {
+    const entry = _setupLogs[id];
+    if (!entry) return;
+    fs.appendFile(LOG_FILE, JSON.stringify(entry) + '\n', () => {}); // async, non-blocking
+  } catch(e) {
+    // Never let logging break the trading engine
+    console.error('[log] Write error:', e.message);
+  }
+}
+
+// Called when setup is created
+function logSetupCreated(setup, primaryZone) {
+  try {
+    const h = new Date().getUTCHours();
+    const log = {
+      id:              setup.id,
+      symbol:          setup.sym,
+      direction:       setup.direction,
+      zone: {
+        low:    primaryZone?.minPrice || null,
+        high:   primaryZone?.maxPrice || null,
+        score:  primaryZone?.confidence?.total || null,
+        touches:primaryZone?.totalTouches || null,
+      },
+      session:          detectSessionTag(h),
+      timestamp_start:  new Date().toISOString(),
+      stages: { liquidity_grab:false, strong_move:false, trend_shift:false, pullback:false, entry:false },
+      entryTriggered:   false,
+      entryPrice:       null,
+      stopLoss:         null,
+      takeProfits:      [],
+      invalidated:      false,
+      invalidationReason: null,
+      timestamp_end:    null,
+      candlesToEntry:   null,
+      candlesToInvalidation: null,
+      startCandleMs:    Date.now(),
+      result:           null,
+      _version:         1,
+    };
+    _setupLogs[setup.id] = log;
+    console.log('[log] Setup created: ' + setup.sym + ' ' + setup.direction +
+      ' zone=' + (primaryZone?.priceRange || '?') + ' score=' + (primaryZone?.confidence?.total || '?'));
+    flushLog(setup.id);
+  } catch(e) { console.error('[log] logSetupCreated error:', e.message); }
+}
+
+// Called when a stage is confirmed
+function logStageUpdate(setup, stage) {
+  try {
+    const log = _setupLogs[setup.id];
+    if (!log) return;
+    const stageMap = { sweep:'liquidity_grab', move:'strong_move', trend:'trend_shift', pullback:'pullback', entry:'entry' };
+    const key = stageMap[stage];
+    if (key) log.stages[key] = true;
+    log._version++;
+    console.log('[log] Stage: ' + setup.sym + ' → ' + stage);
+    flushLog(setup.id);
+  } catch(e) { console.error('[log] logStageUpdate error:', e.message); }
+}
+
+// Called when entry signal fires
+function logEntryTriggered(setup, entryPrice, stopLoss, takeProfits) {
+  try {
+    const log = _setupLogs[setup.id];
+    if (!log) return;
+    log.entryTriggered  = true;
+    log.entryPrice      = entryPrice;
+    log.stopLoss        = stopLoss;
+    log.takeProfits     = takeProfits;
+    log.stages.entry    = true;
+    const elapsed = Date.now() - log.startCandleMs;
+    log.candlesToEntry  = Math.round(elapsed / (5 * 60 * 1000));
+    log.timestamp_end   = new Date().toISOString();
+    log._version++;
+    console.log('[log] Entry triggered: ' + setup.sym + ' @ ' + entryPrice +
+      ' SL=' + stopLoss + ' TP1=' + (takeProfits[0]||'?') + ' candles=' + log.candlesToEntry);
+    flushLog(setup.id);
+  } catch(e) { console.error('[log] logEntryTriggered error:', e.message); }
+}
+
+// Called when setup is invalidated
+function logInvalidation(setup, reason) {
+  try {
+    const log = _setupLogs[setup.id];
+    if (!log) return;
+    log.invalidated         = true;
+    log.invalidationReason  = reason;
+    log.timestamp_end       = new Date().toISOString();
+    const elapsed = Date.now() - log.startCandleMs;
+    log.candlesToInvalidation = Math.round(elapsed / (5 * 60 * 1000));
+    log._version++;
+    console.log('[log] Invalidated: ' + setup.sym + ' reason="' + reason + '" candles=' + log.candlesToInvalidation);
+    flushLog(setup.id);
+    // Remove from memory after flush (setup is dead)
+    setTimeout(() => { delete _setupLogs[setup.id]; }, 2000);
+  } catch(e) { console.error('[log] logInvalidation error:', e.message); }
+}
+
+// Update trade result (TP1/TP2/SL/BE) — called manually or from future price checker
+function logTradeResult(setupId, result) {
+  try {
+    const log = _setupLogs[setupId];
+    if (log) {
+      log.result    = result;
+      log._version++;
+      flushLog(setupId);
+    }
+    // Also update last entry in file for this ID (best-effort)
+    console.log('[log] Result: ' + setupId + ' → ' + result);
+  } catch(e) { console.error('[log] logTradeResult error:', e.message); }
+}
+
+// Read and parse all logs for analytics
+function readAllLogs() {
+  try {
+    if (!fs.existsSync(LOG_FILE)) return [];
+    const lines = fs.readFileSync(LOG_FILE, 'utf8').split('\n').filter(Boolean);
+    // Group by ID, take last entry for each (most recent state)
+    const byId = {};
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line);
+        if (!byId[obj.id] || (obj._version || 0) >= (byId[obj.id]._version || 0)) {
+          byId[obj.id] = obj;
+        }
+      } catch {}
+    }
+    return Object.values(byId);
+  } catch(e) {
+    console.error('[log] readAllLogs error:', e.message);
+    return [];
+  }
+}
+
 const SYMBOLS = {
   XAUUSD: 'XAU/USD',   // Gold spot — free tier
   XAGUSD: 'SLV'        // Silver via iShares Silver Trust ETF (SLV) — free tier proxy
@@ -1891,8 +2049,72 @@ app.get('/prices', (req, res) => {
   });
 });
 
-// Keep-alive ping — call this from frontend every 4 min to prevent Railway sleep
+// Keep-alive ping
 app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
+// ── GET /stats — setup analytics
+app.get('/stats', (req, res) => {
+  try {
+    const logs = readAllLogs();
+    const total        = logs.length;
+    const entries      = logs.filter(l => l.entryTriggered).length;
+    const invalidations= logs.filter(l => l.invalidated && !l.entryTriggered).length;
+    const withResult   = logs.filter(l => l.result);
+    const wins         = withResult.filter(l => l.result === 'TP1' || l.result === 'TP2').length;
+    const losses       = withResult.filter(l => l.result === 'SL').length;
+    const winRate      = withResult.length > 0 ? Math.round(wins / withResult.length * 100) : null;
+    const avgZoneScore = total > 0
+      ? parseFloat((logs.reduce((s,l) => s + (l.zone?.score||0), 0) / total).toFixed(1))
+      : null;
+    const conversionRate = total > 0 ? Math.round(entries / total * 100) : null;
+
+    // Per-session breakdown
+    const bySession = {};
+    for (const l of logs) {
+      const sess = l.session || 'UNKNOWN';
+      if (!bySession[sess]) bySession[sess] = { setups:0, entries:0, wins:0 };
+      bySession[sess].setups++;
+      if (l.entryTriggered) bySession[sess].entries++;
+      if (l.result === 'TP1' || l.result === 'TP2') bySession[sess].wins++;
+    }
+
+    // By direction
+    const byDir = { BUY:{setups:0,entries:0,wins:0}, SELL:{setups:0,entries:0,wins:0} };
+    for (const l of logs) {
+      const d = l.direction;
+      if (byDir[d]) {
+        byDir[d].setups++;
+        if (l.entryTriggered) byDir[d].entries++;
+        if (l.result === 'TP1' || l.result === 'TP2') byDir[d].wins++;
+      }
+    }
+
+    res.json({
+      totalSetups:      total,
+      entriesTriggered: entries,
+      invalidations,
+      winRate,
+      losses,
+      avgZoneScore,
+      conversionRate,
+      bySession,
+      byDirection:      byDir,
+      recentSetups:     logs.slice(-10).reverse(),
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /result — record trade outcome manually
+// Body: { setupId: string, result: "TP1"|"TP2"|"SL"|"BE" }
+app.post('/result', (req, res) => {
+  const { setupId, result } = req.body || {};
+  if (!setupId || !result) return res.status(400).json({ error: 'setupId and result required' });
+  if (!['TP1','TP2','SL','BE'].includes(result)) return res.status(400).json({ error: 'Invalid result' });
+  logTradeResult(setupId, result);
+  res.json({ ok: true, setupId, result });
+});
 
 // Test signal — fires a mock ENTRY_READY through the full Telegram formatter
 // Usage: GET /test-signal  (or /test-signal?dir=BUY)
@@ -2186,8 +2408,19 @@ function createSetup(sym, direction, levelOrZone) {
   return setup;
 }
 
+// Wrapper called from autoScan — creates setup AND logs it
+function createAndLogSetup(sym, direction, levelOrZone) {
+  const setup = createSetup(sym, direction, levelOrZone);
+  logSetupCreated(setup, levelOrZone);
+  return setup;
+}
+
 // Setups keyed by symbol
 const setups = { XAUUSD: null, XAGUSD: null };
+
+// Active trade monitor — tracks open positions after entry signal fires
+// { XAUUSD: { setupId, direction, entry, sl, tp1, tp2, high, low, resultLogged }, ... }
+const tradeMonitor = { XAUUSD: null, XAGUSD: null };
 
 // Per-symbol timing state — persists through setup resets
 // Tracks cooldowns for zone detection, bias flips, invalidation windows
@@ -2308,6 +2541,7 @@ async function invalidateSetup(sym, reason) {
   setup.events.invalidated = true;
   setup.stage              = 'invalidated';
   console.log('[' + sym + '] Setup invalidated → alert sent once (id=' + setup.id + '): ' + reason);
+  logInvalidation(setup, reason);
 
   // ── BIAS FLIP ON INVALIDATION ─────────────────────────────────
   // Invalidation = market rejected this direction → flip bias to opposite
@@ -2726,6 +2960,43 @@ function correctSweepDirection(sweep) {
   return { ...sweep, direction: correct };
 }
 
+// ── TRADE RESULT MONITOR ──────────────────────────────────────────────────────
+// Runs on every scan after an entry signal fires.
+// Checks live price against SL/TP1/TP2 and auto-logs the result.
+function checkTradeMonitor(sym, livePrice, m5) {
+  const mon = tradeMonitor[sym];
+  if (!mon || mon.resultLogged) return;
+
+  const isBuy  = mon.direction === 'BUY';
+  const high   = Math.max(...m5.slice(-3).map(c => c.h)); // recent 3-candle high
+  const low    = Math.min(...m5.slice(-3).map(c => c.l)); // recent 3-candle low
+
+  // Track adverse excursion for BE detection
+  mon.maxFav   = isBuy
+    ? Math.max(mon.maxFav || mon.entry, high)
+    : Math.min(mon.maxFav || mon.entry, low);
+
+  let result = null;
+
+  if (isBuy) {
+    if (mon.tp2 && high >= mon.tp2)       result = 'TP2';
+    else if (mon.tp1 && high >= mon.tp1)  result = 'TP1';
+    else if (low  <= mon.sl)              result = 'SL';
+  } else {
+    if (mon.tp2 && low  <= mon.tp2)       result = 'TP2';
+    else if (mon.tp1 && low  <= mon.tp1)  result = 'TP1';
+    else if (high >= mon.sl)              result = 'SL';
+  }
+
+  if (result) {
+    mon.resultLogged = true;
+    logTradeResult(mon.setupId, result);
+    console.log('[monitor] ' + sym + ': ' + result + ' hit — ' + mon.direction +
+      ' entry=' + mon.entry + ' sl=' + mon.sl + ' tp1=' + mon.tp1);
+    tradeMonitor[sym] = null; // clear monitor
+  }
+}
+
 async function autoScan() {
   const h         = new Date().getUTCHours();
   const inSession = (h >= 7 && h < 16) || (h >= 13 && h < 22);
@@ -2734,6 +3005,11 @@ async function autoScan() {
     for (const sym of ['XAUUSD','XAGUSD']) {
       if (setups[sym]) {
         resetSetup(sym, 'Session closed');
+      }
+      // Clear any open trade monitor at session close
+      if (tradeMonitor[sym] && !tradeMonitor[sym].resultLogged) {
+        console.log('[monitor] ' + sym + ': session closed — trade monitor cleared (no result)');
+        tradeMonitor[sym] = null;
       }
       // Reset consecutive failures and structural bias at session close
       if (symTiming[sym]) {
@@ -2771,6 +3047,9 @@ async function autoScan() {
       const livePrice  = m5[m5.length-1].c;
       const volatility = checkATR(sym, atrValues);
       const levels     = buildLevels(m5, m15);
+
+      // Check open trade monitor first (non-blocking result detection)
+      checkTradeMonitor(sym, livePrice, m5);
       const sess       = sessionName(Date.now());
       const sessionOk  = sess !== null;
       const sessionOverlap = sess === 'London+NY Overlap';
@@ -2938,7 +3217,7 @@ async function autoScan() {
             console.log('[validate] ' + sym + ': approaching blocked — ' + approachBlocked.join(', '));
             await delay(400); continue;
           }
-          const newSetup = createSetup(sym, approaching.dir, approaching);
+          const newSetup = createAndLogSetup(sym, approaching.dir, approaching);
           setups[sym] = newSetup;
           setup = newSetup;
           const rangeStr = approaching.isZone
@@ -2989,7 +3268,7 @@ async function autoScan() {
           console.log('[validate] ' + sym + ': setup creation blocked (' + vResult.reasons.length + ' failures)');
           await delay(400); continue;
         }
-        setup = createSetup(sym, sweep.direction, sweep.level);
+        setup = createAndLogSetup(sym, sweep.direction, sweep.level);
         setups[sym] = setup;
         console.log('[validate] ' + sym + ': setup passed all 8 rules — created id=' + setup.id);
       }
@@ -3039,6 +3318,7 @@ async function autoScan() {
       // Forces each stage to be confirmed on a separate scan cycle.
       // Prevents bulk-confirmation of multiple stages from historical data.
       if (sweepFired) {
+        logStageUpdate(setup, 'sweep');
         // Record structural bias at sweep stage
         if (timing) {
           timing.structuralBiasDir   = sweep.direction;
@@ -3065,6 +3345,7 @@ async function autoScan() {
       ), disp.candleIdx);
 
       if (moveFired) {
+        logStageUpdate(setup, 'move');
         if (timing) {
           timing.structuralBiasDir   = sweep.direction;
           timing.structuralBiasStage = 'move';
@@ -3091,6 +3372,7 @@ async function autoScan() {
       ), bos.candleIdx);
 
       if (trendFired) {
+        logStageUpdate(setup, 'trend');
         if (timing) {
           timing.structuralBiasDir   = sweep.direction;
           timing.structuralBiasStage = 'trend';
@@ -3142,12 +3424,13 @@ async function autoScan() {
         await delay(400); continue;
       }
 
-      await fireEvent(setup, 'pullback', sym, () => sendTelegram(
+      const pullbackFired = await fireEvent(setup, 'pullback', sym, () => sendTelegram(
         '🎯 <b>' + asset + ' — PULLBACK INTO ENTRY ZONE</b>\n\n' +
         'Price pulled back ' + pb.retracement + '% into the entry zone.\n' +
         'Preparing to evaluate full signal.\n\n' +
         '⏳ Running quality checks...\n\n─────────────────\nAurum Signals'
       ), pb.candleIdx);
+      if (pullbackFired) logStageUpdate(setup, 'pullback');
 
       // ── STAGE: ENTRY SIGNAL ───────────────────────────────────
       // Run aggressive entry engine — gated by zone score
@@ -3285,8 +3568,24 @@ async function autoScan() {
       await fireEvent(setup, 'entry', sym, async () => {
         sentSignals.add(sigKey);
         setTimeout(() => sentSignals.delete(sigKey), 4 * 60 * 60 * 1000);
-        // Mark setup as complete — no more events
         setup.active = false;
+        // Log entry
+        logEntryTriggered(setup, rawSig.entry, rawSig.stop_loss, [rawSig.take_profit_1, rawSig.take_profit_2].filter(Boolean));
+        // Start trade result monitor
+        tradeMonitor[sym] = {
+          setupId:      setup.id,
+          direction:    rawSig.direction,
+          entry:        rawSig.entry,
+          sl:           rawSig.stop_loss,
+          tp1:          rawSig.take_profit_1,
+          tp2:          rawSig.take_profit_2,
+          maxFav:       rawSig.entry,
+          resultLogged: false,
+          startedAt:    Date.now(),
+        };
+        console.log('[monitor] ' + sym + ': trade monitor started — ' +
+          rawSig.direction + ' entry=' + rawSig.entry + ' SL=' + rawSig.stop_loss +
+          ' TP1=' + rawSig.take_profit_1 + ' TP2=' + rawSig.take_profit_2);
         // Early entry lock: if AGGRESSIVE_EARLY mode, freeze for 2 candles (10 min)
         if (entryResult.type === 'ENTRY_READY' && entryResult.mode === 'AGGRESSIVE_EARLY') {
           setup.earlyLockUntil = Date.now() + 10 * 60 * 1000; // 10 min = 2 × M5 candles
