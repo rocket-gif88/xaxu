@@ -2091,16 +2091,25 @@ app.get('/health', async (req, res) => {
 });
 
 app.get('/prices', (req, res) => {
-  // Serve prices from in-memory cache — zero API calls
-  // Cache is populated by /analyze calls; stale by at most 60s which is fine
+  // Serve prices from in-memory candle cache — zero API calls
   const xauCache = getCached('candles_XAUUSD_5min_120');
   const xagCache = getCached('candles_XAGUSD_5min_120');
   const xau = xauCache ? parseFloat(xauCache[xauCache.length-1]?.c) || null : null;
-  const xag = xagCache ? parseFloat(xagCache[xagCache.length-1]?.c) || null : null;
+  const slv = xagCache ? parseFloat(xagCache[xagCache.length-1]?.c) || null : null;
+
+  // SLV holds ~0.9300 troy oz of silver per share (IAU ratio, updated periodically)
+  // Convert SLV price → XAG spot price for an accurate Gold/Silver ratio
+  const SLV_OZ_RATIO = 0.9300;
+  const xagSpot = slv ? parseFloat((slv / SLV_OZ_RATIO).toFixed(3)) : null;
+
+  // Real XAU/XAG ratio (Gold/Silver ratio) — industry standard metric
+  const ratio = xau && xagSpot ? parseFloat((xau / xagSpot).toFixed(1)) : null;
+
   res.json({
-    success: true,
-    prices: { XAUUSD: xau, XAGUSD: xag },
-    ratio: xau && xag ? parseFloat((xau/xag).toFixed(2)) : null,
+    success:  true,
+    prices:   { XAUUSD: xau, XAGUSD: slv },   // XAGUSD shows SLV price as-is for display
+    xag_spot: xagSpot,                          // actual silver spot estimate
+    ratio,                                      // true XAU/XAG ratio
     from_cache: true,
     ts: new Date().toUTCString()
   });
