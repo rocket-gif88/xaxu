@@ -3459,6 +3459,20 @@ async function autoScan() {
           timing.structuralBiasAt    = Date.now();
           console.log('[bias] ' + sym + ': structural bias confirmed → ' + sweep.direction + ' (BOS stage)');
         }
+        // PRE-ENTRY ALERT: send at trend confirmation (not pullback)
+        // This ensures alert fires even if pullback immediately exceeds 70%
+        if (TELEGRAM_MODE !== 'FULL' && setup && !setup.tgAlerts?.preEntry) {
+          if (setup.tgAlerts) setup.tgAlerts.preEntry = true;
+          await sendTelegram(
+            '⚠️ <b>' + asset + ' ' + sweep.direction + ' — SETUP FORMING</b>\n\n' +
+            'Zone: $' + parseFloat(primaryZone.minPrice).toFixed(2) +
+            ' – $' + parseFloat(primaryZone.maxPrice).toFixed(2) + '\n' +
+            'Confidence: ' + zoneScore + '/100\n' +
+            'Touches: ' + primaryZone.totalTouches + '\n\n' +
+            'Status: Waiting for pullback into entry zone.\n\n' +
+            '⏳ No action yet — monitor closely.\n\n─────────────────\nAurum Signals'
+          );
+        }
         console.log('[' + sym + '] Trend fired this scan — waiting for next scan before pullback');
         await delay(400); continue;
       }
@@ -3513,20 +3527,7 @@ async function autoScan() {
             '⏳ Running quality checks...\n\n─────────────────\nAurum Signals'
           );
         }
-        // EXECUTION mode: send PRE-ENTRY alert here (trend confirmed + pullback = action required soon)
-        if (TELEGRAM_MODE !== 'FULL' && setup && !setup.tgAlerts?.preEntry) {
-          if (setup.tgAlerts) setup.tgAlerts.preEntry = true;
-          const dirEmoji = sweep.direction === 'BUY' ? '🟢' : '🔴';
-          await sendTelegram(
-            '⚠️ <b>' + asset + ' ' + sweep.direction + ' — SETUP FORMING</b>\n\n' +
-            'Zone: $' + parseFloat(primaryZone.minPrice).toFixed(2) +
-            ' – $' + parseFloat(primaryZone.maxPrice).toFixed(2) + '\n' +
-            'Confidence: ' + zoneScore + '/100\n' +
-            'Pullback: ' + pb.retracement + '% retracement\n\n' +
-            'Status: Evaluating entry conditions...\n\n' +
-            '⏳ No action yet — monitor closely.\n\n─────────────────\nAurum Signals'
-          );
-        }
+        // Pre-entry alert already sent at trend stage — nothing extra needed here
       }, pb.candleIdx);
       if (pullbackFired) logStageUpdate(setup, 'pullback');
 
