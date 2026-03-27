@@ -516,8 +516,10 @@ function scoreZone(z, price, sess) {
 
 
 // ── ZONE RANKING ENGINE — selects ONE primary zone per symbol ───────────────
-function selectPrimaryZone(levels, price, sess, m5Candles) {
+function selectPrimaryZone(levels, price, sess, m5Candles, structuralBias) {
   const m5 = m5Candles || [];
+  // structuralBias: { dir: 'BUY'|'SELL'|null, stage: 'sweep'|'move'|'trend'|null }
+  // If set, the opposite direction zone cannot become primary unless structure confirms
 
   // 1. Pull only EQH/EQL clustered zones
   const zones = levels.filter(l => l.isZone && (l.type === 'EQH' || l.type === 'EQL'));
@@ -573,10 +575,42 @@ function selectPrimaryZone(levels, price, sess, m5Candles) {
              inside, confidence, score: confidence.total };
   });
 
+  // 4. Apply structural bias — block opposite direction zones from becoming primary
+  // unless bias is only at 'sweep' level (weakest) and no opposing zone is stronger
+  if (structuralBias && structuralBias.dir) {
+    const biasDir       = structuralBias.dir;
+    const biasStage     = structuralBias.stage || 'sweep';
+    const oppositeDir   = biasDir === 'BUY' ? 'SELL' : 'BUY';
+    const stageStrength = { sweep: 1, move: 2, trend: 3 };
+    const biasStrength  = stageStrength[biasStage] || 1;
+
+    scored.forEach(z => {
+      if (z.direction === oppositeDir) {
+        // Counter-trend zone — demote unless bias is only at sweep level
+        if (biasStrength >= 2) {
+          // Move or trend confirmed — strongly suppress counter-trend zone
+          z.score        = Math.max(0, z.score - 40);
+          z.isCounterTrend = true;
+          console.log('[bias] ' + oppositeDir + ' zone ' + z.priceRange +
+            ' demoted (counter-trend — ' + biasDir + ' bias at ' + biasStage + ' stage)');
+        } else {
+          // Only sweep confirmed — moderate suppression
+          z.score        = Math.max(0, z.score - 20);
+          z.isCounterTrend = true;
+          console.log('[bias] ' + oppositeDir + ' zone ' + z.priceRange +
+            ' mildly demoted (counter-trend — ' + biasDir + ' sweep only)');
+        }
+      }
+    });
+  }
+
   // 4. Sort by score descending — highest score = primary zone
   scored.sort((a, b) => b.score - a.score);
 
   const primary = scored[0];
+  if (primary.isCounterTrend) {
+    console.log('[bias] WARNING: primary zone is counter-trend — no same-direction zone available');
+  }
   console.log('[zone] PRIMARY ZONE SELECTED: ' + primary.direction +
     ' ' + primary.priceRange +
     ' score=' + primary.score + '/100' +
@@ -1544,7 +1578,7 @@ app.get('/analyze/:sym', async (req, res) => {
   // ── PRIMARY ZONE SELECTION (before sweep detection) ────────────────────
   // Must happen here so detectSweep can be locked to primary zone only.
   // Prevents secondary zones from triggering conflicting signals.
-  const primaryZoneEarly = selectPrimaryZone(levels, currentPrice, sess, m5);
+  const primaryZoneEarly = selectPrimaryZone(levels, currentPrice, sess, m5, null);
   const sweepLevels = primaryZoneEarly ? [primaryZoneEarly] : [];
 
   if (!sessionOk) {
@@ -2165,10 +2199,14 @@ const symTiming = {
     lastInvalidatedDir:      null,
     pullbackStartCandleIdx:  -1,
     pullbackCandleCount:     0,
-    // Sweep alert cooldown — prevents duplicate grab alerts on overlapping zones
-    lastSweepAlertAt:        0,    // ms timestamp of last sweep Telegram
-    lastSweepDir:            null, // direction of last sweep alert
-    lastSweepZoneKey:        null, // zone ID of last sweep alert
+    lastSweepAlertAt:        0,
+    lastSweepDir:            null,
+    lastSweepZoneKey:        null,
+    // Structural bias — persists until opposite structure confirmed
+    structuralBiasDir:       null,  // 'BUY' | 'SELL' | null
+    structuralBiasStage:     null,  // 'sweep' | 'move' | 'trend' — how strong
+    structuralBiasAt:        0,     // timestamp when bias was set
+    consecutiveFailures:     { BUY: 0, SELL: 0 }, // track repeated failures per direction
   },
   XAGUSD: {
     zoneDetectionAllowedAt:  0,
@@ -2180,6 +2218,10 @@ const symTiming = {
     lastSweepAlertAt:        0,
     lastSweepDir:            null,
     lastSweepZoneKey:        null,
+    structuralBiasDir:       null,
+    structuralBiasStage:     null,
+    structuralBiasAt:        0,
+    consecutiveFailures:     { BUY: 0, SELL: 0 },
   }
 };
 
@@ -2261,13 +2303,47 @@ async function invalidateSetup(sym, reason) {
     console.log('[' + sym + '] Invalidation alert already sent — blocking duplicate');
     return;
   }
-  setup.invalidated       = true;
-  setup.active            = false;
+  setup.invalidated        = true;
+  setup.active             = false;
   setup.events.invalidated = true;
-  setup.stage             = 'invalidated';
+  setup.stage              = 'invalidated';
   console.log('[' + sym + '] Setup invalidated → alert sent once (id=' + setup.id + '): ' + reason);
+
+  // ── BIAS FLIP ON INVALIDATION ─────────────────────────────────
+  // Invalidation = market rejected this direction → flip bias to opposite
+  const oppositeDir   = setup.direction === 'BUY' ? 'SELL' : 'BUY';
+  const t             = symTiming[sym];
+  let   biasMsg       = 'Watching for next opportunity.';
+  if (t) {
+    // Track consecutive failures per direction
+    t.consecutiveFailures[setup.direction] = (t.consecutiveFailures[setup.direction] || 0) + 1;
+    t.consecutiveFailures[oppositeDir]     = 0; // reset opposite count
+    const failures = t.consecutiveFailures[setup.direction];
+
+    // Flip structural bias to opposite direction
+    // Stage strength depends on how far the failed setup progressed
+    const failedStage = setup.stage === 'trend'    ? 'move'
+                      : setup.stage === 'pullback' ? 'trend'
+                      : setup.stage === 'move'     ? 'sweep'
+                      : 'sweep';
+    t.structuralBiasDir   = oppositeDir;
+    t.structuralBiasStage = failedStage;
+    t.structuralBiasAt    = Date.now();
+
+    const confStr = failures >= 3 ? ' (HIGH confidence — ' + failures + ' consecutive failures)'
+                  : failures >= 2 ? ' (' + failures + ' consecutive failures)'
+                  : '';
+    biasMsg = setup.direction + ' setup invalidated — short-term ' + oppositeDir +
+      ' bias active' + confStr + '.';
+    console.log('[bias] ' + sym + ': bias flipped → ' + oppositeDir +
+      ' after ' + setup.direction + ' invalidation (stage: ' + failedStage + ', failures: ' + failures + ')');
+  }
+
   const asset = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
-  await sendTelegram('⚠️ <b>' + asset + ' — SETUP INVALIDATED</b>\n\n' + reason + '\n\nWatching for next opportunity.\n\n─────────────────\nAurum Signals');
+  const dirEmoji = oppositeDir === 'BUY' ? '🟢' : '🔴';
+  await sendTelegram('⚠️ <b>' + asset + ' — SETUP INVALIDATED</b>\n\n' +
+    reason + '\n\n' + dirEmoji + ' ' + biasMsg +
+    '\n\n─────────────────\nAurum Signals');
 }
 
 // Reset a symbol's setup — called when session closes or new sweep on different zone
@@ -2284,7 +2360,12 @@ function resetSetup(sym, reason) {
       symTiming[sym].biasFlipAllowedAt      = now + 2 * CANDLE_MS;
       symTiming[sym].pullbackStartCandleIdx = -1;
       symTiming[sym].pullbackCandleCount    = 0;
+      // Structural bias was updated in invalidateSetup (flipped to opposite direction)
+      // resetSetup just records the cooldown — bias is already correct
       console.log('[timing] ' + sym + ': cooldown set — zone detection blocked for 10min after ' + reason);
+      console.log('[bias] ' + sym + ': bias now → ' +
+        (symTiming[sym].structuralBiasDir || 'none') +
+        ' (' + (symTiming[sym].structuralBiasStage || '?') + ' stage)');
     }
   }
   setups[sym] = null;
@@ -2654,6 +2735,12 @@ async function autoScan() {
       if (setups[sym]) {
         resetSetup(sym, 'Session closed');
       }
+      // Reset consecutive failures and structural bias at session close
+      if (symTiming[sym]) {
+        symTiming[sym].structuralBiasDir   = null;
+        symTiming[sym].structuralBiasStage = null;
+        symTiming[sym].consecutiveFailures = { BUY: 0, SELL: 0 };
+      }
     }
     console.log('[auto-scan] Outside session (UTC ' + h + ':xx) — skipping');
     return;
@@ -2722,6 +2809,14 @@ async function autoScan() {
             if (sweep2Corrected.direction !== setup.direction) {
               await invalidateSetup(sym, 'Structure broke against ' + setup.direction + ' direction on primary zone.');
               resetSetup(sym, 'Counter-structure');
+              // Counter-structure sweep = opposite structure confirmed → clear bias
+              if (symTiming[sym]) {
+                symTiming[sym].structuralBiasDir   = sweep2Corrected.direction;
+                symTiming[sym].structuralBiasStage = 'sweep';
+                symTiming[sym].structuralBiasAt    = Date.now();
+                console.log('[bias] ' + sym + ': structural bias flipped → ' +
+                  sweep2Corrected.direction + ' (counter-structure confirmed)');
+              }
               await delay(400); continue;
             }
           }
@@ -2734,7 +2829,10 @@ async function autoScan() {
       }
 
       // ── PRIMARY ZONE SELECTION — only this zone matters ─────────
-      const primaryZone = selectPrimaryZone(levels, livePrice, sess, m5);
+      const structBias = timing
+        ? { dir: timing.structuralBiasDir, stage: timing.structuralBiasStage }
+        : null;
+      const primaryZone = selectPrimaryZone(levels, livePrice, sess, m5, structBias);
       if (!primaryZone) {
         console.log('[' + sym + '] No primary zone found — skip');
         await delay(400); continue;
@@ -2745,7 +2843,6 @@ async function autoScan() {
         (zoneScore >= 75 ? ' [FULL]' : zoneScore >= 60 ? ' [STANDARD]' : ' [BLOCKED]'));
 
       // ── ZONE DETECTION COOLDOWN ────────────────────────────────
-      // After invalidation, block new zone detection for 2 candles (10 min)
       const timing = symTiming[sym];
       if (timing && Date.now() < timing.zoneDetectionAllowedAt) {
         const waitMins = Math.ceil((timing.zoneDetectionAllowedAt - Date.now()) / 60000);
@@ -2753,14 +2850,36 @@ async function autoScan() {
         await delay(400); continue;
       }
 
-      // ── BIAS FLIP PROTECTION ────────────────────────────────────
-      // After a BUY setup is invalidated, don't allow a SELL setup for 2 candles (vice versa)
+      // ── BIAS FLIP PROTECTION (cooldown-based) ──────────────────
       if (timing && timing.lastInvalidatedDir && Date.now() < timing.biasFlipAllowedAt) {
         if (primaryZone && primaryZone.direction !== timing.lastInvalidatedDir) {
           const waitMins = Math.ceil((timing.biasFlipAllowedAt - Date.now()) / 60000);
           console.log('[timing] ' + sym + ': bias flip blocked — last setup was ' +
             timing.lastInvalidatedDir + ', opposite direction locked for ' + waitMins + 'min');
           await delay(400); continue;
+        }
+      }
+
+      // ── STRUCTURAL BIAS GATE ─────────────────────────────────────
+      // If a structural bias is active (sweep/move/trend confirmed in one direction),
+      // block opposite-direction setups until structure confirms the flip.
+      // Counter-trend zones are demoted in selectPrimaryZone but may still win
+      // if no same-direction zone exists — block them here.
+      if (timing && timing.structuralBiasDir && primaryZone) {
+        const biasStage    = timing.structuralBiasStage || 'sweep';
+        const stageStrength = { sweep: 1, move: 2, trend: 3 };
+        const strength      = stageStrength[biasStage] || 1;
+
+        if (primaryZone.direction !== timing.structuralBiasDir && primaryZone.isCounterTrend) {
+          if (strength >= 2) {
+            // Move or trend confirmed — hard block on counter-trend setup
+            console.log('[bias] ' + sym + ': BUY zone blocked — no bullish structure confirmation' +
+              ' (structural bias: ' + timing.structuralBiasDir + ' at ' + biasStage + ')');
+            await delay(400); continue;
+          }
+          // Sweep only — allow but log
+          console.log('[bias] ' + sym + ': counter-trend ' + primaryZone.direction +
+            ' zone allowed (bias only at sweep level — monitoring)');
         }
       }
 
@@ -2919,6 +3038,13 @@ async function autoScan() {
       // Forces each stage to be confirmed on a separate scan cycle.
       // Prevents bulk-confirmation of multiple stages from historical data.
       if (sweepFired) {
+        // Record structural bias at sweep stage
+        if (timing) {
+          timing.structuralBiasDir   = sweep.direction;
+          timing.structuralBiasStage = 'sweep';
+          timing.structuralBiasAt    = Date.now();
+          console.log('[bias] ' + sym + ': structural bias set → ' + sweep.direction + ' (sweep stage)');
+        }
         console.log('[' + sym + '] Sweep fired this scan — waiting for next scan before displacement');
         await delay(400); continue;
       }
@@ -2938,6 +3064,12 @@ async function autoScan() {
       ), disp.candleIdx);
 
       if (moveFired) {
+        if (timing) {
+          timing.structuralBiasDir   = sweep.direction;
+          timing.structuralBiasStage = 'move';
+          timing.structuralBiasAt    = Date.now();
+          console.log('[bias] ' + sym + ': structural bias strengthened → ' + sweep.direction + ' (move stage)');
+        }
         console.log('[' + sym + '] Move fired this scan — waiting for next scan before BOS');
         await delay(400); continue;
       }
@@ -2958,6 +3090,12 @@ async function autoScan() {
       ), bos.candleIdx);
 
       if (trendFired) {
+        if (timing) {
+          timing.structuralBiasDir   = sweep.direction;
+          timing.structuralBiasStage = 'trend';
+          timing.structuralBiasAt    = Date.now();
+          console.log('[bias] ' + sym + ': structural bias confirmed → ' + sweep.direction + ' (BOS stage)');
+        }
         console.log('[' + sym + '] Trend fired this scan — waiting for next scan before pullback');
         await delay(400); continue;
       }
@@ -3032,10 +3170,20 @@ async function autoScan() {
       if (entryResult.type === 'NO_ENTRY' && entryResult.reason?.includes('window expired') && setup) {
         if (!setup.momentumTimeoutSent) {
           setup.momentumTimeoutSent = true;
-          await sendTelegram('❌ <b>' + (sym === 'XAUUSD' ? 'GOLD' : 'SILVER') +
-            ' — SETUP INVALIDATED</b>\n\nNo momentum confirmed after liquidity sweep.\n' +
+          const _asset2  = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
+          const _oppDir  = setup.direction === 'BUY' ? 'SELL' : 'BUY';
+          const _oppEmoji= _oppDir === 'BUY' ? '🟢' : '🔴';
+          const _t2      = symTiming[sym];
+          if (_t2) {
+            _t2.structuralBiasDir   = _oppDir;
+            _t2.structuralBiasStage = 'sweep';
+            _t2.consecutiveFailures[setup.direction] = (_t2.consecutiveFailures[setup.direction]||0)+1;
+          }
+          await sendTelegram('❌ <b>' + _asset2 + ' — SETUP INVALIDATED</b>\n\n' +
+            'No momentum confirmed after liquidity sweep.\n' +
             'The 2-candle window expired without confirmation.\n\n' +
-            'Watching for next opportunity.\n\n─────────────────\nAurum Signals');
+            _oppEmoji + ' ' + setup.direction + ' setup failed — short-term ' + _oppDir +
+            ' bias active.\n\n─────────────────\nAurum Signals');
         }
       }
       if (entryResult.type === 'NO_ENTRY') {
