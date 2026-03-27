@@ -15,6 +15,9 @@ const fs   = require('fs');
 const path = require('path');
 
 const TWELVE_KEY    = '7f3fc6ca85664930ab6e687db8ff0c5d';
+// TELEGRAM_MODE: 'EXECUTION' (default) = pre-entry + entry + conditional invalidation only
+//                'FULL'                 = all stage alerts (debug/verbose)
+const TELEGRAM_MODE = process.env.TELEGRAM_MODE || 'EXECUTION';
 const ANTHROPIC_KEY = ['sk-ant-','api03-PSBtiCb9gNCUnpxHjEl2sqWVtfNop5DtO1WCW2pdUw_upi3Zl0VDjCT7Yyk','W9bboA3Bxnq2ucHBFyuNrNx6CL','w-qYuk4wAA'].join('');
 // ═══════════════════════════════════════════════════════════════════════════
 // SETUP LOGGING & ANALYTICS SYSTEM
@@ -22,28 +25,66 @@ const ANTHROPIC_KEY = ['sk-ant-','api03-PSBtiCb9gNCUnpxHjEl2sqWVtfNop5DtO1WCW2pd
 // Logs every setup lifecycle event to logs.jsonl
 // ═══════════════════════════════════════════════════════════════════════════
 
-const LOG_FILE = path.join(__dirname, 'logs.jsonl');
-
-// In-memory log store — keyed by setup.id, flushed on update
+// In-memory log store — keyed by setup.id
 const _setupLogs = {};
+
+// ── GOOGLE SHEETS LOGGING ────────────────────────────────────────────────────
+// Credentials and sheet ID loaded from Railway environment variables:
+//   GOOGLE_SERVICE_ACCOUNT_JSON  — full service account JSON (stringified)
+//   GOOGLE_SHEET_ID              — the ID from the sheet URL
+//
+// Sheet columns (row per event):
+// A: Timestamp | B: Setup ID | C: Symbol | D: Direction | E: Session
+// F: Zone Low  | G: Zone High | H: Zone Score | I: Touches
+// J: Event     | K: Entry Price | L: Stop Loss | M: TP1 | N: TP2
+// O: Candles   | P: Result | Q: Invalidation Reason | R: Stages
+
+let _sheetsClient = null;
+
+async function getSheetsClient() {
+  if (_sheetsClient) return _sheetsClient;
+  try {
+    const credsJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+    if (!credsJson) { console.log('[sheets] No credentials — logging disabled'); return null; }
+    const { google } = require('googleapis');
+    const creds = JSON.parse(credsJson);
+    const auth  = new google.auth.GoogleAuth({
+      credentials: creds,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    _sheetsClient = google.sheets({ version: 'v4', auth });
+    console.log('[sheets] Google Sheets client initialised');
+    return _sheetsClient;
+  } catch(e) {
+    console.error('[sheets] Init error:', e.message);
+    return null;
+  }
+}
+
+async function appendToSheet(row) {
+  try {
+    const sheetId = process.env.GOOGLE_SHEET_ID;
+    if (!sheetId) return;
+    const sheets  = await getSheetsClient();
+    if (!sheets)  return;
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: sheetId,
+      range:         'Aurum!A:R',
+      valueInputOption: 'RAW',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: [row] },
+    });
+  } catch(e) {
+    // Never let logging break the trading engine
+    console.error('[sheets] Append error:', e.message);
+  }
+}
 
 function detectSessionTag(utcHour) {
   if (utcHour >= 0  && utcHour < 7)  return 'ASIA';
   if (utcHour >= 7  && utcHour < 13) return 'LONDON';
   if (utcHour >= 13 && utcHour < 22) return 'NY';
   return 'OFF';
-}
-
-// Write or update a log entry (non-blocking)
-function flushLog(id) {
-  try {
-    const entry = _setupLogs[id];
-    if (!entry) return;
-    fs.appendFile(LOG_FILE, JSON.stringify(entry) + '\n', () => {}); // async, non-blocking
-  } catch(e) {
-    // Never let logging break the trading engine
-    console.error('[log] Write error:', e.message);
-  }
 }
 
 // Called when setup is created
@@ -79,7 +120,14 @@ function logSetupCreated(setup, primaryZone) {
     _setupLogs[setup.id] = log;
     console.log('[log] Setup created: ' + setup.sym + ' ' + setup.direction +
       ' zone=' + (primaryZone?.priceRange || '?') + ' score=' + (primaryZone?.confidence?.total || '?'));
-    flushLog(setup.id);
+    // Append to Google Sheets (non-blocking)
+    appendToSheet([
+      new Date().toISOString(), setup.id, setup.sym, setup.direction,
+      detectSessionTag(h),
+      primaryZone?.minPrice || '', primaryZone?.maxPrice || '',
+      primaryZone?.confidence?.total || '', primaryZone?.totalTouches || '',
+      'CREATED', '', '', '', '', '', '', '', ''
+    ]);
   } catch(e) { console.error('[log] logSetupCreated error:', e.message); }
 }
 
@@ -93,7 +141,13 @@ function logStageUpdate(setup, stage) {
     if (key) log.stages[key] = true;
     log._version++;
     console.log('[log] Stage: ' + setup.sym + ' → ' + stage);
-    flushLog(setup.id);
+    appendToSheet([
+      new Date().toISOString(), setup.id, log.symbol, log.direction,
+      log.session, log.zone?.low||'', log.zone?.high||'',
+      log.zone?.score||'', log.zone?.touches||'',
+      'STAGE:' + stage.toUpperCase(), '', '', '', '', '', '', '',
+      Object.entries(log.stages).filter(([,v])=>v).map(([k])=>k).join(',')
+    ]);
   } catch(e) { console.error('[log] logStageUpdate error:', e.message); }
 }
 
@@ -113,7 +167,13 @@ function logEntryTriggered(setup, entryPrice, stopLoss, takeProfits) {
     log._version++;
     console.log('[log] Entry triggered: ' + setup.sym + ' @ ' + entryPrice +
       ' SL=' + stopLoss + ' TP1=' + (takeProfits[0]||'?') + ' candles=' + log.candlesToEntry);
-    flushLog(setup.id);
+    appendToSheet([
+      new Date().toISOString(), setup.id, log.symbol, log.direction,
+      log.session, log.zone?.low||'', log.zone?.high||'',
+      log.zone?.score||'', log.zone?.touches||'',
+      'ENTRY', entryPrice, stopLoss, takeProfits[0]||'', takeProfits[1]||'',
+      log.candlesToEntry, '', '', 'all'
+    ]);
   } catch(e) { console.error('[log] logEntryTriggered error:', e.message); }
 }
 
@@ -129,8 +189,14 @@ function logInvalidation(setup, reason) {
     log.candlesToInvalidation = Math.round(elapsed / (5 * 60 * 1000));
     log._version++;
     console.log('[log] Invalidated: ' + setup.sym + ' reason="' + reason + '" candles=' + log.candlesToInvalidation);
-    flushLog(setup.id);
-    // Remove from memory after flush (setup is dead)
+    appendToSheet([
+      new Date().toISOString(), setup.id, log.symbol, log.direction,
+      log.session, log.zone?.low||'', log.zone?.high||'',
+      log.zone?.score||'', log.zone?.touches||'',
+      'INVALIDATED', '', '', '', '',
+      log.candlesToInvalidation, '', reason,
+      Object.entries(log.stages).filter(([,v])=>v).map(([k])=>k).join(',')
+    ]);
     setTimeout(() => { delete _setupLogs[setup.id]; }, 2000);
   } catch(e) { console.error('[log] logInvalidation error:', e.message); }
 }
@@ -142,33 +208,24 @@ function logTradeResult(setupId, result) {
     if (log) {
       log.result    = result;
       log._version++;
-      flushLog(setupId);
     }
-    // Also update last entry in file for this ID (best-effort)
     console.log('[log] Result: ' + setupId + ' → ' + result);
+    appendToSheet([
+      new Date().toISOString(), setupId,
+      log?.symbol||'', log?.direction||'', log?.session||'',
+      log?.zone?.low||'', log?.zone?.high||'',
+      log?.zone?.score||'', log?.zone?.touches||'',
+      'RESULT', log?.entryPrice||'', log?.stopLoss||'',
+      log?.takeProfits?.[0]||'', log?.takeProfits?.[1]||'',
+      '', result, '', ''
+    ]);
   } catch(e) { console.error('[log] logTradeResult error:', e.message); }
 }
 
-// Read and parse all logs for analytics
+// Read all logs — from in-memory store (session data)
+// Historical data lives in Google Sheets
 function readAllLogs() {
-  try {
-    if (!fs.existsSync(LOG_FILE)) return [];
-    const lines = fs.readFileSync(LOG_FILE, 'utf8').split('\n').filter(Boolean);
-    // Group by ID, take last entry for each (most recent state)
-    const byId = {};
-    for (const line of lines) {
-      try {
-        const obj = JSON.parse(line);
-        if (!byId[obj.id] || (obj._version || 0) >= (byId[obj.id]._version || 0)) {
-          byId[obj.id] = obj;
-        }
-      } catch {}
-    }
-    return Object.values(byId);
-  } catch(e) {
-    console.error('[log] readAllLogs error:', e.message);
-    return [];
-  }
+  return Object.values(_setupLogs);
 }
 
 const SYMBOLS = {
@@ -2391,6 +2448,12 @@ function createSetup(sym, direction, levelOrZone) {
       entry:        false,
       invalidated:  false,
     },
+    // Alert state — tracks what Telegram messages have been sent for this setup
+    tgAlerts: {
+      preEntry: false,  // ⚠️ SETUP FORMING alert (sent at trend+valid pullback stage)
+      entry:    false,  // 🟢/🔴 full signal
+      invalid:  false,  // ⚠️ invalidation (only if preEntry or pullback reached)
+    },
     // Candle index at which each stage was confirmed — enforces stage separation
     stageCandleIdx: {
       sweep:    -1,
@@ -2542,6 +2605,14 @@ async function invalidateSetup(sym, reason) {
   setup.stage              = 'invalidated';
   console.log('[' + sym + '] Setup invalidated → alert sent once (id=' + setup.id + '): ' + reason);
   logInvalidation(setup, reason);
+  // In EXECUTION mode: only send invalidation if pre-entry alert was sent or pullback reached
+  const _shouldSendInvalidation = TELEGRAM_MODE === 'FULL' ||
+    setup.tgAlerts?.preEntry ||
+    setup.events?.pullback;
+  if (!_shouldSendInvalidation) {
+    console.log('[tg] Invalidation suppressed — pre-entry alert not yet sent (silent invalidation)');
+    return;
+  }
 
   // ── BIAS FLIP ON INVALIDATION ─────────────────────────────────
   // Invalidation = market rejected this direction → flip bias to opposite
@@ -3223,15 +3294,16 @@ async function autoScan() {
           const rangeStr = approaching.isZone
             ? '$' + parseFloat(approaching.minPrice).toFixed(2) + '–$' + parseFloat(approaching.maxPrice).toFixed(2)
             : '$' + parseFloat(approaching.price).toFixed(2);
-          await fireEvent(setup, 'approaching', sym, () => sendTelegram(
-            '🎯 <b>PRIMARY ZONE IDENTIFIED</b>\n\n' +
+          await fireEvent(setup, 'approaching', sym, async () => {
+            if (TELEGRAM_MODE === 'FULL') await sendTelegram(
             asset + ' ' + approaching.dir + ' ZONE\n' +
             'Range: $' + parseFloat(approaching.minPrice||approaching.price).toFixed(2) + ' – $' + parseFloat(approaching.maxPrice||approaching.price).toFixed(2) + '\n' +
             'Strength: ' + (approaching.confidence?.total || approaching.score || '—') + '/100\n' +
             'Touches: ' + (approaching.totalTouches || '—') + '\n\n' +
             'If price sweeps through and reverses, a ' + approaching.dir + ' setup may form.\n\n' +
             '⏳ No action yet — monitoring.\n\n─────────────────\nAurum Signals'
-          ));
+            );
+          });
         }
         await delay(400); continue;
       }
@@ -3304,7 +3376,7 @@ async function autoScan() {
           timing.lastSweepDir      = sweep.direction;
           timing.lastSweepZoneKey  = newSweepKey;
         }
-        if (!isDupeSweep) {
+        if (!isDupeSweep && TELEGRAM_MODE === 'FULL') {
           await sendTelegram(
             '⚡ <b>' + asset + ' — LIQUIDITY GRAB DETECTED</b>\n\n' +
             asset + ' swept ' + lvlDesc + ' and closed back inside.\n' +
@@ -3337,12 +3409,16 @@ async function autoScan() {
         await delay(400); continue;
       }
 
-      const moveFired = await fireEvent(setup, 'move', sym, () => sendTelegram(
-        '↗️ <b>' + asset + ' — STRONG MOVE CONFIRMED</b>\n\n' +
-        'A ' + disp.ratio + '× displacement candle followed the liquidity grab.\n' +
-        'Direction: <b>' + sweep.direction + '</b>\n\n' +
-        '⏳ Waiting for break of structure.\n\n─────────────────\nAurum Signals'
-      ), disp.candleIdx);
+      const moveFired = await fireEvent(setup, 'move', sym, async () => {
+        if (TELEGRAM_MODE === 'FULL') {
+          await sendTelegram(
+            '↗️ <b>' + asset + ' — STRONG MOVE CONFIRMED</b>\n\n' +
+            'A ' + disp.ratio + '× displacement candle followed the liquidity grab.\n' +
+            'Direction: <b>' + sweep.direction + '</b>\n\n' +
+            '⏳ Waiting for break of structure.\n\n─────────────────\nAurum Signals'
+          );
+        }
+      }, disp.candleIdx);
 
       if (moveFired) {
         logStageUpdate(setup, 'move');
@@ -3364,12 +3440,16 @@ async function autoScan() {
       }
 
       const m15bos = m15.length >= 8 ? confirmBOS_M15(m15, sweep.direction, bos.bos_level) : false;
-      const trendFired = await fireEvent(setup, 'trend', sym, () => sendTelegram(
-        '✅ <b>' + asset + ' — TREND SHIFT CONFIRMED</b>\n\n' +
-        'Break of structure confirmed on M5' + (m15bos ? '/M15' : '') + '.\n' +
-        'Direction: <b>' + sweep.direction + '</b>\n\n' +
-        '⏳ Waiting for 50–61.8% pullback into entry zone.\n\n─────────────────\nAurum Signals'
-      ), bos.candleIdx);
+      const trendFired = await fireEvent(setup, 'trend', sym, async () => {
+        if (TELEGRAM_MODE === 'FULL') {
+          await sendTelegram(
+            '✅ <b>' + asset + ' — TREND SHIFT CONFIRMED</b>\n\n' +
+            'Break of structure confirmed on M5' + (m15bos ? '/M15' : '') + '.\n' +
+            'Direction: <b>' + sweep.direction + '</b>\n\n' +
+            '⏳ Waiting for 50–61.8% pullback into entry zone.\n\n─────────────────\nAurum Signals'
+          );
+        }
+      }, bos.candleIdx);
 
       if (trendFired) {
         logStageUpdate(setup, 'trend');
@@ -3424,12 +3504,30 @@ async function autoScan() {
         await delay(400); continue;
       }
 
-      const pullbackFired = await fireEvent(setup, 'pullback', sym, () => sendTelegram(
-        '🎯 <b>' + asset + ' — PULLBACK INTO ENTRY ZONE</b>\n\n' +
-        'Price pulled back ' + pb.retracement + '% into the entry zone.\n' +
-        'Preparing to evaluate full signal.\n\n' +
-        '⏳ Running quality checks...\n\n─────────────────\nAurum Signals'
-      ), pb.candleIdx);
+      const pullbackFired = await fireEvent(setup, 'pullback', sym, async () => {
+        if (TELEGRAM_MODE === 'FULL') {
+          await sendTelegram(
+            '🎯 <b>' + asset + ' — PULLBACK INTO ENTRY ZONE</b>\n\n' +
+            'Price pulled back ' + pb.retracement + '% into the entry zone.\n' +
+            'Preparing to evaluate full signal.\n\n' +
+            '⏳ Running quality checks...\n\n─────────────────\nAurum Signals'
+          );
+        }
+        // EXECUTION mode: send PRE-ENTRY alert here (trend confirmed + pullback = action required soon)
+        if (TELEGRAM_MODE !== 'FULL' && setup && !setup.tgAlerts?.preEntry) {
+          if (setup.tgAlerts) setup.tgAlerts.preEntry = true;
+          const dirEmoji = sweep.direction === 'BUY' ? '🟢' : '🔴';
+          await sendTelegram(
+            '⚠️ <b>' + asset + ' ' + sweep.direction + ' — SETUP FORMING</b>\n\n' +
+            'Zone: $' + parseFloat(primaryZone.minPrice).toFixed(2) +
+            ' – $' + parseFloat(primaryZone.maxPrice).toFixed(2) + '\n' +
+            'Confidence: ' + zoneScore + '/100\n' +
+            'Pullback: ' + pb.retracement + '% retracement\n\n' +
+            'Status: Evaluating entry conditions...\n\n' +
+            '⏳ No action yet — monitor closely.\n\n─────────────────\nAurum Signals'
+          );
+        }
+      }, pb.candleIdx);
       if (pullbackFired) logStageUpdate(setup, 'pullback');
 
       // ── STAGE: ENTRY SIGNAL ───────────────────────────────────
@@ -3452,7 +3550,7 @@ async function autoScan() {
       }
       // NO_ENTRY with momentum timeout — send specific invalidation once
       if (entryResult.type === 'NO_ENTRY' && entryResult.reason?.includes('window expired') && setup) {
-        if (!setup.momentumTimeoutSent) {
+        if (!setup.momentumTimeoutSent && (TELEGRAM_MODE === 'FULL' || setup.tgAlerts?.preEntry || setup.events?.pullback)) {
           setup.momentumTimeoutSent = true;
           const _asset2  = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
           const _oppDir  = setup.direction === 'BUY' ? 'SELL' : 'BUY';
@@ -3569,6 +3667,7 @@ async function autoScan() {
         sentSignals.add(sigKey);
         setTimeout(() => sentSignals.delete(sigKey), 4 * 60 * 60 * 1000);
         setup.active = false;
+        if (setup.tgAlerts) setup.tgAlerts.entry = true;
         // Log entry
         logEntryTriggered(setup, rawSig.entry, rawSig.stop_loss, [rawSig.take_profit_1, rawSig.take_profit_2].filter(Boolean));
         // Start trade result monitor
