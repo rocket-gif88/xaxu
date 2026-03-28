@@ -2063,33 +2063,37 @@ app.get('/analyze/:sym', async (req, res) => {
     };
   }
 
-  res.json({
-    success:      true,
-    symbol:       sym,
-    system_state: 'active',
-    price:        livePrice,
-    atr:          currentATR,
-    session:      sess || 'Closed',
-    session_ok:   sessionOk,
-    setup_state:  setupState,
-    levels:       levels.slice(0,8),
-    log,
-    signal,
-    near_setup,
-    approaching_levels: approachingLevels,
-    sweep_potentials:  sweepPotentials,
-    primary_zone:      primaryZone,
-    zone_confidence:   pzConf,
-    zone_direction:    primaryZone?.direction || null,
-    zone_score_tier:   pzConf >= 75 ? 'FULL' : pzConf >= 60 ? 'STANDARD' : 'BLOCKED',
-    zone_grade:        pzGrade,
-    directional_bias:  directionalBias,
-    bias_score:        analyzeGlobalBias?.score || 0,
-    bias_label:        analyzeGlobalBias?.bias  || 'NEUTRAL',
-    m5_candles:   m5.length,
-    ratio
-  });
   } // end qf.pass
+
+  // ── ALWAYS send response — regardless of signal path taken ──────────────
+  if (!res.headersSent) {
+    res.json({
+      success:      true,
+      symbol:       sym,
+      system_state: 'active',
+      price:        livePrice,
+      atr:          currentATR,
+      session:      sess || 'Closed',
+      session_ok:   sessionOk,
+      setup_state:  setupState,
+      levels:       levels.slice(0,8),
+      log,
+      signal,
+      near_setup,
+      approaching_levels: approachingLevels,
+      sweep_potentials:  sweepPotentials,
+      primary_zone:      primaryZone,
+      zone_confidence:   pzConf,
+      zone_direction:    primaryZone?.direction || null,
+      zone_score_tier:   pzConf >= 75 ? 'FULL' : pzConf >= 60 ? 'STANDARD' : 'BLOCKED',
+      zone_grade:        pzGrade,
+      directional_bias:  directionalBias,
+      bias_score:        analyzeGlobalBias?.score || 0,
+      bias_label:        analyzeGlobalBias?.bias  || 'NEUTRAL',
+      m5_candles:   m5.length,
+      ratio
+    });
+  }
 
   } catch(routeErr) {
     console.error('[analyze] Unhandled error in signal engine:', routeErr.message, routeErr.stack?.split('\n')[1]);
