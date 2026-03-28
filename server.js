@@ -1214,7 +1214,7 @@ function filterOverextension(candles, disp, avgRange) {
   if (!avgRange || avgRange === 0) return { pass: true };
   const c = candles[disp.candleIdx];
   const moveSize = range(c);
-  const ratio    = moveSize / avgRange;
+  ratio = moveSize / avgRange;
   if (ratio > 2.5)
     return { pass: false,
       reason: 'Move overextended — ' + ratio.toFixed(1) + 'x avg range (max 2.5x). Entry too late.' };
@@ -1716,11 +1716,22 @@ app.get('/analyze/:sym', async (req, res) => {
       signal: null, m5_candles: 0 });
   }
 
+  // Pre-declare variables accessible in catch block and final response
+  livePrice = m5?.[m5.length-1]?.c || null;
+  setupState = 'idle';
+  signal = null;
+  near_setup = null;
+  approachingLevels = [];
+  sweepPotentials = [];
+  primaryZone = null;
+  pzConf = 0, pzGrade = 'IGNORE';
+  directionalBias = 'neutral', analyzeGlobalBias = { bias: 'NEUTRAL', score: 0 };
+  let ratio = null;
+
   // ── SIGNAL ENGINE (fully wrapped — any crash returns a safe error response) ──
   try {
 
   // ── SYSTEM STATE DETERMINATION ─────────────────────────────────────────────
-  // State is independent of session. Data issues ≠ session closed.
   const nowUtc   = Date.now();
   const utcHour  = new Date(nowUtc).getUTCHours();
   const inSession= (utcHour >= 7 && utcHour < 16) || (utcHour >= 13 && utcHour < 22);
@@ -1795,7 +1806,7 @@ app.get('/analyze/:sym', async (req, res) => {
   const volatility = checkATR(sym, atrValues);
 
   // --- DIRECTIONAL BIAS — unified via calcGlobalBias() ----------------------
-  const analyzeGlobalBias = calcGlobalBias(levels, currentPrice, null);
+  analyzeGlobalBias = calcGlobalBias(levels, currentPrice, null);
   const directionalBias   = analyzeGlobalBias.bias === 'BUY'  ? 'bullish_bias'
                           : analyzeGlobalBias.bias === 'SELL' ? 'bearish_bias'
                           : 'neutral';
@@ -2001,7 +2012,7 @@ app.get('/analyze/:sym', async (req, res) => {
 
   // Gate pre-signals: only generate if zone confidence >= 40 (not IGNORE)
   const pzConf  = primaryZone?.confidence?.total || 0;
-  const pzGrade = primaryZone?.confidence?.grade || 'IGNORE';
+  pzGrade = primaryZone?.confidence?.grade || 'IGNORE';
   if (primaryZone) {
     log.push('[Zone] PRIMARY ' + primaryZone.direction + ' ZONE $' + primaryZone.priceRange +
       ' score=' + pzConf + '/100 touches=' + primaryZone.totalTouches +
@@ -2096,9 +2107,10 @@ app.get('/analyze/:sym', async (req, res) => {
   }
 
   } catch(routeErr) {
-    console.error('[analyze] Unhandled error in signal engine:', routeErr.message, routeErr.stack?.split('\n')[1]);
+    console.error('[analyze] Unhandled error in signal engine:', routeErr.message, routeErr.stack?.split('\n').slice(0,3).join(' | '));
     if (!res.headersSent) {
-      res.json({ success: true, symbol: sym, price: m5?.[m5.length-1]?.c || null,
+      const _price = (typeof livePrice !== 'undefined' ? livePrice : null) || m5?.[m5?.length-1]?.c || null;
+      res.json({ success: true, symbol: sym, price: _price,
         system_state: 'data_error', session: 'Unknown', session_ok: false,
         setup_state: 'standby', levels: [],
         log: ['Signal engine error — ' + routeErr.message],
