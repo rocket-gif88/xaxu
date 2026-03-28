@@ -1678,6 +1678,21 @@ app.get('/analyze/:sym', async (req, res) => {
   const sym = req.params.sym.toUpperCase();
   if (!SYMBOLS[sym]) return res.status(400).json({ success:false, error:'Unknown symbol' });
 
+  // Server-side timeout — never hang longer than 20s regardless of API slowness
+  const routeTimeout = setTimeout(() => {
+    if (!res.headersSent) {
+      console.error('[' + sym + '] Route timeout — Twelve Data too slow, returning error');
+      res.json({ success: true, symbol: sym, price: null, atr: null,
+        system_state: 'data_error', session: 'Unknown', session_ok: false,
+        setup_state: 'standby', levels: [],
+        log: ['Live data temporarily unavailable — API timeout (>20s)'],
+        signal: null, m5_candles: 0 });
+    }
+  }, 20000);
+
+  // Ensure timeout is cleared when response finishes
+  res.on('finish', () => clearTimeout(routeTimeout));
+
   // ── 1. FETCH DATA ──────────────────────────────────────────────────────
   let m5, m15, atrValues;
   try {
