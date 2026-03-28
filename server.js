@@ -2329,7 +2329,7 @@ app.get('/debug/:sym', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.json({
-  status:'ok', version:'4.0',
+  status:'ok', version:'5.1',
   engine:'Liquidity Sweep — Pure Price Action (M5+M15)',
   rules: ['PDH/PDL/ASH/ASL/EQH/EQL levels','0.02% sweep break required','1.5× body displacement','M5+M15 BOS','50-61.8% pullback entry','min 1:2 RR','confidence ≥ 80','10-candle time decay']
 }));
