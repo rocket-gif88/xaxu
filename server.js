@@ -1716,6 +1716,9 @@ app.get('/analyze/:sym', async (req, res) => {
       signal: null, m5_candles: 0 });
   }
 
+  // ── SIGNAL ENGINE (fully wrapped — any crash returns a safe error response) ──
+  try {
+
   // ── SYSTEM STATE DETERMINATION ─────────────────────────────────────────────
   // State is independent of session. Data issues ≠ session closed.
   const nowUtc   = Date.now();
@@ -2087,6 +2090,17 @@ app.get('/analyze/:sym', async (req, res) => {
     ratio
   });
   } // end qf.pass
+
+  } catch(routeErr) {
+    console.error('[analyze] Unhandled error in signal engine:', routeErr.message, routeErr.stack?.split('\n')[1]);
+    if (!res.headersSent) {
+      res.json({ success: true, symbol: sym, price: m5?.[m5.length-1]?.c || null,
+        system_state: 'data_error', session: 'Unknown', session_ok: false,
+        setup_state: 'standby', levels: [],
+        log: ['Signal engine error — ' + routeErr.message],
+        signal: null, m5_candles: m5?.length || 0 });
+    }
+  }
 });
 
 // ─── PRICES ROUTE ─────────────────────────────────────────────────────────
