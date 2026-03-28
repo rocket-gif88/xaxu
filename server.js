@@ -2147,6 +2147,47 @@ app.get('/prices', (req, res) => {
 // Keep-alive ping
 app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
+// Step-by-step analyze test — finds exactly where the route crashes
+app.get('/test-analyze/:sym', async (req, res) => {
+  const sym = (req.params.sym || 'XAUUSD').toUpperCase();
+  const steps = [];
+  try {
+    steps.push('1. starting');
+    const m5 = await getCandles(sym, '5min', 120);
+    steps.push('2. candles fetched: ' + (m5?.length || 0));
+    if (!m5 || m5.length < 50) return res.json({ ok: false, steps, error: 'insufficient candles' });
+
+    const m15 = deriveM15FromM5(m5);
+    steps.push('3. m15 derived: ' + m15.length);
+
+    const atrValues = calcATRFromCandles(m5, 14);
+    steps.push('4. atr calculated: ' + atrValues.length);
+
+    const levels = buildLevels(m5, m15);
+    steps.push('5. levels built: ' + levels.length);
+
+    const livePrice = m5[m5.length-1].c;
+    steps.push('6. livePrice: ' + livePrice);
+
+    const sess = sessionName(Date.now());
+    steps.push('7. session: ' + sess);
+
+    const primaryZone = selectPrimaryZone(levels, livePrice, sess, m5, null);
+    steps.push('8. primaryZone: ' + (primaryZone ? primaryZone.direction + ' ' + primaryZone.priceRange : 'null'));
+
+    const globalBias = calcGlobalBias(levels, livePrice, null);
+    steps.push('9. bias: ' + globalBias.bias);
+
+    const sweep = detectSweep(m5, primaryZone ? [primaryZone] : levels);
+    steps.push('10. sweep: ' + sweep.found);
+
+    res.json({ ok: true, steps, sym, livePrice, session: sess });
+  } catch(e) {
+    steps.push('ERROR: ' + e.message);
+    res.json({ ok: false, steps, error: e.message, stack: e.stack?.split('\n').slice(0,3) });
+  }
+});
+
 // ── GET /stats — setup analytics
 app.get('/stats', (req, res) => {
   try {
