@@ -2321,6 +2321,143 @@ app.get('/setup-sheets', async (req, res) => {
   }
 });
 
+// ─── SHEET SETUP ROUTE ────────────────────────────────────────────────────
+// Hit this ONCE after deploying to create headers + formatting in Google Sheets.
+// GET /setup-sheet
+// Safe to run multiple times — it overwrites row 1 and re-applies formatting.
+app.get('/setup-sheet', async (req, res) => {
+  const sheetId   = process.env.GOOGLE_SHEET_ID;
+  const credsJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+
+  if (!sheetId || !credsJson) {
+    return res.status(500).json({
+      ok: false,
+      error: 'Missing GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT_JSON env vars on Railway.'
+    });
+  }
+
+  try {
+    const { google } = require('googleapis');
+    const creds = JSON.parse(credsJson);
+    const auth  = new google.auth.GoogleAuth({
+      credentials: creds,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const sheets = google.sheets({ version: 'v4', auth });
+
+    // Find the Aurum tab
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
+    const tab  = meta.data.sheets.find(s => s.properties.title === 'Aurum');
+    if (!tab) {
+      return res.status(400).json({
+        ok: false,
+        error: 'No tab named "Aurum" found. Go to your Google Sheet and rename Sheet1 to "Aurum" first.'
+      });
+    }
+    const tabId = tab.properties.sheetId;
+
+    // Write headers
+    const HEADERS = [
+      'Timestamp', 'Setup ID', 'Symbol', 'Direction', 'Session',
+      'Zone Low', 'Zone High', 'Zone Score', 'Touches',
+      'Event', 'Entry Price', 'Stop Loss', 'TP1', 'TP2',
+      'Candles to Event', 'Result', 'Invalidation Reason', 'Stages Confirmed'
+    ];
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: sheetId, range: 'Aurum!A1:R1',
+      valueInputOption: 'RAW', requestBody: { values: [HEADERS] },
+    });
+
+    // Formatting
+    const GOLD   = { red: 1.0,   green: 0.843, blue: 0.0   };
+    const BLACK  = { red: 0.098, green: 0.098, blue: 0.098 };
+    const DARK1  = { red: 0.12,  green: 0.12,  blue: 0.12  };
+    const DARK2  = { red: 0.15,  green: 0.15,  blue: 0.15  };
+
+    const colWidths = [180,200,80,70,130,90,90,90,70,160,100,100,100,100,120,80,260,220];
+    const widthReqs = colWidths.map((px, i) => ({
+      updateDimensionProperties: {
+        range: { sheetId: tabId, dimension: 'COLUMNS', startIndex: i, endIndex: i+1 },
+        properties: { pixelSize: px }, fields: 'pixelSize',
+      }
+    }));
+
+    const requests = [
+      // Header row style
+      { repeatCell: {
+        range: { sheetId: tabId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 18 },
+        cell: { userEnteredFormat: {
+          backgroundColor: BLACK,
+          textFormat: { foregroundColor: GOLD, bold: true, fontSize: 10 },
+          horizontalAlignment: 'CENTER', verticalAlignment: 'MIDDLE',
+        }},
+        fields: 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)',
+      }},
+      // Freeze header
+      { updateSheetProperties: {
+        properties: { sheetId: tabId, gridProperties: { frozenRowCount: 1 }},
+        fields: 'gridProperties.frozenRowCount',
+      }},
+      // Row banding
+      { addBanding: { bandedRange: {
+        range: { sheetId: tabId, startRowIndex: 1, startColumnIndex: 0, endColumnIndex: 18 },
+        rowProperties: { headerColor: DARK2, firstBandColor: DARK1, secondBandColor: BLACK },
+      }}},
+      // Tab color gold
+      { updateSheetProperties: {
+        properties: { sheetId: tabId, tabColor: GOLD },
+        fields: 'tabColor',
+      }},
+      // Conditional: ENTRY=green, INVALIDATED=red, RESULT=blue, CREATED=amber
+      ...['ENTRY','INVALIDATED','RESULT','CREATED'].map((val, i) => ({
+        addConditionalFormatRule: {
+          rule: {
+            ranges: [{ sheetId: tabId, startRowIndex: 1, startColumnIndex: 9, endColumnIndex: 10 }],
+            booleanRule: {
+              condition: { type: 'TEXT_CONTAINS', values: [{ userEnteredValue: val }] },
+              format: { backgroundColor: [
+                { red:0.133,green:0.369,blue:0.133 },
+                { red:0.369,green:0.133,blue:0.133 },
+                { red:0.133,green:0.267,blue:0.467 },
+                { red:0.267,green:0.267,blue:0.133 },
+              ][i]},
+            },
+          }, index: 0,
+        }
+      })),
+      // BUY=green text, SELL=red text in Direction column
+      { addConditionalFormatRule: { rule: {
+        ranges: [{ sheetId: tabId, startRowIndex: 1, startColumnIndex: 3, endColumnIndex: 4 }],
+        booleanRule: {
+          condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: 'BUY' }] },
+          format: { textFormat: { foregroundColor: { red:0.4,green:0.9,blue:0.4 }}},
+        },
+      }, index: 0 }},
+      { addConditionalFormatRule: { rule: {
+        ranges: [{ sheetId: tabId, startRowIndex: 1, startColumnIndex: 3, endColumnIndex: 4 }],
+        booleanRule: {
+          condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: 'SELL' }] },
+          format: { textFormat: { foregroundColor: { red:0.9,green:0.3,blue:0.3 }}},
+        },
+      }, index: 0 }},
+      ...widthReqs,
+    ];
+
+    await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody: { requests } });
+
+    return res.json({
+      ok: true,
+      message: 'Aurum sheet initialized successfully.',
+      columns: HEADERS,
+      sheet_url: 'https://docs.google.com/spreadsheets/d/' + sheetId,
+    });
+
+  } catch(e) {
+    console.error('[setup-sheet] Error:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ─── PRICES ROUTE ─────────────────────────────────────────────────────────
 // Health check — shows server is up and what data is available
 app.get('/health', async (req, res) => {
@@ -2403,6 +2540,111 @@ app.get('/test-analyze/:sym', async (req, res) => {
   } catch(e) {
     steps.push('ERROR: ' + e.message);
     res.json({ ok: false, steps, error: e.message, stack: e.stack?.split('\n').slice(0,3) });
+  }
+});
+
+// ── GET /setup-sheets — run ONCE after deploy to format the Aurum tab ─────
+// Hit this URL once in your browser after the first Railway deploy.
+// Writes headers, column widths, colors, banding. Safe to re-run.
+app.get('/setup-sheets', async (req, res) => {
+  const sheetId   = process.env.GOOGLE_SHEET_ID;
+  const credsJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!sheetId || !credsJson) {
+    return res.json({ ok: false, error: 'GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT_JSON not set in Railway variables' });
+  }
+  try {
+    const { google } = require('googleapis');
+    const creds = JSON.parse(credsJson);
+    const auth  = new google.auth.GoogleAuth({ credentials: creds,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
+    const sheets = google.sheets({ version: 'v4', auth });
+
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
+    const tab  = meta.data.sheets.find(s => s.properties.title === 'Aurum');
+    if (!tab) return res.json({ ok: false, error: 'No tab named "Aurum" found — create it in Google Sheets first' });
+    const tabId = tab.properties.sheetId;
+
+    const HEADERS = [
+      'Timestamp','Setup ID','Symbol','Direction','Session',
+      'Zone Low','Zone High','Zone Score','Touches','Event',
+      'Entry Price','Stop Loss','TP1','TP2','Candles to Event',
+      'Result','Invalidation Reason','Stages Confirmed'
+    ];
+
+    // Write headers
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: sheetId, range: 'Aurum!A1:R1',
+      valueInputOption: 'RAW', requestBody: { values: [HEADERS] },
+    });
+
+    const GOLD   = { red: 1.0,   green: 0.843, blue: 0.0   };
+    const DARK   = { red: 0.098, green: 0.098, blue: 0.098 };
+    const colWidths = [180,200,80,70,130,90,90,90,70,160,100,100,100,100,120,80,260,220];
+
+    const requests = [
+      // Header styling
+      { repeatCell: {
+        range: { sheetId: tabId, startRowIndex:0, endRowIndex:1, startColumnIndex:0, endColumnIndex:18 },
+        cell: { userEnteredFormat: {
+          backgroundColor: DARK,
+          textFormat: { foregroundColor: GOLD, bold: true, fontSize: 10 },
+          horizontalAlignment: 'CENTER', verticalAlignment: 'MIDDLE',
+        }},
+        fields: 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)',
+      }},
+      // Freeze header row
+      { updateSheetProperties: {
+        properties: { sheetId: tabId, gridProperties: { frozenRowCount: 1 } },
+        fields: 'gridProperties.frozenRowCount',
+      }},
+      // Gold tab color
+      { updateSheetProperties: {
+        properties: { sheetId: tabId, tabColor: GOLD },
+        fields: 'tabColor',
+      }},
+      // Row banding
+      { addBanding: { bandedRange: {
+        range: { sheetId: tabId, startRowIndex:1, startColumnIndex:0, endColumnIndex:18 },
+        rowProperties: {
+          firstBandColor:  { red:0.12,  green:0.12,  blue:0.12  },
+          secondBandColor: { red:0.098, green:0.098, blue:0.098 },
+        },
+      }}},
+      // Column widths
+      ...colWidths.map((px, i) => ({ updateDimensionProperties: {
+        range: { sheetId: tabId, dimension:'COLUMNS', startIndex:i, endIndex:i+1 },
+        properties: { pixelSize: px }, fields: 'pixelSize',
+      }})),
+      // Event column colors (J = index 9)
+      ...([
+        ['ENTRY',       { red:0.133, green:0.369, blue:0.133 }],
+        ['INVALIDATED', { red:0.369, green:0.133, blue:0.133 }],
+        ['RESULT',      { red:0.133, green:0.267, blue:0.467 }],
+        ['CREATED',     { red:0.267, green:0.267, blue:0.133 }],
+      ].map(([val, bg]) => ({ addConditionalFormatRule: { index:0, rule: {
+        ranges: [{ sheetId:tabId, startRowIndex:1, startColumnIndex:9, endColumnIndex:10 }],
+        booleanRule: { condition:{ type:'TEXT_CONTAINS', values:[{ userEnteredValue:val }] },
+                       format:{ backgroundColor: bg } },
+      }}}))),
+      // BUY = green text, SELL = red text (D = index 3)
+      { addConditionalFormatRule: { index:0, rule: {
+        ranges: [{ sheetId:tabId, startRowIndex:1, startColumnIndex:3, endColumnIndex:4 }],
+        booleanRule: { condition:{ type:'TEXT_EQ', values:[{ userEnteredValue:'BUY' }] },
+                       format:{ textFormat:{ foregroundColor:{ red:0.4, green:0.9, blue:0.4 } } } },
+      }}},
+      { addConditionalFormatRule: { index:0, rule: {
+        ranges: [{ sheetId:tabId, startRowIndex:1, startColumnIndex:3, endColumnIndex:4 }],
+        booleanRule: { condition:{ type:'TEXT_EQ', values:[{ userEnteredValue:'SELL' }] },
+                       format:{ textFormat:{ foregroundColor:{ red:0.9, green:0.3, blue:0.3 } } } },
+      }}},
+    ];
+
+    await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody: { requests } });
+
+    res.json({ ok: true, message: 'Aurum sheet formatted successfully — 18 headers, banding, colors applied',
+               sheet_url: 'https://docs.google.com/spreadsheets/d/' + sheetId });
+  } catch(e) {
+    res.json({ ok: false, error: e.message });
   }
 });
 
