@@ -103,6 +103,10 @@ function logSetupCreated(setup, primaryZone) {
       },
       session:          detectSessionTag(h),
       timestamp_start:  new Date().toISOString(),
+      htfBias:              null, // set when first stage fires
+      biasAlignment:        null, // 'ALIGNED' | 'COUNTER' | 'NEUTRAL'
+      confidenceBeforeBias: null,
+      confidenceAfterBias:  null,
       stages: { liquidity_grab:false, strong_move:false, trend_shift:false, pullback:false, entry:false },
       entryTriggered:   false,
       entryPrice:       null,
@@ -164,9 +168,21 @@ function logEntryTriggered(setup, entryPrice, stopLoss, takeProfits) {
     const elapsed = Date.now() - log.startCandleMs;
     log.candlesToEntry  = Math.round(elapsed / (5 * 60 * 1000));
     log.timestamp_end   = new Date().toISOString();
+    // Capture HTF bias from symTiming at time of entry
+    const _t = symTiming[setup.sym];
+    if (_t && !log.htfBias) {
+      log.htfBias = _t.htfBias || 'NEUTRAL';
+      const htfAligned = (log.htfBias === 'BULLISH' && setup.direction === 'BUY') ||
+                         (log.htfBias === 'BEARISH' && setup.direction === 'SELL');
+      const htfCounter = (log.htfBias === 'BULLISH' && setup.direction === 'SELL') ||
+                         (log.htfBias === 'BEARISH' && setup.direction === 'BUY');
+      log.biasAlignment = htfAligned ? 'ALIGNED' : htfCounter ? 'COUNTER' : 'NEUTRAL';
+    }
     log._version++;
+    const _logHtf = log.htfBias || 'NEUTRAL';
     console.log('[log] Entry triggered: ' + setup.sym + ' @ ' + entryPrice +
-      ' SL=' + stopLoss + ' TP1=' + (takeProfits[0]||'?') + ' candles=' + log.candlesToEntry);
+      ' SL=' + stopLoss + ' TP1=' + (takeProfits[0]||'?') + ' candles=' + log.candlesToEntry +
+      ' HTF=' + _logHtf);
     appendToSheet([
       new Date().toISOString(), setup.id, log.symbol, log.direction,
       log.session, log.zone?.low||'', log.zone?.high||'',
@@ -976,7 +992,9 @@ function detectSweep(candles, levels) {
 // ─── DISPLACEMENT ──────────────────────────────────────────────────────────
 // Must occur within 1–3 candles after sweep candle
 // Returns: { found, candleIdx, bodySize, avgBody }
-function detectDisplacement(candles, sweepIdx, direction) {
+function detectDisplacement(candles, sweepIdx, direction, minRatioOverride) {
+  // minRatioOverride: optional — allows caller to require stricter displacement
+  const MIN_RATIO_OVERRIDE = minRatioOverride || null;
   // Scans up to 4 candles. Tolerates 1 weak/indecisive candle gap.
   const BODY_MULT  = 1.5;
   const CLOSE_ZONE = 0.25;
@@ -993,7 +1011,8 @@ function detectDisplacement(candles, sweepIdx, direction) {
     const r = range(c);
     if (r === 0) continue;
     const dirOk      = direction === 'BUY' ? c.c > c.o : c.c < c.o;
-    const bodyStrong = b >= avgBody10 * BODY_MULT;
+    const _dispMin   = MIN_RATIO_OVERRIDE || BODY_MULT;
+    const bodyStrong = b >= avgBody10 * _dispMin;
     const closeZone  = direction === 'BUY'
       ? (c.c - c.l) / r >= (1 - CLOSE_ZONE)
       : (c.h - c.c) / r >= (1 - CLOSE_ZONE);
@@ -1363,7 +1382,9 @@ function checkVolatility(atrValues) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 function scoreSetup(sessionLabel, sessionOk, sweep, displacement, bos, pullback,
-                    volatilityOk, directionalBias, biasPenalty) {
+                    volatilityOk, directionalBias, biasPenalty, htfBias) {
+  // htfBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL' (optional — defaults to NEUTRAL)
+  const _htfBias = htfBias || 'NEUTRAL';
 
   const breakdown = {};
   let total = 0;
@@ -1454,7 +1475,7 @@ function scoreSetup(sessionLabel, sessionOk, sweep, displacement, bos, pullback,
   breakdown.session = { score: sessScore, max: 10, label: sessionLabel || 'Unknown' };
   total += sessScore;
 
-  // ── PENALTIES ────────────────────────────────────────────────
+  // ── PENALTIES + HTF BIAS MODIFIER ───────────────────────────
   if (!volatilityOk) {
     total -= 8;
     breakdown.volatility = { penalty: -8 };
@@ -1465,6 +1486,24 @@ function scoreSetup(sessionLabel, sessionOk, sweep, displacement, bos, pullback,
     if (isCounter) {
       total -= biasPenalty;
       breakdown.bias = { penalty: -biasPenalty, note: 'Counter-trend setup' };
+    }
+  }
+
+  // ── HTF BIAS MODIFIER (confidence only — never blocks trade) ─
+  if (_htfBias !== 'NEUTRAL' && sweep.found) {
+    const dir = sweep.direction;
+    const htfAligned = (_htfBias === 'BULLISH' && dir === 'BUY') ||
+                       (_htfBias === 'BEARISH' && dir === 'SELL');
+    const htfCounter = (_htfBias === 'BULLISH' && dir === 'SELL') ||
+                       (_htfBias === 'BEARISH' && dir === 'BUY');
+    if (htfAligned) {
+      total += 10;
+      breakdown.htfBias = { adjustment: +10, alignment: 'ALIGNED', htfBias: _htfBias };
+      console.log('[htf] ' + dir + ' setup ALIGNED with ' + _htfBias + ' HTF bias → +10 confidence');
+    } else if (htfCounter) {
+      total -= 15;
+      breakdown.htfBias = { adjustment: -15, alignment: 'COUNTER', htfBias: _htfBias };
+      console.log('[htf] ' + dir + ' setup COUNTER to ' + _htfBias + ' HTF bias → -15 confidence');
     }
   }
 
@@ -1694,12 +1733,26 @@ app.get('/analyze/:sym', async (req, res) => {
   res.on('finish', () => clearTimeout(routeTimeout));
 
   // ── 1. FETCH DATA ──────────────────────────────────────────────────────
+  // SLV early exit: if outside NYSE hours AND no cached data, skip fetch entirely
+  const _nowH = new Date().getUTCHours();
+  const _slvClosed = sym === 'XAGUSD' && (_nowH >= 20 || _nowH < 13);
+  if (_slvClosed) {
+    const _cached = getCached('candles_XAGUSD_5min_120');
+    const _lastPrice = _cached ? parseFloat(_cached[_cached.length-1]?.c) : null;
+    const _lastATR   = _cached ? calcATRFromCandles(_cached, 14) : [];
+    return res.json({ success: true, symbol: 'XAGUSD',
+      price: _lastPrice, atr: null,
+      volatility_atr: _lastATR.length ? parseFloat(_lastATR[_lastATR.length-1].toFixed(4)) : null,
+      system_state: 'session_closed', session: 'Closed',
+      session_ok: false, setup_state: 'standby',
+      levels: [], log: ['Silver market closed — SLV ETF trades 13:30–20:00 UTC.' + (_lastPrice ? ' Last price: $' + _lastPrice.toFixed(3) : '')],
+      signal: null, m5_candles: _cached?.length || 0,
+      note: 'SLV market closed. Opens 13:30 UTC.' });
+  }
+
   let m5, m15, atrValues;
   try {
     // ONE API call per symbol — everything else derived from M5 candles.
-    // M15 is derived by grouping M5 candles (3 M5 = 1 M15).
-    // ATR is calculated locally from candle data (Wilder's method).
-    // This keeps total calls at 2/scan (1 per symbol) — within free tier.
     m5 = await getCandles(sym, '5min', 120);  // 120 × 5min = 10 hours
 
     // Derive M15 and ATR without additional API calls
@@ -1807,6 +1860,8 @@ app.get('/analyze/:sym', async (req, res) => {
 
   // --- DIRECTIONAL BIAS — unified via calcGlobalBias() ----------------------
   analyzeGlobalBias = calcGlobalBias(levels, currentPrice, null);
+  const htfResult     = calcHTFBias(m15);
+  console.log('[htf] ' + sym + ' (analyze): bias=' + htfResult.bias + ' — ' + htfResult.reason);
   const directionalBias   = analyzeGlobalBias.bias === 'BUY'  ? 'bullish_bias'
                           : analyzeGlobalBias.bias === 'SELL' ? 'bearish_bias'
                           : 'neutral';
@@ -1917,8 +1972,10 @@ app.get('/analyze/:sym', async (req, res) => {
                 log.push('Confidence score: ' + confidence + '/100');
 
                 // Full signal requires HIGH tier (≥75). Grade: A+ ≥85, A ≥75.
-                const scoreResult2 = scoreSetup(sess, sessionOk, sweep, disp, bos, pb,
-                  volatility.ok === true || volatility.ok === undefined, directionalBias, biasPenalty);
+                const _htfBiasState = timing?.htfBias || 'NEUTRAL';
+        const scoreResult2 = scoreSetup(sess, sessionOk, sweep, disp, bos, pb,
+                  volatility.ok === true || volatility.ok === undefined, directionalBias, biasPenalty,
+                  _htfBiasState);
                 // Zone score gate applies here too
                 if (!analyzeZoneAllowSignal) {
                   setupState = 'invalidated';
@@ -2101,6 +2158,9 @@ app.get('/analyze/:sym', async (req, res) => {
       directional_bias:  directionalBias,
       bias_score:        analyzeGlobalBias?.score || 0,
       bias_label:        analyzeGlobalBias?.bias  || 'NEUTRAL',
+      htf_bias:          htfResult?.bias || 'NEUTRAL',
+      htf_last_bos:      htfResult?.lastBOS || 'NONE',
+      htf_reason:        htfResult?.reason || '',
       m5_candles:   m5.length,
       ratio
     });
@@ -2594,10 +2654,16 @@ const symTiming = {
     lastSweepDir:            null,
     lastSweepZoneKey:        null,
     // Structural bias — persists until opposite structure confirmed
-    structuralBiasDir:       null,  // 'BUY' | 'SELL' | null
-    structuralBiasStage:     null,  // 'sweep' | 'move' | 'trend' — how strong
-    structuralBiasAt:        0,     // timestamp when bias was set
-    consecutiveFailures:     { BUY: 0, SELL: 0 }, // track repeated failures per direction
+    structuralBiasDir:       null,
+    structuralBiasStage:     null,
+    structuralBiasAt:        0,
+    consecutiveFailures:     { BUY: 0, SELL: 0 },
+    // HTF (M15) structural bias — updated every scan
+    htfBias:                 'NEUTRAL',  // 'BULLISH' | 'BEARISH' | 'NEUTRAL'
+    htfLastBOS:              'NONE',     // 'UP' | 'DOWN' | 'NONE'
+    htfLastHigh:             0,
+    htfLastLow:              0,
+    htfUpdatedAt:            0,
   },
   XAGUSD: {
     zoneDetectionAllowedAt:  0,
@@ -2613,6 +2679,11 @@ const symTiming = {
     structuralBiasStage:     null,
     structuralBiasAt:        0,
     consecutiveFailures:     { BUY: 0, SELL: 0 },
+    htfBias:                 'NEUTRAL',
+    htfLastBOS:              'NONE',
+    htfLastHigh:             0,
+    htfLastLow:              0,
+    htfUpdatedAt:            0,
   }
 };
 
@@ -3126,6 +3197,86 @@ function correctSweepDirection(sweep) {
   return { ...sweep, direction: correct };
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// HTF STRUCTURAL BIAS ENGINE
+// Uses M15 candles to determine higher-timeframe directional bias.
+// Bias is a CONFIDENCE MODIFIER — never a trade filter.
+// Returns: { bias, lastBOS, lastHigh, lastLow, reason }
+// ═══════════════════════════════════════════════════════════════════════════
+function calcHTFBias(m15Candles) {
+  if (!m15Candles || m15Candles.length < 8) {
+    return { bias: 'NEUTRAL', lastBOS: 'NONE', lastHigh: 0, lastLow: 0, reason: 'Insufficient M15 data' };
+  }
+
+  // Use last 20 M15 candles (~5 hours) for structure analysis
+  const candles = m15Candles.slice(-20);
+  const n = candles.length;
+
+  // ── 1. Find swing highs and swing lows (pivot method: higher on both sides)
+  const swingHighs = [];
+  const swingLows  = [];
+  for (let i = 1; i < n - 1; i++) {
+    if (candles[i].h > candles[i-1].h && candles[i].h > candles[i+1].h) {
+      swingHighs.push({ price: candles[i].h, idx: i });
+    }
+    if (candles[i].l < candles[i-1].l && candles[i].l < candles[i+1].l) {
+      swingLows.push({ price: candles[i].l, idx: i });
+    }
+  }
+
+  if (swingHighs.length < 2 || swingLows.length < 2) {
+    return { bias: 'NEUTRAL', lastBOS: 'NONE', lastHigh: candles[n-1].h, lastLow: candles[n-1].l,
+             reason: 'Insufficient swing structure' };
+  }
+
+  const lastHigh  = swingHighs[swingHighs.length - 1].price;
+  const prevHigh  = swingHighs[swingHighs.length - 2].price;
+  const lastLow   = swingLows[swingLows.length  - 1].price;
+  const prevLow   = swingLows[swingLows.length  - 2].price;
+  const livePrice = candles[n-1].c;
+
+  // ── 2. Detect BOS: last swing high broken = UP BOS, last swing low broken = DOWN BOS
+  const BOS_MARGIN = 0.0002; // 0.02% — minor buffer to avoid noise
+  let lastBOS = 'NONE';
+  // Check last few candles for breaks
+  const recent = candles.slice(-5);
+  for (const c of recent) {
+    if (c.c > lastHigh * (1 + BOS_MARGIN)) { lastBOS = 'UP';   break; }
+    if (c.c < lastLow  * (1 - BOS_MARGIN)) { lastBOS = 'DOWN'; break; }
+  }
+
+  // ── 3. HH/HL or LH/LL structure
+  const isHHHL = lastHigh > prevHigh && lastLow > prevLow;  // bullish structure
+  const isLHLL = lastHigh < prevHigh && lastLow < prevLow;  // bearish structure
+
+  // ── 4. Price vs structure midpoint
+  const structureMid = (lastHigh + lastLow) / 2;
+  const aboveMid = livePrice > structureMid;
+
+  // ── 5. Determine bias
+  let bias = 'NEUTRAL';
+  let reason = '';
+
+  if (lastBOS === 'UP' && (isHHHL || aboveMid)) {
+    bias = 'BULLISH';
+    reason = 'BOS UP + ' + (isHHHL ? 'HH/HL structure' : 'price above mid');
+  } else if (lastBOS === 'DOWN' && (isLHLL || !aboveMid)) {
+    bias = 'BEARISH';
+    reason = 'BOS DOWN + ' + (isLHLL ? 'LH/LL structure' : 'price below mid');
+  } else if (isHHHL && aboveMid) {
+    bias = 'BULLISH';
+    reason = 'HH/HL structure + price above mid (no BOS yet)';
+  } else if (isLHLL && !aboveMid) {
+    bias = 'BEARISH';
+    reason = 'LH/LL structure + price below mid (no BOS yet)';
+  } else {
+    bias = 'NEUTRAL';
+    reason = 'Choppy / ranging structure';
+  }
+
+  return { bias, lastBOS, lastHigh, lastLow, structureMid, reason };
+}
+
 // ── TRADE RESULT MONITOR ──────────────────────────────────────────────────────
 // Runs on every scan after an entry signal fires.
 // Checks live price against SL/TP1/TP2 and auto-logs the result.
@@ -3216,6 +3367,18 @@ async function autoScan() {
 
       // Check open trade monitor first (non-blocking result detection)
       checkTradeMonitor(sym, livePrice, m5);
+
+      // ── UPDATE HTF BIAS from M15 ──────────────────────────────
+      const htfResult = calcHTFBias(m15);
+      if (timing) {
+        timing.htfBias      = htfResult.bias;
+        timing.htfLastBOS   = htfResult.lastBOS;
+        timing.htfLastHigh  = htfResult.lastHigh;
+        timing.htfLastLow   = htfResult.lastLow;
+        timing.htfUpdatedAt = Date.now();
+      }
+      console.log('[htf] ' + sym + ': bias=' + htfResult.bias +
+        ' BOS=' + htfResult.lastBOS + ' — ' + htfResult.reason);
       const sess       = sessionName(Date.now());
       const sessionOk  = sess !== null;
       const sessionOverlap = sess === 'London+NY Overlap';
@@ -3498,8 +3661,17 @@ async function autoScan() {
       }
 
       // ── STAGE: DISPLACEMENT (MOVE) ────────────────────────────
-      const disp = detectDisplacement(m5, sweep.candleIdx, sweep.direction);
+      // HTF counter-bias: require stronger displacement (1.5× instead of default)
+      const _htfBiasNow = timing?.htfBias || 'NEUTRAL';
+      const _htfCounter = (_htfBiasNow === 'BULLISH' && sweep.direction === 'SELL') ||
+                          (_htfBiasNow === 'BEARISH' && sweep.direction === 'BUY');
+      const dispMinRatio = _htfCounter ? 1.5 : 1.2; // stricter for counter-HTF setups
+
+      const disp = detectDisplacement(m5, sweep.candleIdx, sweep.direction, dispMinRatio);
       if (!disp.found) {
+        if (_htfCounter) {
+          console.log('[htf] ' + sym + ': counter-HTF setup — displacement must be ≥' + dispMinRatio + '× avg');
+        }
         console.log('[' + sym + '] Waiting for displacement');
         await delay(400); continue;
       }
@@ -3558,12 +3730,23 @@ async function autoScan() {
         // This ensures alert fires even if pullback immediately exceeds 70%
         if (TELEGRAM_MODE !== 'FULL' && setup && !setup.tgAlerts?.preEntry) {
           if (setup.tgAlerts) setup.tgAlerts.preEntry = true;
+          const _htfNow     = timing?.htfBias || 'NEUTRAL';
+          const _htfAligned = (_htfNow === 'BULLISH' && sweep.direction === 'BUY') ||
+                              (_htfNow === 'BEARISH' && sweep.direction === 'SELL');
+          const _htfCounter = (_htfNow === 'BULLISH' && sweep.direction === 'SELL') ||
+                              (_htfNow === 'BEARISH' && sweep.direction === 'BUY');
+          const _htfLine    = _htfNow === 'NEUTRAL'
+            ? 'HTF Bias: Neutral ➖'
+            : _htfAligned
+              ? 'HTF Bias: ' + _htfNow.charAt(0) + _htfNow.slice(1).toLowerCase() + ' ✅ (aligned)'
+              : 'HTF Bias: ' + _htfNow.charAt(0) + _htfNow.slice(1).toLowerCase() + ' ❌ (counter — stronger confirmation required)';
           await sendTelegram(
             '⚠️ <b>' + asset + ' ' + sweep.direction + ' — SETUP FORMING</b>\n\n' +
             'Zone: $' + parseFloat(primaryZone.minPrice).toFixed(2) +
             ' – $' + parseFloat(primaryZone.maxPrice).toFixed(2) + '\n' +
             'Confidence: ' + zoneScore + '/100\n' +
-            'Touches: ' + primaryZone.totalTouches + '\n\n' +
+            'Touches: ' + primaryZone.totalTouches + '\n' +
+            _htfLine + '\n\n' +
             'Status: Waiting for pullback into entry zone.\n\n' +
             '⏳ No action yet — monitor closely.\n\n─────────────────\nAurum Signals'
           );
