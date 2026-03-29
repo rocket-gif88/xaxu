@@ -2182,6 +2182,145 @@ app.get('/analyze/:sym', async (req, res) => {
   }
 });
 
+// ─── SETUP SHEETS ROUTE ───────────────────────────────────────────────────
+// Hit this URL once in your browser after deploying to initialise the Aurum
+// tab with headers and formatting. Safe to run multiple times — idempotent.
+// Usage: GET https://your-railway-url.railway.app/setup-sheets
+app.get('/setup-sheets', async (req, res) => {
+  const sheetId   = process.env.GOOGLE_SHEET_ID;
+  const credsJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+
+  if (!sheetId || !credsJson) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Missing env vars. Add GOOGLE_SHEET_ID and GOOGLE_SERVICE_ACCOUNT_JSON in Railway → Variables.'
+    });
+  }
+
+  try {
+    const { google } = require('googleapis');
+    const creds = JSON.parse(credsJson);
+    const auth  = new google.auth.GoogleAuth({
+      credentials: creds,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const sheets = google.sheets({ version: 'v4', auth });
+
+    // Find the Aurum tab
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
+    const tab  = meta.data.sheets.find(s => s.properties.title === 'Aurum');
+    if (!tab) {
+      return res.status(400).json({
+        ok: false,
+        error: 'No tab named "Aurum" found. Create it in your Google Sheet first.'
+      });
+    }
+    const tabId = tab.properties.sheetId;
+
+    // Write headers
+    const HEADERS = [
+      'Timestamp', 'Setup ID', 'Symbol', 'Direction', 'Session',
+      'Zone Low', 'Zone High', 'Zone Score', 'Touches', 'Event',
+      'Entry Price', 'Stop Loss', 'TP1', 'TP2', 'Candles to Event',
+      'Result', 'Invalidation Reason', 'Stages Confirmed'
+    ];
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: sheetId,
+      range: 'Aurum!A1:R1',
+      valueInputOption: 'RAW',
+      requestBody: { values: [HEADERS] },
+    });
+
+    const colIdx = l => l.charCodeAt(0) - 65;
+    const COL_WIDTHS = {
+      A:180, B:200, C:80,  D:70,  E:130,
+      F:90,  G:90,  H:90,  I:70,  J:160,
+      K:100, L:100, M:100, N:100, O:120,
+      P:80,  Q:260, R:220
+    };
+
+    const requests = [
+      // Header row: dark bg, gold text, bold
+      { repeatCell: {
+        range: { sheetId: tabId, startRowIndex:0, endRowIndex:1, startColumnIndex:0, endColumnIndex:18 },
+        cell: { userEnteredFormat: {
+          backgroundColor: { red:0.098, green:0.098, blue:0.098 },
+          textFormat: { foregroundColor:{ red:1.0, green:0.843, blue:0.0 }, bold:true, fontSize:10 },
+          horizontalAlignment: 'CENTER', verticalAlignment: 'MIDDLE'
+        }},
+        fields: 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)'
+      }},
+      // Freeze header row
+      { updateSheetProperties: {
+        properties: { sheetId: tabId, gridProperties: { frozenRowCount:1 } },
+        fields: 'gridProperties.frozenRowCount'
+      }},
+      // Column widths
+      ...Object.entries(COL_WIDTHS).map(([l, px]) => ({
+        updateDimensionProperties: {
+          range: { sheetId: tabId, dimension:'COLUMNS', startIndex:colIdx(l), endIndex:colIdx(l)+1 },
+          properties: { pixelSize: px }, fields: 'pixelSize'
+        }
+      })),
+      // Row banding
+      { addBanding: { bandedRange: {
+        range: { sheetId: tabId, startRowIndex:1, startColumnIndex:0, endColumnIndex:18 },
+        rowProperties: {
+          headerColor:     { red:0.15,  green:0.15,  blue:0.15  },
+          firstBandColor:  { red:0.12,  green:0.12,  blue:0.12  },
+          secondBandColor: { red:0.098, green:0.098, blue:0.098 }
+        }
+      }}},
+      // Event column colors (J = col 9)
+      ...[ ['ENTRY', {red:0.133,green:0.369,blue:0.133}],
+           ['INVALIDATED', {red:0.369,green:0.133,blue:0.133}],
+           ['RESULT', {red:0.133,green:0.267,blue:0.467}],
+           ['CREATED', {red:0.267,green:0.267,blue:0.133}]
+      ].map(([val, bg]) => ({ addConditionalFormatRule: { rule: {
+        ranges: [{ sheetId: tabId, startRowIndex:1, startColumnIndex:9, endColumnIndex:10 }],
+        booleanRule: {
+          condition: { type:'TEXT_CONTAINS', values:[{ userEnteredValue: val }] },
+          format: { backgroundColor: bg }
+        }
+      }, index:0 }})),
+      // BUY green / SELL red (D = col 3)
+      { addConditionalFormatRule: { rule: {
+        ranges: [{ sheetId: tabId, startRowIndex:1, startColumnIndex:3, endColumnIndex:4 }],
+        booleanRule: {
+          condition: { type:'TEXT_EQ', values:[{ userEnteredValue:'BUY' }] },
+          format: { textFormat: { foregroundColor:{ red:0.4, green:0.9, blue:0.4 } } }
+        }
+      }, index:0 } },
+      { addConditionalFormatRule: { rule: {
+        ranges: [{ sheetId: tabId, startRowIndex:1, startColumnIndex:3, endColumnIndex:4 }],
+        booleanRule: {
+          condition: { type:'TEXT_EQ', values:[{ userEnteredValue:'SELL' }] },
+          format: { textFormat: { foregroundColor:{ red:0.9, green:0.3, blue:0.3 } } }
+        }
+      }, index:0 } },
+      // Gold tab color
+      { updateSheetProperties: {
+        properties: { sheetId: tabId, tabColor:{ red:1.0, green:0.843, blue:0.0 } },
+        fields: 'tabColor'
+      }}
+    ];
+
+    await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody: { requests } });
+
+    console.log('[setup-sheets] ✓ Aurum tab initialised successfully');
+    return res.json({
+      ok: true,
+      message: 'Aurum sheet ready. Headers written, formatting applied.',
+      sheet_url: 'https://docs.google.com/spreadsheets/d/' + sheetId,
+      columns: HEADERS
+    });
+
+  } catch(e) {
+    console.error('[setup-sheets] Error:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ─── PRICES ROUTE ─────────────────────────────────────────────────────────
 // Health check — shows server is up and what data is available
 app.get('/health', async (req, res) => {
@@ -3720,18 +3859,34 @@ async function autoScan() {
         await delay(400); continue;
       }
 
-      // ── VWAP RECLAIM CHECK ─────────────────────────────────────
-      // Confirms price reclaimed session VWAP after the sweep.
-      // Soft-block: logs only for 2 weeks, then harden to hard-stop.
+      // ── VWAP RECLAIM CHECK (HARD GATE) ────────────────────────
+      // Requires price to close back through session VWAP after the sweep
+      // before BOS is evaluated. Eliminates fake displacement moves that
+      // fail to reclaim value area — the most common source of false signals.
+      //
+      // Grace period: 3 candles (15 min) after the sweep before blocking.
+      // This allows the reclaim candle time to form without firing too early.
       const vwapCheck = detectVWAPReclaim(m5, sweep.candleIdx, sweep.direction);
       console.log('[vwap] ' + sym + ': ' + vwapCheck.note);
       if (!vwapCheck.reclaimed) {
         const candlesSinceSweep = m5.length - 1 - sweep.candleIdx;
-        if (candlesSinceSweep > 4) {
-          console.log('[vwap] ' + sym + ': no VWAP reclaim in ' + candlesSinceSweep +
-            ' candles — weak follow-through (soft-logged)');
+        if (candlesSinceSweep > 3) {
+          // Hard block: no VWAP reclaim after 15 min = weak institutional follow-through
+          console.log('[vwap] ' + sym + ': ❌ BLOCKED — no VWAP reclaim after ' +
+            candlesSinceSweep + ' candles (VWAP $' + (vwapCheck.vwap || '—') + ')');
+          // Log the invalidation so it appears in /stats and Sheets
+          if (setup && !setup.invalidated) {
+            await invalidateSetup(sym, 'VWAP reclaim failed — price could not close through session VWAP after sweep.');
+            resetSetup(sym, 'VWAP reclaim failed');
+          }
+          await delay(400); continue;
         }
+        // Within grace period — wait silently
+        console.log('[vwap] ' + sym + ': waiting for VWAP reclaim (candle ' +
+          candlesSinceSweep + '/3 grace period)');
+        await delay(400); continue;
       }
+      console.log('[vwap] ' + sym + ': ✓ VWAP reclaimed — BOS evaluation unlocked');
 
       // ── STAGE: TREND SHIFT (BOS) ──────────────────────────────
       const bos = detectBOS(m5, sweep.candleIdx, sweep.direction);
