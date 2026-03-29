@@ -2,6 +2,9 @@ const express = require('express');
 const cors    = require('cors');
 const fetch   = require('node-fetch');
 const app     = express();
+const { hydrateFromSheets, updateZoneMemory, getZoneFreshness,
+        clearZoneMemory, detectVWAPReclaim, formatATRBlock,
+        getSessionQuality } = require('./aurum-upgrades');
 // CORS: allow Netlify frontend and any origin (needed for Railway free tier)
 app.use(cors({
   origin: '*',                   // allow all origins — tighten if needed
@@ -2511,9 +2514,14 @@ function formatTelegramSignal(sig) {
   if (bd.structure)    reasons.push('• BOS: ' + (bd.structure.type || '') + ' (' + (bd.structure.method || '') + ')');
   if (sig.pullback_pct)reasons.push('• Pullback: ' + sig.pullback_pct + '% retracement');
   if (!reasons.length && sig.reason) reasons.push('• ' + sig.reason);
+  // v5.2: zone freshness label
+  if (sig.zoneFreshness) reasons.push('• Zone: ' + sig.zoneFreshness);
 
   // ── Session ───────────────────────────────────────────────────
   const sess = sig.session || '—';
+
+  // v5.2: ATR position sizing block
+  const atrBlock = formatATRBlock(sig.atr, entryPrice, sl);
 
   return [
     dirEmoji + ' <b>' + asset + ' ' + dir + '</b>  ' + gradeEmoji + ' <b>' + grade + '</b>  ' + modeStr,
@@ -2533,6 +2541,7 @@ function formatTelegramSignal(sig) {
     '',
     '<b>WHY</b>',
     ...reasons,
+    atrBlock,
     '',
     '<b>VALID:  </b>' + validity,
     '<b>CANCEL: </b>' + invalidation,
@@ -3334,6 +3343,7 @@ async function autoScan() {
         symTiming[sym].structuralBiasStage = null;
         symTiming[sym].consecutiveFailures = { BUY: 0, SELL: 0 };
       }
+      clearZoneMemory(sym); // zone memory resets each session
     }
     console.log('[auto-scan] Outside session (UTC ' + h + ':xx) — skipping');
     return;
@@ -3446,6 +3456,17 @@ async function autoScan() {
         console.log('[' + sym + '] No primary zone found — skip');
         await delay(400); continue;
       }
+
+      // ── ZONE MEMORY: track retest count + gate exhausted zones ──
+      updateZoneMemory(sym, primaryZone);
+      const zoneFreshness = getZoneFreshness(sym, primaryZone);
+      console.log('[zone-mem] ' + sym + ': ' + zoneFreshness.label +
+        ' (session touches: ' + zoneFreshness.touchCount + ')');
+      if (zoneFreshness.suppress) {
+        console.log('[zone-mem] ' + sym + ': EXHAUSTED zone — signal suppressed');
+        await delay(400); continue;
+      }
+
       const zoneScore = primaryZone.confidence?.total || 0;
       console.log('[' + sym + '] Primary zone: ' + primaryZone.direction +
         ' ' + primaryZone.priceRange + ' score=' + zoneScore + '/100' +
@@ -3699,6 +3720,19 @@ async function autoScan() {
         await delay(400); continue;
       }
 
+      // ── VWAP RECLAIM CHECK ─────────────────────────────────────
+      // Confirms price reclaimed session VWAP after the sweep.
+      // Soft-block: logs only for 2 weeks, then harden to hard-stop.
+      const vwapCheck = detectVWAPReclaim(m5, sweep.candleIdx, sweep.direction);
+      console.log('[vwap] ' + sym + ': ' + vwapCheck.note);
+      if (!vwapCheck.reclaimed) {
+        const candlesSinceSweep = m5.length - 1 - sweep.candleIdx;
+        if (candlesSinceSweep > 4) {
+          console.log('[vwap] ' + sym + ': no VWAP reclaim in ' + candlesSinceSweep +
+            ' candles — weak follow-through (soft-logged)');
+        }
+      }
+
       // ── STAGE: TREND SHIFT (BOS) ──────────────────────────────
       const bos = detectBOS(m5, sweep.candleIdx, sweep.direction);
       if (!bos.found) {
@@ -3934,6 +3968,8 @@ async function autoScan() {
         session: sess, directional_bias: directionalBias,
         sweep_level: sweep.level?.label || '—',
         pullback_pct: pb.retracement, expiry: expiryUTC,
+        atr: currentATR,                               // v5.2: position sizing
+        zoneFreshness: zoneFreshness?.label || null,   // v5.2: zone memory label
         primaryZone: primaryZone
           ? { low: primaryZone.minPrice, high: primaryZone.maxPrice }
           : null,
@@ -4007,4 +4043,6 @@ app.listen(PORT, () => {
   // Run once immediately on startup (after 10s to let server settle)
   setTimeout(autoScan, 10000);
   console.log('[scheduler] Auto-scan started — every 5 minutes during sessions');
+  // Restore last 24h of logs from Sheets after Railway restarts
+  hydrateFromSheets(_setupLogs).catch(e => console.error('[boot-hydrate]', e.message));
 });
