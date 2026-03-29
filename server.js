@@ -133,7 +133,7 @@ function logSetupCreated(setup, primaryZone) {
       detectSessionTag(h),
       primaryZone?.minPrice || '', primaryZone?.maxPrice || '',
       primaryZone?.confidence?.total || '', primaryZone?.totalTouches || '',
-      'CREATED', '', '', '', '', '', '', '', ''
+      'CREATED', '', '', '', '', '', '', '', '', ''
     ]);
   } catch(e) { console.error('[log] logSetupCreated error:', e.message); }
 }
@@ -153,13 +153,13 @@ function logStageUpdate(setup, stage) {
       log.session, log.zone?.low||'', log.zone?.high||'',
       log.zone?.score||'', log.zone?.touches||'',
       'STAGE:' + stage.toUpperCase(), '', '', '', '', '', '', '',
-      Object.entries(log.stages).filter(([,v])=>v).map(([k])=>k).join(',')
+      Object.entries(log.stages).filter(([,v])=>v).map(([k])=>k).join(','), ''
     ]);
   } catch(e) { console.error('[log] logStageUpdate error:', e.message); }
 }
 
 // Called when entry signal fires
-function logEntryTriggered(setup, entryPrice, stopLoss, takeProfits) {
+function logEntryTriggered(setup, entryPrice, stopLoss, takeProfits, meta) {
   try {
     const log = _setupLogs[setup.id];
     if (!log) return;
@@ -171,6 +171,16 @@ function logEntryTriggered(setup, entryPrice, stopLoss, takeProfits) {
     const elapsed = Date.now() - log.startCandleMs;
     log.candlesToEntry  = Math.round(elapsed / (5 * 60 * 1000));
     log.timestamp_end   = new Date().toISOString();
+    // v5.2 — flexible entry metadata
+    if (meta) {
+      log.entryType            = meta.entryType            || 'PULLBACK';
+      log.pullbackPercent      = meta.pullbackPercent      ?? null;
+      log.pullbackTier         = meta.pullbackTier         || null;
+      log.displacementRatio    = meta.displacementRatio    || null;
+      log.displacementStrength = meta.displacementStrength || null;
+      log.bosType              = meta.bosType              || null;
+      log.scoreBreakdown       = meta.scoreBreakdown       || null;
+    }
     // Capture HTF bias from symTiming at time of entry
     const _t = symTiming[setup.sym];
     if (_t && !log.htfBias) {
@@ -185,13 +195,20 @@ function logEntryTriggered(setup, entryPrice, stopLoss, takeProfits) {
     const _logHtf = log.htfBias || 'NEUTRAL';
     console.log('[log] Entry triggered: ' + setup.sym + ' @ ' + entryPrice +
       ' SL=' + stopLoss + ' TP1=' + (takeProfits[0]||'?') + ' candles=' + log.candlesToEntry +
-      ' HTF=' + _logHtf);
+      ' HTF=' + _logHtf + ' type=' + (log.entryType||'PULLBACK'));
     appendToSheet([
       new Date().toISOString(), setup.id, log.symbol, log.direction,
       log.session, log.zone?.low||'', log.zone?.high||'',
       log.zone?.score||'', log.zone?.touches||'',
       'ENTRY', entryPrice, stopLoss, takeProfits[0]||'', takeProfits[1]||'',
-      log.candlesToEntry, '', '', 'all'
+      log.candlesToEntry, '', '', 'all',
+      // S col — v5.2 metadata summary
+      [
+        'type=' + (log.entryType||'PULLBACK'),
+        log.pullbackPercent  != null ? 'pb='   + log.pullbackPercent + '%(' + (log.pullbackTier||'') + ')' : 'pb=NONE',
+        log.displacementRatio        ? 'disp=' + log.displacementRatio + 'x(' + (log.displacementStrength||'') + ')' : '',
+        log.bosType                  ? 'bos='  + log.bosType : '',
+      ].filter(Boolean).join(' | ')
     ]);
   } catch(e) { console.error('[log] logEntryTriggered error:', e.message); }
 }
@@ -214,7 +231,7 @@ function logInvalidation(setup, reason) {
       log.zone?.score||'', log.zone?.touches||'',
       'INVALIDATED', '', '', '', '',
       log.candlesToInvalidation, '', reason,
-      Object.entries(log.stages).filter(([,v])=>v).map(([k])=>k).join(',')
+      Object.entries(log.stages).filter(([,v])=>v).map(([k])=>k).join(','), ''
     ]);
     setTimeout(() => { delete _setupLogs[setup.id]; }, 2000);
   } catch(e) { console.error('[log] logInvalidation error:', e.message); }
@@ -236,9 +253,46 @@ function logTradeResult(setupId, result) {
       log?.zone?.score||'', log?.zone?.touches||'',
       'RESULT', log?.entryPrice||'', log?.stopLoss||'',
       log?.takeProfits?.[0]||'', log?.takeProfits?.[1]||'',
-      '', result, '', ''
+      '', result, '', '', ''
     ]);
   } catch(e) { console.error('[log] logTradeResult error:', e.message); }
+}
+
+// ── SCAN-LEVEL EVENT LOGGING ──────────────────────────────────────────────
+// Logs every engine decision to Sheets — not just signals.
+// Non-blocking, never throws. Gives full visibility into filter logic.
+//
+// Events logged: SCAN_START, HTF_BIAS, ZONE_SELECTED, ZONE_EXHAUSTED,
+//                ZONE_SCORE_BLOCKED, BIAS_BLOCKED, VWAP_PASS, VWAP_FAIL,
+//                SESSION_BLOCKED, NO_ZONE, SWEEP_FOUND, SWEEP_WAITING
+//
+// Sheet columns used: A(ts) B(id=SCAN) C(sym) D(dir) E(sess)
+//                     F(zLow) G(zHigh) H(zScore) I(touches) J(event)
+//                     K–N(blank) O(blank) P(blank) Q(details) R(stages) S(notes)
+function logScanEvent(sym, event, details, opts) {
+  try {
+    const h    = new Date().getUTCHours();
+    const sess = detectSessionTag(h);
+    const o    = opts || {};
+    appendToSheet([
+      new Date().toISOString(),
+      'SCAN_' + sym,
+      sym,
+      o.direction  || '',
+      sess,
+      o.zoneLow    || '',
+      o.zoneHigh   || '',
+      o.zoneScore  || '',
+      o.touches    || '',
+      event,
+      '', '', '', '',    // K–N (entry/sl/tp1/tp2 — N/A for scan events)
+      '',                // O (candles)
+      '',                // P (result)
+      details        || '',   // Q — human-readable reason
+      o.stages       || '',   // R — stage chain if relevant
+      o.notes        || '',   // S — extra context (HTF bias, VWAP level, etc.)
+    ]);
+  } catch(e) { /* never block scan loop */ }
 }
 
 // Read all logs — from in-memory store (session data)
@@ -385,10 +439,13 @@ function deriveM15FromM5(m5Candles) {
 
 
 // --- ATR RANGE VALIDATION ----------------------------------------------------
-// Valid ATR range per M5 candle. Outside either bound = ignore volatility filter.
+// v5.2: Explicit absolute ATR ranges for XAUUSD (M5 candle basis):
+//   < 5  → low volatility, suppress (choppy/dead market)
+//   5–20 → valid trading range
+//   > 20 → news spike, suppress (unpredictable slippage)
 const ATR_RANGE = {
-  XAUUSD: { min: 0.30, max: 8.0  },  // $0.30-$8.00 per M5 candle — XAU/USD spot
-  XAGUSD: { min: 0.03, max: 1.50 }   // $0.03-$1.50 per M5 candle — SLV ETF (~$28-32/share)
+  XAUUSD: { min: 5.0,  max: 20.0 },  // explicit $ range per M5 candle — XAU/USD
+  XAGUSD: { min: 0.03, max: 1.50  }  // $0.03–$1.50 per M5 candle — SLV ETF
 };
 function checkATR(sym, atrValues) {
   if (!atrValues || atrValues.length < 5 || !ATR_RANGE[sym]) {
@@ -993,13 +1050,17 @@ function detectSweep(candles, levels) {
 }
 
 // ─── DISPLACEMENT ──────────────────────────────────────────────────────────
+// v5.2: Minimum threshold lowered from 1.5x → 1.2x.
+//   ≥1.5x = STRONG  (max score)
+//   ≥1.2x = VALID   (reduced score)
+//   <1.2x = invalid (unchanged)
 // Must occur within 1–3 candles after sweep candle
-// Returns: { found, candleIdx, bodySize, avgBody }
+// Returns: { found, candleIdx, bodySize, avgBody, ratio, strength }
 function detectDisplacement(candles, sweepIdx, direction, minRatioOverride) {
   // minRatioOverride: optional — allows caller to require stricter displacement
   const MIN_RATIO_OVERRIDE = minRatioOverride || null;
-  // Scans up to 4 candles. Tolerates 1 weak/indecisive candle gap.
-  const BODY_MULT  = 1.5;
+  // v5.2: Min ratio 1.2x. STRONG=1.5x+, VALID=1.2–1.5x
+  const BODY_MULT  = 1.2;  // was 1.5 — lowered to accept valid displacement
   const CLOSE_ZONE = 0.25;
   const slice = candles.slice(Math.max(0, sweepIdx - 10), sweepIdx);
   if (slice.length < 3) return { found: false, reason: 'insufficient candle history' };
@@ -1020,9 +1081,11 @@ function detectDisplacement(candles, sweepIdx, direction, minRatioOverride) {
       ? (c.c - c.l) / r >= (1 - CLOSE_ZONE)
       : (c.h - c.c) / r >= (1 - CLOSE_ZONE);
     if (bodyStrong && dirOk && closeZone) {
+      const ratio    = parseFloat((b / avgBody10).toFixed(2));
+      const strength = ratio >= 1.5 ? 'STRONG' : 'VALID'; // v5.2 strength label
       return { found: true, candleIdx: idx,
-               ratio: parseFloat((b/avgBody10).toFixed(2)),
-               avgBody: avgBody10, weakGap,
+               ratio, avgBody: avgBody10, weakGap,
+               strength,  // 'STRONG' | 'VALID'
                impulseHigh: c.h, impulseLow: c.l };
     }
     // Allow 1 weak/indecisive candle gap before invalidating
@@ -1115,59 +1178,154 @@ function confirmBOS_M15(m15Candles, direction, bos_level) {
   return false;
 }
 
+// ─── CONTINUATION ENTRY DETECTION ────────────────────────────────────────
+// v5.2: Handles strong moves that never retrace ≥30%.
+// Requirements: displacement ≥1.5x (STRONG only), no opposing wicks,
+//               structure holds (no candle closes against direction).
+// Entry type: CONTINUATION. Confidence penalty: -10. Tighter SL.
+//
+// Returns: { found, entry, entryType, reason } | { found: false }
+function detectContinuation(candles, dispIdx, direction, atr) {
+  const disp = candles[dispIdx];
+  if (!disp) return { found: false, reason: 'no displacement candle' };
+
+  // Only allow STRONG displacement for continuation entries
+  const dispBody  = body(disp);
+  const slice     = candles.slice(Math.max(0, dispIdx - 10), dispIdx);
+  const avgBody   = slice.length ? slice.reduce((s,c) => s + body(c), 0) / slice.length : dispBody;
+  const ratio     = avgBody > 0 ? dispBody / avgBody : 0;
+
+  if (ratio < 1.5) {
+    return { found: false, reason: 'Continuation requires STRONG displacement ≥1.5x (got ' + ratio.toFixed(2) + 'x)' };
+  }
+
+  // Check 2–5 candles after displacement for continuation conditions
+  const postDisp = candles.slice(dispIdx + 1, Math.min(candles.length, dispIdx + 6));
+  if (postDisp.length === 0) return { found: false, reason: 'no candles after displacement' };
+
+  let opposingWick  = false;
+  let structureBroke = false;
+
+  for (const c of postDisp) {
+    const r = range(c);
+    if (r === 0) continue;
+    // Check for large opposing wick (>40% of candle range against direction)
+    if (direction === 'BUY') {
+      const upperWick = c.h - Math.max(c.o, c.c);
+      const lowerWick = Math.min(c.o, c.c) - c.l;
+      if (lowerWick / r > 0.40) { opposingWick = true; break; }
+      // Structure break: candle closes below displacement low
+      if (c.c < disp.l) { structureBroke = true; break; }
+    } else {
+      const lowerWick = Math.min(c.o, c.c) - c.l;
+      const upperWick = c.h - Math.max(c.o, c.c);
+      if (upperWick / r > 0.40) { opposingWick = true; break; }
+      if (c.c > disp.h) { structureBroke = true; break; }
+    }
+  }
+
+  if (opposingWick)   return { found: false, reason: 'Opposing wick detected — momentum not clean' };
+  if (structureBroke) return { found: false, reason: 'Structure broke after displacement' };
+
+  // Entry: current close (continuation at market)
+  const lastCandle = postDisp[postDisp.length - 1];
+  const entry = lastCandle.c;
+
+  // Tighter SL for continuation — use displacement midpoint as anchor
+  const dispMid = (disp.h + disp.l) / 2;
+  const atrBuf  = (atr || 1) * 0.15;
+  const sl = direction === 'BUY'
+    ? parseFloat((dispMid - atrBuf).toFixed(3))
+    : parseFloat((dispMid + atrBuf).toFixed(3));
+
+  return {
+    found:       true,
+    entry,
+    sl,
+    entryType:   'CONTINUATION',
+    dispRatio:   parseFloat(ratio.toFixed(2)),
+    candlesHeld: postDisp.length,
+    reason:      'Strong momentum continuation — no pullback (' + ratio.toFixed(2) + 'x displacement, clean candles)',
+  };
+}
+
 // ─── PULLBACK ENTRY DETECTION ─────────────────────────────────────────────
+// v5.2: Expanded zone 30–70%. Tiered scoring. >70% invalidation unchanged.
+//
+// Pullback tiers:
+//   50–61.8% = OPTIMAL  (+20 score)
+//   40–50%   = VALID    (+12 score)
+//   61.8–65% = VALID    (+12 score)
+//   30–40%   = WEAK     (+8  score)
+//   65–70%   = WEAK     (+5  score)
+//   >70%     = INVALID  (hard invalidation — unchanged)
+//   <30%     = no pullback (falls through to continuation logic)
 function detectPullback(candles, dispIdx, direction, sweepExtreme) {
   const disp = candles[dispIdx];
   if (!disp) return { found: false, reason: 'displacement candle not found' };
 
-  // Displacement range
-  const dispHigh = disp.h;
-  const dispLow  = disp.l;
+  const dispHigh  = disp.h;
+  const dispLow   = disp.l;
   const dispRange = dispHigh - dispLow;
   if (dispRange === 0) return { found: false, reason: 'zero displacement range' };
 
-  // Entry zone: 50%–61.8% retracement
-  let zone_high, zone_low;
-  if (direction === 'BUY') {
-    // Price moved UP during displacement — pullback retraces DOWN
-    const retr50   = dispHigh - dispRange * 0.50;
-    const retr618  = dispHigh - dispRange * 0.618;
-    const retr70   = dispHigh - dispRange * 0.70;
-    zone_high = retr50;
-    zone_low  = retr618;
+  // ── Retracement levels ──────────────────────────────────────────
+  const PCT = (pct) => direction === 'BUY'
+    ? dispHigh - dispRange * pct
+    : dispLow  + dispRange * pct;
 
-    // Look for price entering zone and printing rejection
-    for (let i = dispIdx + 1; i < Math.min(candles.length, dispIdx + 8); i++) {
+  const retr30  = PCT(0.30);
+  const retr40  = PCT(0.40);
+  const retr50  = PCT(0.50);
+  const retr618 = PCT(0.618);
+  const retr65  = PCT(0.65);
+  const retr70  = PCT(0.70);
+
+  // Classify retracement depth → tier + pullback score
+  function classifyRetracement(pct) {
+    if (pct > 70) return null; // invalidated — caller handles
+    if (pct >= 50  && pct <= 61.8) return { tier: 'OPTIMAL', pbScore: 20, label: 'Optimal (50–61.8%)' };
+    if (pct >= 40  && pct <  50)   return { tier: 'VALID',   pbScore: 12, label: 'Valid (40–50%)'     };
+    if (pct >  61.8 && pct <= 65)  return { tier: 'VALID',   pbScore: 12, label: 'Valid (61.8–65%)'   };
+    if (pct >= 30  && pct <  40)   return { tier: 'WEAK',    pbScore: 8,  label: 'Weak (30–40%)'      };
+    if (pct >  65  && pct <= 70)   return { tier: 'WEAK',    pbScore: 5,  label: 'Weak (65–70%)'      };
+    return null; // < 30% — not a pullback
+  }
+
+  if (direction === 'BUY') {
+    for (let i = dispIdx + 1; i < Math.min(candles.length, dispIdx + 10); i++) {
       const c = candles[i];
-      if (c.l <= zone_high && c.l >= zone_low) {
-        // Price in zone — check rejection candle: closes bullish, lower wick present
-        if (c.c > c.o && (c.o - c.l) / range(c) > 0.15) {
-          if (c.l < retr70) return { found: false, reason: 'pullback exceeded 70% — setup invalidated' };
-          return { found: true, entry: c.c, zone_high, zone_low, retracement: ((dispHigh - c.l)/dispRange*100).toFixed(1) };
-        }
+      // Hard invalidation — >70% retracement
+      if (c.l < retr70) return { found: false, reason: 'pullback exceeded 70% — setup invalidated' };
+      // Must be at minimum 30% retracement to qualify
+      if (c.l > retr30) continue;
+      // Rejection candle: closes bullish, lower wick present
+      if (c.c > c.o && (c.o - c.l) / Math.max(range(c), 0.001) > 0.12) {
+        const retPct = parseFloat(((dispHigh - c.l) / dispRange * 100).toFixed(1));
+        const cls    = classifyRetracement(retPct);
+        if (!cls) continue;
+        return { found: true, entry: c.c, zone_high: retr30, zone_low: retr70,
+                 retracement: retPct, tier: cls.tier, pbScore: cls.pbScore,
+                 tierLabel: cls.label };
       }
-      if (c.l < retr70) return { found: false, reason: 'pullback exceeded 70%' };
     }
-    return { found: false, reason: 'no pullback into 50-61.8% zone' };
+    return { found: false, reason: 'no pullback into 30–70% zone' };
 
   } else { // SELL
-    const retr50  = dispLow + dispRange * 0.50;
-    const retr618 = dispLow + dispRange * 0.618;
-    const retr70  = dispLow + dispRange * 0.70;
-    zone_high = retr618;
-    zone_low  = retr50;
-
-    for (let i = dispIdx + 1; i < Math.min(candles.length, dispIdx + 8); i++) {
+    for (let i = dispIdx + 1; i < Math.min(candles.length, dispIdx + 10); i++) {
       const c = candles[i];
-      if (c.h >= zone_low && c.h <= zone_high) {
-        if (c.c < c.o && (c.h - c.o) / range(c) > 0.15) {
-          if (c.h > retr70) return { found: false, reason: 'pullback exceeded 70%' };
-          return { found: true, entry: c.c, zone_high, zone_low, retracement: ((c.h - dispLow)/dispRange*100).toFixed(1) };
-        }
+      if (c.h > retr70) return { found: false, reason: 'pullback exceeded 70% — setup invalidated' };
+      if (c.h < retr30) continue;
+      if (c.c < c.o && (c.h - c.o) / Math.max(range(c), 0.001) > 0.12) {
+        const retPct = parseFloat(((c.h - dispLow) / dispRange * 100).toFixed(1));
+        const cls    = classifyRetracement(retPct);
+        if (!cls) continue;
+        return { found: true, entry: c.c, zone_high: retr30, zone_low: retr70,
+                 retracement: retPct, tier: cls.tier, pbScore: cls.pbScore,
+                 tierLabel: cls.label };
       }
-      if (c.h > retr70) return { found: false, reason: 'pullback exceeded 70%' };
     }
-    return { found: false, reason: 'no pullback into 50-61.8% zone' };
+    return { found: false, reason: 'no pullback into 30–70% zone' };
   }
 }
 
@@ -1367,118 +1525,116 @@ function checkVolatility(atrValues) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CONFIDENCE SCORING SYSTEM (0–100)
+// CONFIDENCE SCORING SYSTEM v5.2 — 5 components × 20 pts = 100 max
 //
-// Components:
-//   A. Liquidity Strength   0–25  (zone touch count)
-//   B. Reaction Quality     0–20  (wick rejection strength)
-//   C. Displacement         0–20  (move strength after grab)
-//   D. Structure (BOS)      0–15  (trend shift quality)
-//   E. Pullback Quality     0–10  (entry zone refinement)
-//   F. Session Quality      0–10  (time-based weighting)
+// Component      Max   Description
+// ─────────────────────────────────────────────────
+// Session         20   Time-of-day quality
+// Liquidity       20   Zone touch count + level type
+// Displacement    20   Move strength (1.2–3x)
+// BOS             20   M5 required, M15 optional boost
+// Pullback        20   Tiered retracement quality
 //
-// Tiers:
-//   0–39   IGNORE  — do not display, no alerts
-//  40–59   LOW     — display only, no alerts
-//  60–74   VALID   — pre-signal Telegram allowed
-//  75–100  HIGH    — full signal allowed
+// Tiers (lowered from 75 → 70 for full signal):
+//   ≥70  HIGH   — full signal + Telegram
+//   ≥55  VALID  — pre-signal Telegram allowed
+//   ≥40  LOW    — display only
+//    <40  IGNORE — discard
 // ═══════════════════════════════════════════════════════════════════════════
 
 function scoreSetup(sessionLabel, sessionOk, sweep, displacement, bos, pullback,
                     volatilityOk, directionalBias, biasPenalty, htfBias) {
-  // htfBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL' (optional — defaults to NEUTRAL)
   const _htfBias = htfBias || 'NEUTRAL';
-
   const breakdown = {};
   let total = 0;
 
   // Hard exits — cannot score without these fundamentals
-  if (!sessionOk)        return { total: 0, tier: 'IGNORE', grade: 'IGNORE', reason: 'Outside session',   breakdown: {} };
-  if (!sweep || !sweep.found) return { total: 0, tier: 'IGNORE', grade: 'IGNORE', reason: 'No sweep',     breakdown: {} };
+  if (!sessionOk)             return { total: 0, tier: 'IGNORE', grade: 'IGNORE', reason: 'Outside session',   breakdown: {} };
+  if (!sweep || !sweep.found) return { total: 0, tier: 'IGNORE', grade: 'IGNORE', reason: 'No sweep',          breakdown: {} };
 
-  // ── A. LIQUIDITY STRENGTH (max 25) ───────────────────────────
-  // Based on zone touch count (totalTouches for clustered zones, strengthScore for singles)
-  const touches = sweep.level
+  // ── A. SESSION (max 20) ───────────────────────────────────────
+  const sessScore = sessionLabel === 'London+NY Overlap' ? 20
+                  : sessionLabel === 'New York'           ? 16
+                  : sessionLabel === 'London'             ? 12
+                  : 0;
+  breakdown.session = { score: sessScore, max: 20, label: sessionLabel || 'Unknown' };
+  total += sessScore;
+
+  // ── B. LIQUIDITY GRAB (max 20) ────────────────────────────────
+  const touches  = sweep.level
     ? (sweep.level.totalTouches || (sweep.level.strengthScore >= 3 ? 6 : sweep.level.strengthScore >= 2 ? 3 : 2))
     : 2;
-  const liqScore = touches >= 10 ? 25
-                 : touches >= 6  ? 22
-                 : touches >= 4  ? 18
-                 : touches === 3 ? 15
-                 :                 10; // 2 touches minimum
-  // Level type bonus: PDH/PDL = premium liquidity
-  const liqBonus = (sweep.level?.type === 'PDH' || sweep.level?.type === 'PDL') ? 3
-                 : (sweep.level?.type === 'ASH' || sweep.level?.type === 'ASL') ? 1 : 0;
-  const liqFinal = Math.min(liqScore + liqBonus, 25);
-  breakdown.liquidity = { score: liqFinal, max: 25, touches, label: sweep.level?.label || '—' };
+  const wickPct  = sweep.wickPct || 0;
+  // Touch count contributes 0–14
+  const touchScore = touches >= 10 ? 14 : touches >= 6 ? 12 : touches >= 4 ? 10 : touches === 3 ? 8 : 5;
+  // Wick quality contributes 0–6
+  const wickScore  = wickPct >= 0.70 ? 6 : wickPct >= 0.55 ? 5 : wickPct >= 0.40 ? 4 : wickPct >= 0.30 ? 2 : 0;
+  // Level type bonus
+  const liqBonus   = (sweep.level?.type === 'PDH' || sweep.level?.type === 'PDL') ? 2
+                   : (sweep.level?.type === 'ASH' || sweep.level?.type === 'ASL') ? 1 : 0;
+  const liqFinal   = Math.min(touchScore + wickScore + liqBonus, 20);
+  breakdown.liquidity = { score: liqFinal, max: 20, touches, wickPct: Math.round(wickPct * 100), label: sweep.level?.label || '—' };
   total += liqFinal;
 
-  // ── B. REACTION QUALITY (max 20) ─────────────────────────────
-  // How cleanly did price reject the zone (wick size + close quality)
-  const wickPct = sweep.wickPct || 0;
-  const reactionScore = wickPct >= 0.70 ? 20   // very strong rejection + full close back
-                      : wickPct >= 0.55 ? 17   // clean wick rejection
-                      : wickPct >= 0.40 ? 14   // decent rejection
-                      : wickPct >= 0.30 ? 10   // minimum valid wick
-                      : 5;                     // below threshold (already filtered, but score low)
-  // Bonus if close was strongly back inside (not just at level)
-  const closeBonus = sweep.closePrice && sweep.level
-    ? (Math.abs(sweep.closePrice - sweep.level.price) / sweep.level.price > 0.001 ? 2 : 0)
-    : 0;
-  const reactionFinal = Math.min(reactionScore + closeBonus, 20);
-  breakdown.reaction = { score: reactionFinal, max: 20, wickPct: Math.round(wickPct * 100) };
-  total += reactionFinal;
-
-  // ── C. DISPLACEMENT / STRONG MOVE (max 20) ───────────────────
+  // ── C. DISPLACEMENT (max 20) ──────────────────────────────────
   if (!displacement || !displacement.found) {
     breakdown.displacement = { score: 0, max: 20, note: 'No displacement detected' };
-    // Not a hard fail for scoring — keeps partial scores for pre-signal use
   } else {
+    // v5.2: 1.2x = VALID (+12), 1.5x+ = STRONG (+20)
     const dispScore = displacement.ratio >= 3.0 ? 20
                     : displacement.ratio >= 2.5 ? 18
-                    : displacement.ratio >= 2.0 ? 15
-                    : displacement.ratio >= 1.5 ? 11
-                    : 6;
-    const dispFinal = displacement.weakGap ? Math.max(dispScore - 3, 5) : dispScore;
-    breakdown.displacement = { score: dispFinal, max: 20, ratio: displacement.ratio };
+                    : displacement.ratio >= 2.0 ? 16
+                    : displacement.ratio >= 1.5 ? 20   // STRONG
+                    : displacement.ratio >= 1.2 ? 12   // VALID
+                    : 0;
+    const dispFinal = displacement.weakGap ? Math.max(dispScore - 3, 0) : dispScore;
+    breakdown.displacement = { score: dispFinal, max: 20, ratio: displacement.ratio, strength: displacement.strength || 'VALID' };
     total += dispFinal;
   }
 
-  // ── D. STRUCTURE BREAK / BOS (max 15) ────────────────────────
+  // ── D. BOS / TREND SHIFT (max 20) ────────────────────────────
+  // v5.2: M5 BOS = required (15 pts). M15 confirmation = optional (+5 pts).
   if (!bos || !bos.found) {
-    breakdown.structure = { score: 0, max: 15, note: 'No BOS detected' };
+    breakdown.structure = { score: 0, max: 20, note: 'No BOS detected' };
   } else {
-    const bosScore = bos.structure_type === 'internal' && bos.method === 'close' ? 15
-                   : bos.structure_type === 'internal'                            ? 13
-                   : bos.method === 'close'                                       ? 11
-                   : 8;
-    breakdown.structure = { score: bosScore, max: 15, type: bos.structure_type, method: bos.method };
-    total += bosScore;
+    // M5 base score
+    const m5Score = bos.structure_type === 'internal' && bos.method === 'close' ? 15
+                  : bos.structure_type === 'internal'                            ? 13
+                  : bos.method === 'close'                                       ? 11
+                  : 8;
+    // M15 optional boost (passed in via bos.m15confirmed flag set by caller)
+    const m15Bonus = bos.m15confirmed ? 5 : 0;
+    const bosType  = bos.m15confirmed ? 'M5+M15' : 'M5';
+    const bosFinal = Math.min(m5Score + m15Bonus, 20);
+    breakdown.structure = { score: bosFinal, max: 20, type: bos.structure_type, method: bos.method, bosType };
+    total += bosFinal;
   }
 
-  // ── E. PULLBACK QUALITY (max 10) ─────────────────────────────
+  // ── E. PULLBACK (max 20) ──────────────────────────────────────
+  // v5.2: Tiered scoring from detectPullback.pbScore. Continuation entry gets flat 10.
   if (!pullback || !pullback.found) {
-    breakdown.pullback = { score: 0, max: 10, note: 'No pullback yet' };
+    breakdown.pullback = { score: 0, max: 20, note: 'No pullback yet' };
   } else {
     const pb = parseFloat(pullback.retracement);
     if (pb > 70) return { total: 0, tier: 'IGNORE', grade: 'IGNORE', reason: 'Pullback > 70%', breakdown };
-    const pbScore = (pb >= 50 && pb <= 61.8) ? 10
-                  : (pb >= 45 && pb <  50)    ? 7
-                  : (pb >  61.8 && pb <= 70)  ? 5
-                  : 3;
-    breakdown.pullback = { score: pbScore, max: 10, retracement: pb };
+    // Use pbScore from detectPullback if available (v5.2), else fall back
+    const pbScore = pullback.pbScore !== undefined ? pullback.pbScore
+                  : (pb >= 50 && pb <= 61.8) ? 20
+                  : (pb >= 40 && pb < 50)    ? 12
+                  : (pb >  61.8 && pb <= 65) ? 12
+                  : (pb >= 30 && pb < 40)    ? 8
+                  : (pb >  65 && pb <= 70)   ? 5
+                  : 0;
+    breakdown.pullback = {
+      score: pbScore, max: 20,
+      retracement: pb,
+      tier: pullback.tier || 'VALID',
+      tierLabel: pullback.tierLabel || '',
+    };
     total += pbScore;
   }
 
-  // ── F. SESSION QUALITY (max 10) ──────────────────────────────
-  const sessScore = sessionLabel === 'London+NY Overlap' ? 10
-                  : sessionLabel === 'New York'           ? 8
-                  : sessionLabel === 'London'             ? 6
-                  : 0;
-  breakdown.session = { score: sessScore, max: 10, label: sessionLabel || 'Unknown' };
-  total += sessScore;
-
-  // ── PENALTIES + HTF BIAS MODIFIER ───────────────────────────
+  // ── PENALTIES + HTF BIAS MODIFIER ─────────────────────────────
   if (!volatilityOk) {
     total -= 8;
     breakdown.volatility = { penalty: -8 };
@@ -1491,48 +1647,38 @@ function scoreSetup(sessionLabel, sessionOk, sweep, displacement, bos, pullback,
       breakdown.bias = { penalty: -biasPenalty, note: 'Counter-trend setup' };
     }
   }
-
-  // ── HTF BIAS MODIFIER (confidence only — never blocks trade) ─
   if (_htfBias !== 'NEUTRAL' && sweep.found) {
-    const dir = sweep.direction;
-    const htfAligned = (_htfBias === 'BULLISH' && dir === 'BUY') ||
-                       (_htfBias === 'BEARISH' && dir === 'SELL');
-    const htfCounter = (_htfBias === 'BULLISH' && dir === 'SELL') ||
-                       (_htfBias === 'BEARISH' && dir === 'BUY');
+    const dir       = sweep.direction;
+    const htfAligned = (_htfBias === 'BULLISH' && dir === 'BUY')  || (_htfBias === 'BEARISH' && dir === 'SELL');
+    const htfCounter = (_htfBias === 'BULLISH' && dir === 'SELL') || (_htfBias === 'BEARISH' && dir === 'BUY');
     if (htfAligned) {
       total += 10;
       breakdown.htfBias = { adjustment: +10, alignment: 'ALIGNED', htfBias: _htfBias };
-      console.log('[htf] ' + dir + ' setup ALIGNED with ' + _htfBias + ' HTF bias → +10 confidence');
+      console.log('[htf] ' + dir + ' ALIGNED with ' + _htfBias + ' HTF bias → +10');
     } else if (htfCounter) {
       total -= 15;
       breakdown.htfBias = { adjustment: -15, alignment: 'COUNTER', htfBias: _htfBias };
-      console.log('[htf] ' + dir + ' setup COUNTER to ' + _htfBias + ' HTF bias → -15 confidence');
+      console.log('[htf] ' + dir + ' COUNTER to ' + _htfBias + ' HTF bias → -15');
     }
   }
 
   total = Math.min(Math.max(Math.round(total), 0), 100);
 
-  // ── TIER CLASSIFICATION ───────────────────────────────────────
-  const tier  = total >= 75 ? 'HIGH'   // full signal allowed
-              : total >= 60 ? 'VALID'  // pre-signal Telegram allowed
-              : total >= 40 ? 'LOW'    // display only, no alerts
-              :               'IGNORE'; // discard
-  // Legacy grade compatibility
-  const grade = total >= 85 ? 'A+' : total >= 75 ? 'A' : total >= 60 ? 'B' : 'REJECT';
+  // ── TIER CLASSIFICATION (v5.2: full signal threshold = 70) ────
+  const tier  = total >= 70 ? 'HIGH'   // full signal allowed (was 75)
+              : total >= 55 ? 'VALID'  // pre-signal allowed  (was 60)
+              : total >= 40 ? 'LOW'
+              :               'IGNORE';
+  const grade = total >= 85 ? 'A+' : total >= 75 ? 'A' : total >= 70 ? 'B+' : total >= 55 ? 'B' : 'REJECT';
 
-  // Debug log
-  const bdStr = [
-    'Liq '  + liqFinal,
-    'React ' + reactionFinal,
-    'Move '  + (breakdown.displacement?.score || 0),
-    'BOS '   + (breakdown.structure?.score || 0),
-    'PB '    + (breakdown.pullback?.score || 0),
-    'Sess '  + sessScore
-  ].join(' + ');
+  const bdStr = ['Sess ' + sessScore, 'Liq ' + liqFinal,
+    'Disp ' + (breakdown.displacement?.score || 0),
+    'BOS '  + (breakdown.structure?.score   || 0),
+    'PB '   + (breakdown.pullback?.score    || 0)].join(' + ');
   console.log('[score] ' + (sweep.level?.label || '—') + ' → ' + total + '/100 (' + tier + ') = ' + bdStr);
 
   return { total, tier, grade, breakdown,
-           reason: tier === 'IGNORE' ? 'Score ' + total + ' below threshold (40)' : null };
+           reason: tier === 'IGNORE' ? 'Score ' + total + ' below threshold' : null };
 }
 
 // Backwards-compatible wrapper — returns total score (number)
@@ -2729,21 +2875,30 @@ app.get('/test-signal', async (req, res) => {
     take_profit_1: isBuy ? 4450.00  : 4418.00,
     take_profit_2: isBuy ? 4465.00  : 4404.00,
     rr:            '2.1',
-    confidence:    82,
+    confidence:    76,
     grade:         'A',
     tier:          'HIGH',
-    entry_mode:    'AGGRESSIVE',
-    session:       'London',
+    entry_mode:    'STANDARD',
+    entryType:     req.query.cont === '1' ? 'CONTINUATION' : 'PULLBACK',
+    pullback_pct:  req.query.cont === '1' ? null : '54.2',
+    pullbackTier:  req.query.cont === '1' ? null : 'OPTIMAL',
+    pullbackTierLabel: req.query.cont === '1' ? null : 'Optimal (50–61.8%)',
+    displacementRatio: 1.6,
+    displacementStrength: 'STRONG',
+    bosType:       'M5+M15',
+    session:       'London+NY Overlap',
     directional_bias: 'neutral',
     sweep_level:   'Equal ' + (isBuy ? 'Lows' : 'Highs') + ' zone (15 touches)',
-    pullback_pct:  '54.2',
+    atr:           11.4,
+    zoneFreshness: '🟢 FRESH (1st test)',
     expiry:        '10:45 UTC',
     primaryZone:   { low: isBuy ? 4425.00 : 4431.35, high: isBuy ? 4432.00 : 4438.79 },
     scoreBreakdown: {
-      sweep:        { score: 17, wickPct: 70 },
-      displacement: { score: 13, ratio: 1.93 },
-      structure:    { score: 15, type: 'internal', method: 'close' },
-      pullback:     { score: 10, retracement: 54.2 }
+      session:      { score: 20, max: 20, label: 'London+NY Overlap' },
+      liquidity:    { score: 16, max: 20, touches: 15, wickPct: 65 },
+      displacement: { score: 20, max: 20, ratio: 1.6, strength: 'STRONG' },
+      structure:    { score: 20, max: 20, type: 'internal', method: 'close', bosType: 'M5+M15' },
+      pullback:     { score: 20, max: 20, retracement: 54.2, tier: 'OPTIMAL' },
     }
   };
 
@@ -2789,9 +2944,9 @@ app.get('/debug/:sym', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.json({
-  status:'ok', version:'5.1',
-  engine:'Liquidity Sweep — Pure Price Action (M5+M15)',
-  rules: ['PDH/PDL/ASH/ASL/EQH/EQL levels','0.02% sweep break required','1.5× body displacement','M5+M15 BOS','50-61.8% pullback entry','min 1:2 RR','confidence ≥ 80','10-candle time decay']
+  status:'ok', version:'5.3',
+  engine:'Liquidity Sweep — Adaptive Execution Engine (M5+M15)',
+  rules: ['PDH/PDL/ASH/ASL/EQH/EQL levels','0.02% sweep break required','1.2–3× body displacement','M5 BOS required / M15 optional +5','30–70% pullback (tiered scoring)','continuation entry (STRONG disp only)','confidence ≥ 70 (5×20 weighted)','ATR 5–20 XAUUSD','10-candle time decay']
 }));
 
 // ═══════════════════════════════════════════════════════════════
@@ -2835,93 +2990,111 @@ async function sendTelegram(text) {
   }
 }
 
-// Format full signal for Telegram — includes grade, score, expiry
+// Format full signal for Telegram — v5.2: entry type header, quality label, flexible fields
 function formatTelegramSignal(sig) {
-  const isBuy   = sig.direction === 'BUY';
-  const dir     = sig.direction;
-  const asset   = sig.asset === 'XAUUSD' ? 'GOLD' : 'SILVER';
-  const dirEmoji = isBuy ? '🟢' : '🔴';
+  const isBuy      = sig.direction === 'BUY';
+  const dir        = sig.direction;
+  const asset      = sig.asset === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  const isCont     = sig.entryType === 'CONTINUATION';
 
-  // ── Grade & mode ──────────────────────────────────────────────
-  const conf    = sig.confidence || 0;
-  const grade   = conf >= 85 ? 'A+' : conf >= 75 ? 'A' : conf >= 65 ? 'B' : 'C';
-  const gradeEmoji = conf >= 85 ? '⭐' : conf >= 75 ? '✅' : '🔵';
+  // ── Header: entry type determines emoji + title ───────────────
+  const headerEmoji = isCont ? '⚡' : (isBuy ? '🔥' : '🔥');
+  const headerTitle = isCont
+    ? asset + ' — CONTINUATION ENTRY'
+    : asset + ' — ENTRY READY';
+  const dirEmoji   = isBuy ? '🟢' : '🔴';
 
-  const modeKey = sig.entry_mode || 'STANDARD';
-  const modeStr = modeKey === 'AGGRESSIVE_EARLY' ? '⚡ EARLY'
-                : modeKey === 'AGGRESSIVE'        ? '🎯 STANDARD'
-                : '🚀 MOMENTUM';
+  // ── Grade ─────────────────────────────────────────────────────
+  const conf       = sig.confidence || 0;
+  const grade      = conf >= 85 ? 'A+' : conf >= 75 ? 'A' : conf >= 70 ? 'B+' : conf >= 55 ? 'B' : 'C';
+  const gradeEmoji = conf >= 85 ? '⭐' : conf >= 75 ? '✅' : conf >= 70 ? '🔵' : '⚪';
+
+  // ── Quality label (Step 8 requirement) ───────────────────────
+  const qualityLabel = conf >= 85 ? '→ High conviction setup'
+                     : conf >= 75 ? '→ Strong setup'
+                     : conf >= 70 ? '→ Moderate quality setup'
+                     : isCont     ? '→ ⚠️ Higher risk entry (no pullback)'
+                     :              '→ Borderline setup — size conservatively';
 
   // ── Entry zone ────────────────────────────────────────────────
-  const entryPrice  = sig.entry;
-  const livePrice   = sig.live_price || entryPrice;
+  const entryPrice    = sig.entry;
+  const livePrice     = sig.live_price || entryPrice;
   const distFromEntry = livePrice && entryPrice
     ? Math.abs(((livePrice - entryPrice) / entryPrice) * 100).toFixed(3)
     : null;
-
-  // Zone range from primary zone if available
-  const zone = sig.primaryZone || sig.zone || null;
+  const zone      = sig.primaryZone || sig.zone || null;
   const zoneRange = zone
     ? '$' + parseFloat(zone.low || zone.minPrice || entryPrice).toFixed(2) +
       ' – $' + parseFloat(zone.high || zone.maxPrice || entryPrice).toFixed(2)
     : '$' + entryPrice;
 
   // ── Risk management ───────────────────────────────────────────
-  const sl     = sig.stop_loss;
+  const sl       = sig.stop_loss;
   const riskDist = Math.abs(entryPrice - sl);
-  // Risk % assumes 0.5% of account per trade (configurable)
   const RISK_PCT = 0.5;
-
-  // ── Take profit ───────────────────────────────────────────────
-  const tp1 = sig.take_profit_1;
-  const tp2 = sig.take_profit_2;
-  const rr1 = sig.rr || (tp1 ? (Math.abs(tp1 - entryPrice) / riskDist).toFixed(1) : '—');
+  const tp1      = sig.take_profit_1;
+  const tp2      = sig.take_profit_2;
+  const rr1      = sig.rr || (tp1 ? (Math.abs(tp1 - entryPrice) / riskDist).toFixed(1) : '—');
 
   // ── Validity / invalidation ───────────────────────────────────
-  const validity = modeKey === 'AGGRESSIVE_EARLY'
-    ? 'Valid for 2 candles (10 min) — early entry window'
+  const validity = isCont
+    ? 'Valid for 3 candles (15 min) — momentum must hold'
     : 'Valid until zone $' + (zone ? parseFloat(zone.low||zone.minPrice||sl).toFixed(2) : parseFloat(sl).toFixed(2)) + ' breaks';
-
   const invalidation = isBuy
     ? 'Close below $' + sl + ' · Pullback > 70% · Time expiry'
     : 'Close above $' + sl + ' · Pullback > 70% · Time expiry';
 
-  // ── Reason bullets ────────────────────────────────────────────
-  const bd = sig.scoreBreakdown || {};
-  const reasons = [];
-  if (sig.sweep_level) reasons.push('• ' + sig.sweep_level + ' swept');
-  if (bd.sweep)        reasons.push('• Rejection wick: ' + (bd.sweep.wickPct || '—') + '%');
-  if (bd.displacement) reasons.push('• Displacement: ' + (bd.displacement.ratio || '—') + '× avg body');
-  if (bd.structure)    reasons.push('• BOS: ' + (bd.structure.type || '') + ' (' + (bd.structure.method || '') + ')');
-  if (sig.pullback_pct)reasons.push('• Pullback: ' + sig.pullback_pct + '% retracement');
-  if (!reasons.length && sig.reason) reasons.push('• ' + sig.reason);
-  // v5.2: zone freshness label
-  if (sig.zoneFreshness) reasons.push('• Zone: ' + sig.zoneFreshness);
+  // ── Setup detail lines (Step 8 spec) ─────────────────────────
+  const sess       = sig.session || '—';
+  const pbPct      = sig.pullback_pct;
+  const pbTierLbl  = sig.pullbackTierLabel || sig.pullbackTier || '';
+  const dispRatio  = sig.displacementRatio || sig.scoreBreakdown?.displacement?.ratio || '—';
+  const dispStr    = sig.displacementStrength || (dispRatio >= 1.5 ? 'STRONG' : 'VALID');
+  const bosType    = sig.bosType || (sig.scoreBreakdown?.structure?.bosType) || 'M5';
 
-  // ── Session ───────────────────────────────────────────────────
-  const sess = sig.session || '—';
+  const pbLine = isCont
+    ? 'Pullback:      None — strong continuation'
+    : pbPct
+      ? 'Pullback:      ' + pbPct + '% ' + (pbTierLbl ? '(' + pbTierLbl + ')' : '')
+      : 'Pullback:      —';
+  const dispLine  = 'Displacement:  ' + dispRatio + '× avg body  [' + dispStr + ']';
+  const bosLine   = 'BOS:           ' + bosType + (bosType === 'M5+M15' ? ' ✅' : '');
 
-  // v5.2: ATR position sizing block
+  // ── Zone freshness ────────────────────────────────────────────
+  const freshLine = sig.zoneFreshness ? 'Zone:          ' + sig.zoneFreshness : null;
+
+  // ── ATR position sizing block ─────────────────────────────────
   const atrBlock = formatATRBlock(sig.atr, entryPrice, sl);
 
+  // ── Continuation warning ──────────────────────────────────────
+  const contWarning = isCont
+    ? '\n⚠️ <b>No pullback detected</b> — strong momentum continuation\nHigher risk entry — reduce position size'
+    : '';
+
   return [
-    dirEmoji + ' <b>' + asset + ' ' + dir + '</b>  ' + gradeEmoji + ' <b>' + grade + '</b>  ' + modeStr,
+    headerEmoji + ' <b>' + headerTitle + '</b>',
     '─────────────────────────────',
     '',
+    dirEmoji + ' <b>' + dir + '</b>  ' + gradeEmoji + ' <b>' + grade + '</b>   Confidence: <b>' + conf + '/100</b>',
+    qualityLabel,
+    contWarning,
+    '',
     '<b>ENTRY</b>',
+    'Type:    ' + (isCont ? 'Continuation' : 'Pullback'),
     'Zone:    ' + zoneRange,
     'Price:   $' + entryPrice + (distFromEntry ? '  (' + distFromEntry + '% from zone)' : ''),
+    'Session: ' + sess,
+    '',
+    '<b>SETUP QUALITY</b>',
+    pbLine,
+    dispLine,
+    bosLine,
+    ...(freshLine ? [freshLine] : []),
     '',
     '<b>RISK MANAGEMENT</b>',
     'Stop:    $' + sl + '  (risk ' + RISK_PCT + '% of account)',
     'TP1:     $' + tp1 + '  (1:' + rr1 + 'R)',
     'TP2:     $' + tp2,
-    '',
-    '<b>CONFIDENCE: ' + conf + '/100 — ' + grade + '</b>',
-    'Session: ' + sess,
-    '',
-    '<b>WHY</b>',
-    ...reasons,
     atrBlock,
     '',
     '<b>VALID:  </b>' + validity,
@@ -3759,6 +3932,9 @@ async function autoScan() {
       // Check open trade monitor first (non-blocking result detection)
       checkTradeMonitor(sym, livePrice, m5);
 
+      // Declare timing early — used throughout the entire loop body
+      const timing = symTiming[sym];
+
       // ── UPDATE HTF BIAS from M15 ──────────────────────────────
       const htfResult = calcHTFBias(m15);
       if (timing) {
@@ -3770,6 +3946,11 @@ async function autoScan() {
       }
       console.log('[htf] ' + sym + ': bias=' + htfResult.bias +
         ' BOS=' + htfResult.lastBOS + ' — ' + htfResult.reason);
+
+      // Log every scan cycle start + HTF bias state
+      logScanEvent(sym, 'SCAN_START',
+        'Price=$' + livePrice + ' ATR=' + (currentATR ? currentATR.toFixed(2) : '—'),
+        { notes: 'HTF=' + htfResult.bias + ' BOS=' + htfResult.lastBOS + ' | ' + htfResult.reason });
       const sess       = sessionName(Date.now());
       const sessionOk  = sess !== null;
       const sessionOverlap = sess === 'London+NY Overlap';
@@ -3824,17 +4005,19 @@ async function autoScan() {
 
       // ── DETECT MARKET STATE ────────────────────────────────────
       if (!sessionOk || volatility.ok === false) {
+        if (!sessionOk) logScanEvent(sym, 'SESSION_BLOCKED', 'Outside London/NY session hours', { notes: 'UTC hour ' + new Date().getUTCHours() });
+        if (volatility.ok === false) logScanEvent(sym, 'VOLATILITY_BLOCKED', volatility.note || 'ATR out of range');
         await delay(400); continue;
       }
 
       // ── PRIMARY ZONE SELECTION — only this zone matters ─────────
-      const timing    = symTiming[sym];  // declared here — used throughout this block
       const structBias = timing
         ? { dir: timing.structuralBiasDir, stage: timing.structuralBiasStage }
         : null;
       const primaryZone = selectPrimaryZone(levels, livePrice, sess, m5, structBias);
       if (!primaryZone) {
         console.log('[' + sym + '] No primary zone found — skip');
+        logScanEvent(sym, 'NO_ZONE', 'No qualifying EQH/EQL zone found', { notes: 'Price=$' + livePrice });
         await delay(400); continue;
       }
 
@@ -3843,8 +4026,19 @@ async function autoScan() {
       const zoneFreshness = getZoneFreshness(sym, primaryZone);
       console.log('[zone-mem] ' + sym + ': ' + zoneFreshness.label +
         ' (session touches: ' + zoneFreshness.touchCount + ')');
+
+      // Log zone selected regardless of outcome
+      logScanEvent(sym, 'ZONE_SELECTED',
+        primaryZone.direction + ' zone $' + primaryZone.priceRange + ' score=' + (primaryZone.confidence?.total || 0) + '/100',
+        { direction: primaryZone.direction, zoneLow: primaryZone.minPrice, zoneHigh: primaryZone.maxPrice,
+          zoneScore: primaryZone.confidence?.total || 0, touches: primaryZone.totalTouches,
+          notes: zoneFreshness.label });
+
       if (zoneFreshness.suppress) {
         console.log('[zone-mem] ' + sym + ': EXHAUSTED zone — signal suppressed');
+        logScanEvent(sym, 'ZONE_EXHAUSTED', 'Zone suppressed — too many retests this session (' + zoneFreshness.touchCount + ')',
+          { direction: primaryZone.direction, zoneLow: primaryZone.minPrice, zoneHigh: primaryZone.maxPrice,
+            zoneScore: primaryZone.confidence?.total || 0, touches: primaryZone.totalTouches });
         await delay(400); continue;
       }
 
@@ -4138,13 +4332,16 @@ async function autoScan() {
       }
 
       const m15bos = m15.length >= 8 ? confirmBOS_M15(m15, sweep.direction, bos.bos_level) : false;
+      // v5.2: stamp M15 confirmation on BOS object so scoreSetup can award optional +5
+      if (m15bos) bos.m15confirmed = true;
+      const bosType = m15bos ? 'M5+M15' : 'M5';
       const trendFired = await fireEvent(setup, 'trend', sym, async () => {
         if (TELEGRAM_MODE === 'FULL') {
           await sendTelegram(
             '✅ <b>' + asset + ' — TREND SHIFT CONFIRMED</b>\n\n' +
-            'Break of structure confirmed on M5' + (m15bos ? '/M15' : '') + '.\n' +
+            'Break of structure confirmed on ' + bosType + '.\n' +
             'Direction: <b>' + sweep.direction + '</b>\n\n' +
-            '⏳ Waiting for 50–61.8% pullback into entry zone.\n\n─────────────────\nAurum Signals'
+            '⏳ Waiting for pullback into entry zone.\n\n─────────────────\nAurum Signals'
           );
         }
       }, bos.candleIdx);
@@ -4222,7 +4419,35 @@ async function autoScan() {
           await invalidateSetup(sym, 'Pullback exceeded 70% retracement.');
           resetSetup(sym, 'Pullback > 70%');
         } else {
-          console.log('[' + sym + '] Waiting for pullback (candle ' + curCandleIdx + ')');
+          // ── CONTINUATION ENTRY CHECK ────────────────────────────
+          // No pullback formed — check for strong momentum continuation
+          const contResult = detectContinuation(m5, disp.candleIdx, sweep.direction, currentATR);
+          if (contResult.found) {
+            console.log('[' + sym + '] Continuation entry detected — ' + contResult.reason);
+            // Treat as a synthetic pullback object with CONTINUATION type
+            const contPb = {
+              found:       true,
+              entry:       contResult.entry,
+              retracement: 0,
+              tier:        'CONTINUATION',
+              pbScore:     10,   // flat score, -10 penalty applied in scoreSetup
+              tierLabel:   'Continuation (no pullback)',
+              entryType:   'CONTINUATION',
+              sl:          contResult.sl,
+            };
+            // Fire pullback event with continuation flag
+            const contFired = await fireEvent(setup, 'pullback', sym, async () => {
+              if (TELEGRAM_MODE === 'FULL') {
+                await sendTelegram('⚡ <b>' + asset + ' — CONTINUATION ENTRY DETECTED</b>\n\nStrong momentum — no pullback formed.\nRunning quality checks...\n\n─────────────────\nAurum Signals');
+              }
+            });
+            if (contFired) {
+              logStageUpdate(setup, 'pullback');
+              setup._continuationEntry = contPb; // carry for signal generation
+            }
+          } else {
+            console.log('[' + sym + '] Waiting for pullback (candle ' + curCandleIdx + ') | ' + contResult.reason);
+          }
         }
         await delay(400); continue;
       }
@@ -4290,8 +4515,16 @@ async function autoScan() {
           entryResult.confidence + ' | ' + (entryResult.entry_reason?.[0] || ''));
       }
 
-      const sl  = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5);
-      const tps = calcTP(sweep.direction, pb.entry, sl, levels);
+      // ── RESOLVE PULLBACK OBJECT (PULLBACK or CONTINUATION) ────
+      // Continuation entries store their synthetic pb on setup._continuationEntry
+      const activePb     = setup._continuationEntry || pb;
+      const entryType    = activePb.entryType || 'PULLBACK';
+      const isContinuation = entryType === 'CONTINUATION';
+
+      const sl  = isContinuation
+        ? activePb.sl  // continuation uses tighter SL from detectContinuation
+        : calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5);
+      const tps = calcTP(sweep.direction, activePb.entry, sl, levels);
 
       if (tps.rr1 < 1.5) {
         console.log('[' + sym + '] R:R ' + tps.rr1 + ' below minimum — no signal');
@@ -4299,25 +4532,32 @@ async function autoScan() {
       }
 
       const avgRange = m5.slice(-10).reduce((s,c) => s + range(c), 0) / 10;
-      const qf = runQualityFilters(m5, m15, sweep, disp, bos, pb,
-        levels, sweep.direction, parseFloat(pb.entry.toFixed(3)), tps.tp1, sess, avgRange);
+      const qf = runQualityFilters(m5, m15, sweep, disp, bos, activePb,
+        levels, sweep.direction, parseFloat(activePb.entry.toFixed(3)), tps.tp1, sess, avgRange);
       if (!qf.pass) {
         console.log('[' + sym + '] Quality filter [' + qf.failedFilter + ']: ' + qf.reason);
         await delay(400); continue;
       }
 
-      const scoreResult = scoreSetup(sess, sessionOk, sweep, disp, bos, pb,
+      const scoreResult = scoreSetup(sess, sessionOk, sweep, disp, bos, activePb,
         volatility.ok === true || volatility.ok === undefined, directionalBias, biasPenalty);
 
+      // Continuation penalty: -10 (higher risk, no pullback confirmation)
+      if (isContinuation) {
+        scoreResult.total = Math.max(scoreResult.total - 10, 0);
+        scoreResult.breakdown.continuationPenalty = { penalty: -10, note: 'No pullback confirmation' };
+        scoreResult.tier  = scoreResult.total >= 70 ? 'HIGH' : scoreResult.total >= 55 ? 'VALID' : 'LOW';
+        scoreResult.grade = scoreResult.total >= 85 ? 'A+' : scoreResult.total >= 75 ? 'A' : scoreResult.total >= 70 ? 'B+' : 'B';
+        console.log('[' + sym + '] Continuation penalty -10 applied → score=' + scoreResult.total);
+      }
+
       // Aggressive engine boosts score when it confirms — additive, not replacement
-      // Standard score gate still applies regardless
       let finalScore = scoreResult.total;
       if (entryResult.type === 'ENTRY_READY') {
-        // Blend: average of structural score and aggressive confidence, +5 bonus
         finalScore = Math.min(Math.round((scoreResult.total + entryResult.confidence) / 2) + 5, 100);
         scoreResult.total = finalScore;
         scoreResult.grade = finalScore >= 85 ? 'A+' : finalScore >= 75 ? 'A' : scoreResult.grade;
-        scoreResult.tier  = finalScore >= 75 ? 'HIGH' : scoreResult.tier;
+        scoreResult.tier  = finalScore >= 70 ? 'HIGH' : scoreResult.tier;
         console.log('[' + sym + '] Score: ' + scoreResult.total + ' → ' + finalScore +
           ' (structural + aggressive confirmation) (' + scoreResult.grade + ')');
       } else {
@@ -4326,9 +4566,9 @@ async function autoScan() {
           (entryResult.type === 'NO_ENTRY' ? ' [aggressive engine: no pattern]' : ''));
       }
 
-      // Tier gate: only HIGH (≥75) gets a full signal
+      // Tier gate: only HIGH (≥70) gets a full signal (v5.2: was 75)
       if (scoreResult.tier !== 'HIGH') {
-        console.log('[' + sym + '] Score ' + finalScore + ' tier=' + scoreResult.tier + ' — below 75 threshold');
+        console.log('[' + sym + '] Score ' + finalScore + ' tier=' + scoreResult.tier + ' — below 70 threshold');
         await delay(400); continue;
       }
 
@@ -4347,16 +4587,17 @@ async function autoScan() {
       }
 
       // ── GENERATE FULL SIGNAL ──────────────────────────────────
-      const sigKey = sym + '_' + sweep.direction + '_' + parseFloat(pb.entry.toFixed(2));
+      const sigKey = sym + '_' + sweep.direction + '_' + parseFloat(activePb.entry.toFixed(2));
       if (sentSignals.has(sigKey)) {
         console.log('[' + sym + '] Signal already sent for this entry — blocked');
         await delay(400); continue;
       }
 
       const expiryUTC = new Date(Date.now() + minsLeft * 60000).toUTCString().split(' ')[4] + ' UTC';
+      const bosTypeLabel = bos.m15confirmed ? 'M5+M15' : 'M5';
       const rawSig = {
         id: Date.now(), asset: sym, direction: sweep.direction,
-        entry: parseFloat(pb.entry.toFixed(3)),
+        entry: parseFloat(activePb.entry.toFixed(3)),
         live_price: livePrice,
         stop_loss: sl, take_profit_1: tps.tp1, take_profit_2: tps.tp2,
         rr: tps.rr1, confidence: scoreResult.total,
@@ -4364,14 +4605,26 @@ async function autoScan() {
         entry_mode: entryResult.type === 'ENTRY_READY' ? entryResult.mode : 'STANDARD',
         session: sess, directional_bias: directionalBias,
         sweep_level: sweep.level?.label || '—',
-        pullback_pct: pb.retracement, expiry: expiryUTC,
-        atr: currentATR,                               // v5.2: position sizing
-        zoneFreshness: zoneFreshness?.label || null,   // v5.2: zone memory label
+        // v5.2 — flexible entry fields
+        entryType:        entryType,                          // 'PULLBACK' | 'CONTINUATION'
+        pullback_pct:     isContinuation ? null : activePb.retracement,
+        pullbackTier:     isContinuation ? null : activePb.tier,
+        pullbackTierLabel:isContinuation ? null : activePb.tierLabel,
+        displacementRatio: disp.ratio,
+        displacementStrength: disp.strength || 'VALID',      // 'STRONG' | 'VALID'
+        bosType:          bosTypeLabel,                       // 'M5' | 'M5+M15'
+        atr:              currentATR,
+        zoneFreshness:    zoneFreshness?.label || null,
+        expiry: expiryUTC,
         primaryZone: primaryZone
           ? { low: primaryZone.minPrice, high: primaryZone.maxPrice }
           : null,
-        reason: sess + ' ' + (sweep.level?.label||'') + ' sweep → ' +
-          sweep.direction.toLowerCase() + ' displacement (' + disp.ratio + '×) → BOS → ' + pb.retracement + '% pullback'
+        reason: isContinuation
+          ? sess + ' ' + (sweep.level?.label||'') + ' sweep → ' +
+            sweep.direction.toLowerCase() + ' strong momentum continuation (' + disp.ratio + '× displacement)'
+          : sess + ' ' + (sweep.level?.label||'') + ' sweep → ' +
+            sweep.direction.toLowerCase() + ' displacement (' + disp.ratio + '×) → ' +
+            bosTypeLabel + ' BOS → ' + activePb.retracement + '% pullback (' + (activePb.tierLabel||'') + ')'
       };
       rawSig.alert = formatSignalAlert(rawSig, currentATR);
 
@@ -4380,8 +4633,17 @@ async function autoScan() {
         setTimeout(() => sentSignals.delete(sigKey), 4 * 60 * 60 * 1000);
         setup.active = false;
         if (setup.tgAlerts) setup.tgAlerts.entry = true;
-        // Log entry
-        logEntryTriggered(setup, rawSig.entry, rawSig.stop_loss, [rawSig.take_profit_1, rawSig.take_profit_2].filter(Boolean));
+        // Log entry with v5.2 fields
+        logEntryTriggered(setup, rawSig.entry, rawSig.stop_loss,
+          [rawSig.take_profit_1, rawSig.take_profit_2].filter(Boolean), {
+            entryType:            rawSig.entryType,
+            pullbackPercent:      rawSig.pullback_pct,
+            pullbackTier:         rawSig.pullbackTier,
+            displacementRatio:    rawSig.displacementRatio,
+            displacementStrength: rawSig.displacementStrength,
+            bosType:              rawSig.bosType,
+            scoreBreakdown:       rawSig.scoreBreakdown,
+          });
         // Start trade result monitor
         tradeMonitor[sym] = {
           setupId:      setup.id,
@@ -4440,6 +4702,86 @@ app.listen(PORT, () => {
   // Run once immediately on startup (after 10s to let server settle)
   setTimeout(autoScan, 10000);
   console.log('[scheduler] Auto-scan started — every 5 minutes during sessions');
-  // Restore last 24h of logs from Sheets after Railway restarts
-  hydrateFromSheets(_setupLogs).catch(e => console.error('[boot-hydrate]', e.message));
+  // On boot: write sheet headers if row 1 is empty, then restore last 24h of logs
+  ensureSheetHeaders()
+    .then(() => hydrateFromSheets(_setupLogs))
+    .catch(e => console.error('[boot]', e.message));
 });
+
+// ── ENSURE SHEET HEADERS — runs once on boot ──────────────────────────────
+// Writes the 18-column header row to Aurum!A1:R1 only if it is empty.
+// Safe to run on every deploy — skips silently if headers already exist.
+async function ensureSheetHeaders() {
+  const sheetId   = process.env.GOOGLE_SHEET_ID;
+  const credsJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!sheetId || !credsJson) {
+    console.log("[sheets] Env vars not set — skipping header setup");
+    return;
+  }
+  try {
+    const { google } = require("googleapis");
+    const auth = new google.auth.GoogleAuth({
+      credentials: JSON.parse(credsJson),
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+    });
+    const sheets = google.sheets({ version: "v4", auth });
+
+    // Check if A1 already has content
+    const check = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId,
+      range: "Aurum!A1",
+    });
+    if (check.data.values && check.data.values[0]?.[0]) {
+      console.log("[sheets] Headers already present — skipping");
+      return;
+    }
+
+    // Write headers
+    const HEADERS = [
+      "Timestamp", "Setup ID", "Symbol", "Direction", "Session",
+      "Zone Low", "Zone High", "Zone Score", "Touches", "Event",
+      "Entry Price", "Stop Loss", "TP1", "TP2", "Candles to Event",
+      "Result", "Invalidation Reason", "Stages Confirmed",
+    ];
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: sheetId,
+      range: "Aurum!A1:R1",
+      valueInputOption: "RAW",
+      requestBody: { values: [HEADERS] },
+    });
+
+    // Get tab sheetId for formatting
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
+    const tab  = meta.data.sheets.find(s => s.properties.title === "Aurum");
+    if (!tab) { console.log("[sheets] Aurum tab not found — headers written, no formatting"); return; }
+    const tabId = tab.properties.sheetId;
+
+    // Apply formatting in one batchUpdate
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: sheetId,
+      requestBody: { requests: [
+        { repeatCell: {
+          range: { sheetId: tabId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 18 },
+          cell: { userEnteredFormat: {
+            backgroundColor: { red: 0.098, green: 0.098, blue: 0.098 },
+            textFormat: { foregroundColor: { red: 1.0, green: 0.843, blue: 0.0 }, bold: true, fontSize: 10 },
+            horizontalAlignment: "CENTER",
+          }},
+          fields: "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
+        }},
+        { updateSheetProperties: {
+          properties: { sheetId: tabId, gridProperties: { frozenRowCount: 1 } },
+          fields: "gridProperties.frozenRowCount",
+        }},
+        { updateSheetProperties: {
+          properties: { sheetId: tabId, tabColor: { red: 1.0, green: 0.843, blue: 0.0 } },
+          fields: "tabColor",
+        }},
+      ]},
+    });
+
+    console.log("[sheets] Header setup complete — Aurum tab formatted");
+  } catch(e) {
+    console.error("[sheets] Header setup failed (non-fatal):", e.message);
+  }
+}
