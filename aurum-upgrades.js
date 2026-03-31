@@ -154,9 +154,13 @@ function getZoneFreshness(sym, zone) {
 
   const count = entry.touchCount;
 
+  // v5.4: suppress raised from 4→6 touches
+  // (XAG was exhausted 63% of scans — too aggressive for current market)
   if (count <= 1) return { fresh: true,  touchCount: count, label: '🟢 FRESH (1st test)',           suppress: false };
-  if (count === 2) return { fresh: false, touchCount: count, label: '🟡 RETESTED (2nd test)',         suppress: false };
-  if (count === 3) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (3rd test)',          suppress: false };
+  if (count === 2) return { fresh: false, touchCount: count, label: '🟡 RETESTED (2nd test)',        suppress: false };
+  if (count === 3) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (3rd test)',         suppress: false };
+  if (count === 4) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (4th test)',         suppress: false };
+  if (count === 5) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (5th test)',         suppress: false };
   return             { fresh: false, touchCount: count, label: '🔴 EXHAUSTED (' + count + ' tests)', suppress: true  };
 }
 

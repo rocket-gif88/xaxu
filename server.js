@@ -528,12 +528,11 @@ function deriveM15FromM5(m5Candles) {
 
 
 // --- ATR RANGE VALIDATION ----------------------------------------------------
-// v5.2: Explicit absolute ATR ranges for XAUUSD (M5 candle basis):
-//   < 5  → low volatility, suppress (choppy/dead market)
-//   5–20 → valid trading range
-//   > 20 → news spike, suppress (unpredictable slippage)
+// v5.4: ATR ranges recalibrated from live data (mean ATR=3.18, max=9.63 in first 2 days)
+//   XAUUSD: < 1.5 → dead/illiquid, 1.5–20 → valid, > 20 → news spike
+//   (was 5–20: suppressed 57% of valid scans)
 const ATR_RANGE = {
-  XAUUSD: { min: 5.0,  max: 20.0 },  // explicit $ range per M5 candle — XAU/USD
+  XAUUSD: { min: 1.5,  max: 20.0 },  // recalibrated from live data — was 5.0
   XAGUSD: { min: 0.03, max: 1.50  }  // $0.03–$1.50 per M5 candle — SLV ETF
 };
 function checkATR(sym, atrValues) {
@@ -1139,17 +1138,18 @@ function detectSweep(candles, levels) {
 }
 
 // ─── DISPLACEMENT ──────────────────────────────────────────────────────────
-// v5.2: Minimum threshold lowered from 1.5x → 1.2x.
+// v5.4: Minimum threshold lowered from 1.2x → 1.0x.
 //   ≥1.5x = STRONG  (max score)
-//   ≥1.2x = VALID   (reduced score)
-//   <1.2x = invalid (unchanged)
+//   ≥1.2x = VALID+  (good score)
+//   ≥1.0x = VALID   (base score)
+//   <1.0x = invalid
 // Must occur within 1–3 candles after sweep candle
 // Returns: { found, candleIdx, bodySize, avgBody, ratio, strength }
 function detectDisplacement(candles, sweepIdx, direction, minRatioOverride) {
   // minRatioOverride: optional — allows caller to require stricter displacement
   const MIN_RATIO_OVERRIDE = minRatioOverride || null;
-  // v5.2: Min ratio 1.2x. STRONG=1.5x+, VALID=1.2–1.5x
-  const BODY_MULT  = 1.2;  // was 1.5 — lowered to accept valid displacement
+  // v5.4: Min ratio 1.0x. STRONG=1.5x+, VALID=1.0–1.5x (was 1.2x — live data showed collapse at displacement stage)
+  const BODY_MULT  = 1.0;  // was 1.2 → 1.0 based on live data
   const CLOSE_ZONE = 0.25;
   const slice = candles.slice(Math.max(0, sweepIdx - 10), sweepIdx);
   if (slice.length < 3) return { found: false, reason: 'insufficient candle history' };
@@ -1171,7 +1171,7 @@ function detectDisplacement(candles, sweepIdx, direction, minRatioOverride) {
       : (c.h - c.c) / r >= (1 - CLOSE_ZONE);
     if (bodyStrong && dirOk && closeZone) {
       const ratio    = parseFloat((b / avgBody10).toFixed(2));
-      const strength = ratio >= 1.5 ? 'STRONG' : 'VALID'; // v5.2 strength label
+      const strength = ratio >= 1.5 ? 'STRONG' : ratio >= 1.2 ? 'VALID+' : 'VALID'; // v5.4 strength label
       return { found: true, candleIdx: idx,
                ratio, avgBody: avgBody10, weakGap,
                strength,  // 'STRONG' | 'VALID'
@@ -1669,12 +1669,13 @@ function scoreSetup(sessionLabel, sessionOk, sweep, displacement, bos, pullback,
   if (!displacement || !displacement.found) {
     breakdown.displacement = { score: 0, max: 20, note: 'No displacement detected' };
   } else {
-    // v5.2: 1.2x = VALID (+12), 1.5x+ = STRONG (+20)
+    // v5.4: 1.0x = VALID (+8), 1.2x = VALID+ (+12), 1.5x+ = STRONG (+20)
     const dispScore = displacement.ratio >= 3.0 ? 20
                     : displacement.ratio >= 2.5 ? 18
                     : displacement.ratio >= 2.0 ? 16
                     : displacement.ratio >= 1.5 ? 20   // STRONG
-                    : displacement.ratio >= 1.2 ? 12   // VALID
+                    : displacement.ratio >= 1.2 ? 12   // VALID+
+                    : displacement.ratio >= 1.0 ? 8    // VALID
                     : 0;
     const dispFinal = displacement.weakGap ? Math.max(dispScore - 3, 0) : dispScore;
     breakdown.displacement = { score: dispFinal, max: 20, ratio: displacement.ratio, strength: displacement.strength || 'VALID' };
@@ -2217,7 +2218,7 @@ app.get('/analyze/:sym', async (req, res) => {
                 // Zone score gate applies here too
                 if (!analyzeZoneAllowSignal) {
                   setupState = 'invalidated';
-                  log.push('Signal blocked — zone score ' + pzConf + '/100 < 60 (zone too weak)');
+                  log.push('Signal blocked — zone score ' + pzConf + '/100 < 50 (zone too weak)');
                 } else if (scoreResult2.tier !== 'HIGH') {
                   setupState = 'invalidated';
                   log.push('Signal not generated — score ' + confidence + '/100 tier=' + scoreResult2.tier + ' (requires HIGH ≥75)');
@@ -2314,16 +2315,17 @@ app.get('/analyze/:sym', async (req, res) => {
       (pzConf >= 60 ? ' ✓' : ' ⚠ low'));
   }
   // Zone score gate for analyze route
-  // < 60  → no pre-signals, no signals
-  // 60–74 → pre-signals allowed, no aggressive entry
+  // v5.4: threshold 60→50
+  // < 50  → no pre-signals, no signals
+  // 50–74 → pre-signals allowed, no aggressive entry
   // ≥ 75  → full system
   const analyzeZoneAllowAggressive = pzConf >= 75;
-  const analyzeZoneAllowSignal     = pzConf >= 60;
+  const analyzeZoneAllowSignal     = pzConf >= 50;
   const sweepPotentials = (primaryZone && analyzeZoneAllowSignal && approachingLevels.length)
     ? detectSweepPotential(livePrice, approachingLevels, m5)
     : [];
   if (!analyzeZoneAllowSignal && primaryZone) {
-    log.push('Zone score ' + pzConf + '/100 < 60 — signals suppressed (zone not strong enough)');
+    log.push('Zone score ' + pzConf + '/100 < 50 — signals suppressed (zone not strong enough)');
   } else if (!analyzeZoneAllowAggressive && primaryZone) {
     log.push('Zone score ' + pzConf + '/100 [60–74] — standard entry only, aggressive suppressed');
   }
@@ -2391,7 +2393,7 @@ app.get('/analyze/:sym', async (req, res) => {
       primary_zone:      primaryZone,
       zone_confidence:   pzConf,
       zone_direction:    primaryZone?.direction || null,
-      zone_score_tier:   pzConf >= 75 ? 'FULL' : pzConf >= 60 ? 'STANDARD' : 'BLOCKED',
+      zone_score_tier:   pzConf >= 75 ? 'FULL' : pzConf >= 50 ? 'STANDARD' : 'BLOCKED',
       zone_grade:        pzGrade,
       directional_bias:  directionalBias,
       bias_score:        analyzeGlobalBias?.score || 0,
@@ -3103,9 +3105,9 @@ app.get('/debug/:sym', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.json({
-  status:'ok', version:'5.3',
+  status:'ok', version:'5.4',
   engine:'Liquidity Sweep — Adaptive Execution Engine (M5+M15)',
-  rules: ['PDH/PDL/ASH/ASL/EQH/EQL levels','0.02% sweep break required','1.2–3× body displacement','M5 BOS required / M15 optional +5','30–70% pullback (tiered scoring)','continuation entry (STRONG disp only)','confidence ≥ 70 (5×20 weighted)','ATR 5–20 XAUUSD','10-candle time decay']
+  rules: ['PDH/PDL/ASH/ASL/EQH/EQL levels','0.02% sweep break required','1.0–3× body displacement','M5 BOS required / M15 optional +5','30–70% pullback (tiered scoring)','continuation entry (STRONG disp only)','zone score ≥ 50, confidence ≥ 70','ATR 1.5–20 XAUUSD (recalibrated)','10-candle time decay']
 }));
 
 // ═══════════════════════════════════════════════════════════════
@@ -4205,7 +4207,7 @@ async function autoScan() {
       const zoneScore = primaryZone.confidence?.total || 0;
       console.log('[' + sym + '] Primary zone: ' + primaryZone.direction +
         ' ' + primaryZone.priceRange + ' score=' + zoneScore + '/100' +
-        (zoneScore >= 75 ? ' [FULL]' : zoneScore >= 60 ? ' [STANDARD]' : ' [BLOCKED]'));
+        (zoneScore >= 75 ? ' [FULL]' : zoneScore >= 50 ? ' [STANDARD]' : ' [BLOCKED]'));
 
       // ── ZONE DETECTION COOLDOWN ────────────────────────────────
       // (timing already declared above)
@@ -4249,27 +4251,28 @@ async function autoScan() {
       }
 
       // ── ZONE SCORE GATE ────────────────────────────────────────
-      // < 60  → no signals at all — zone not strong enough
-      // 60–74 → standard entry only, aggressive engine suppressed
+      // v5.4: threshold lowered 60→50 (live data: max score=70, 79% blocked under 60)
+      // < 50  → no signals at all
+      // 50–74 → standard entry only, aggressive engine suppressed
       // ≥ 75  → full system: standard + aggressive
-      if (zoneScore < 60) {
-        console.log('[' + sym + '] Zone score ' + zoneScore + ' < 60 — all signals suppressed');
-        // Cancel any active setup that depended on this zone
+      if (zoneScore < 50) {
+        console.log('[' + sym + '] Zone score ' + zoneScore + ' < 50 — all signals suppressed');
+        logScanEvent(sym, 'ZONE_SCORE_BLOCKED', 'Score ' + zoneScore + '/100 below 50 minimum',
+          { direction: primaryZone.direction, zoneLow: primaryZone.minPrice, zoneHigh: primaryZone.maxPrice,
+            zoneScore, touches: primaryZone.totalTouches });
         if (setup && setup.active) {
-          console.log('[' + sym + '] Cancelling active setup — zone score ' + zoneScore + ' fell below 60');
-          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 60).');
-          resetSetup(sym, 'Zone score below 60');
+          console.log('[' + sym + '] Cancelling active setup — zone score ' + zoneScore + ' fell below 50');
+          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 50).');
+          resetSetup(sym, 'Zone score below 50');
         }
         await delay(400); continue;
       }
 
       // ── ZONE STRENGTH CHECK AT TREND SHIFT+ STAGES ─────────────
-      // If setup has progressed past trend shift but zone score is now < 60,
-      // cancel — do not proceed to pullback or entry with a weak zone.
       if (setup && setup.active && setup.events?.trend) {
-        if (zoneScore < 60) {
-          console.log('[' + sym + '] Setup cancelled at trend+ stage — zone score ' + zoneScore + ' < 60');
-          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 60).');
+        if (zoneScore < 50) {
+          console.log('[' + sym + '] Setup cancelled at trend+ stage — zone score ' + zoneScore + ' < 50');
+          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 50).');
           resetSetup(sym, 'Zone too weak at trend+ stage');
           await delay(400); continue;
         }
