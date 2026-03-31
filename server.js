@@ -72,7 +72,7 @@ async function appendToSheet(row) {
     if (!sheets)  return;
     await sheets.spreadsheets.values.append({
       spreadsheetId: sheetId,
-      range:         'Aurum!A:R',
+      range:         'Aurum!A:S',
       valueInputOption: 'RAW',
       insertDataOption: 'INSERT_ROWS',
       requestBody: { values: [row] },
@@ -258,7 +258,96 @@ function logTradeResult(setupId, result) {
   } catch(e) { console.error('[log] logTradeResult error:', e.message); }
 }
 
-// ── SCAN-LEVEL EVENT LOGGING ──────────────────────────────────────────────
+// ── TRADE MONITOR PERSISTENCE ─────────────────────────────────────────────
+// Saves open trade monitor state to Sheets on entry so it survives Railway restarts.
+// On boot, restores any monitors that haven't resolved yet.
+// Sheet tab: AurumTrades  Columns: A=ts B=setupId C=sym D=dir E=entry F=sl G=tp1 H=tp2 I=status
+
+async function persistTradeMonitor(sym, monData) {
+  try {
+    const sheetId = process.env.GOOGLE_SHEET_ID;
+    const sheets  = await getSheetsClient();
+    if (!sheetId || !sheets) return;
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: sheetId,
+      range:         'AurumTrades!A:I',
+      valueInputOption: 'RAW',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: [[
+        new Date().toISOString(),
+        monData.setupId, sym, monData.direction,
+        monData.entry, monData.sl, monData.tp1, monData.tp2,
+        'OPEN'
+      ]]},
+    });
+    console.log('[persist] Trade monitor saved for ' + sym + ' ' + monData.direction + ' @ ' + monData.entry);
+  } catch(e) { console.error('[persist] Failed to save trade monitor:', e.message); }
+}
+
+async function updateTradeMonitorStatus(setupId, status) {
+  // Marks a monitor as CLOSED in AurumTrades — best-effort, non-blocking
+  try {
+    const sheetId = process.env.GOOGLE_SHEET_ID;
+    const sheets  = await getSheetsClient();
+    if (!sheetId || !sheets) return;
+    const resp = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId, range: 'AurumTrades!A:I',
+    });
+    const rows = resp.data.values || [];
+    for (let i = 1; i < rows.length; i++) {
+      if (rows[i][1] === setupId && rows[i][8] === 'OPEN') {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: sheetId,
+          range:         'AurumTrades!I' + (i + 1),
+          valueInputOption: 'RAW',
+          requestBody: { values: [[status]] },
+        });
+        console.log('[persist] Trade monitor ' + setupId + ' marked ' + status);
+        return;
+      }
+    }
+  } catch(e) { console.error('[persist] Failed to update trade monitor:', e.message); }
+}
+
+async function restoreTradeMonitors() {
+  try {
+    const sheetId = process.env.GOOGLE_SHEET_ID;
+    const sheets  = await getSheetsClient();
+    if (!sheetId || !sheets) {
+      console.log('[restore] Sheets not configured — skipping trade monitor restore');
+      return;
+    }
+    const resp = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId, range: 'AurumTrades!A:I',
+    });
+    const rows   = resp.data.values || [];
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000; // only last 24h
+    let restored = 0;
+    for (const row of rows.slice(1)) {
+      const [ts, setupId, sym, dir, entry, sl, tp1, tp2, status] = row;
+      if (status !== 'OPEN') continue;
+      if (new Date(ts).getTime() < cutoff) continue;
+      if (!sym || !['XAUUSD','XAGUSD'].includes(sym)) continue;
+      // Only restore if no monitor already active for this symbol
+      if (tradeMonitor[sym]) continue;
+      tradeMonitor[sym] = {
+        setupId,
+        direction:    dir,
+        entry:        parseFloat(entry),
+        sl:           parseFloat(sl),
+        tp1:          parseFloat(tp1)  || null,
+        tp2:          parseFloat(tp2)  || null,
+        maxFav:       parseFloat(entry),
+        resultLogged: false,
+        startedAt:    new Date(ts).getTime(),
+        _restored:    true,
+      };
+      restored++;
+      console.log('[restore] Trade monitor restored: ' + sym + ' ' + dir + ' @ ' + entry);
+    }
+    if (restored > 0) console.log('[restore] ✓ Restored ' + restored + ' open trade monitor(s)');
+  } catch(e) { console.error('[restore] Failed (non-fatal):', e.message); }
+}
 // Logs every engine decision to Sheets — not just signals.
 // Non-blocking, never throws. Gives full visibility into filter logic.
 //
@@ -2794,53 +2883,123 @@ app.get('/setup-sheets', async (req, res) => {
   }
 });
 
-// ── GET /stats — setup analytics
+// ── GET /stats — setup analytics (v5.3)
 app.get('/stats', (req, res) => {
   try {
     const logs = readAllLogs();
-    const total        = logs.length;
-    const entries      = logs.filter(l => l.entryTriggered).length;
-    const invalidations= logs.filter(l => l.invalidated && !l.entryTriggered).length;
-    const withResult   = logs.filter(l => l.result);
-    const wins         = withResult.filter(l => l.result === 'TP1' || l.result === 'TP2').length;
-    const losses       = withResult.filter(l => l.result === 'SL').length;
-    const winRate      = withResult.length > 0 ? Math.round(wins / withResult.length * 100) : null;
-    const avgZoneScore = total > 0
-      ? parseFloat((logs.reduce((s,l) => s + (l.zone?.score||0), 0) / total).toFixed(1))
-      : null;
+    const total         = logs.length;
+    const entries       = logs.filter(l => l.entryTriggered).length;
+    const invalidations = logs.filter(l => l.invalidated && !l.entryTriggered).length;
+    const withResult    = logs.filter(l => l.result);
+    const wins          = withResult.filter(l => l.result === 'TP1' || l.result === 'TP2').length;
+    const losses        = withResult.filter(l => l.result === 'SL').length;
+    const winRate       = withResult.length > 0 ? Math.round(wins / withResult.length * 100) : null;
+    const avgZoneScore  = total > 0
+      ? parseFloat((logs.reduce((s,l) => s + (l.zone?.score||0), 0) / total).toFixed(1)) : null;
     const conversionRate = total > 0 ? Math.round(entries / total * 100) : null;
 
-    // Per-session breakdown
+    // ── Per-session breakdown ────────────────────────────────────
     const bySession = {};
     for (const l of logs) {
       const sess = l.session || 'UNKNOWN';
-      if (!bySession[sess]) bySession[sess] = { setups:0, entries:0, wins:0 };
+      if (!bySession[sess]) bySession[sess] = { setups:0, entries:0, wins:0, losses:0 };
       bySession[sess].setups++;
       if (l.entryTriggered) bySession[sess].entries++;
       if (l.result === 'TP1' || l.result === 'TP2') bySession[sess].wins++;
+      if (l.result === 'SL') bySession[sess].losses++;
     }
 
-    // By direction
-    const byDir = { BUY:{setups:0,entries:0,wins:0}, SELL:{setups:0,entries:0,wins:0} };
+    // ── By direction ─────────────────────────────────────────────
+    const byDir = { BUY:{setups:0,entries:0,wins:0,losses:0}, SELL:{setups:0,entries:0,wins:0,losses:0} };
     for (const l of logs) {
       const d = l.direction;
       if (byDir[d]) {
         byDir[d].setups++;
         if (l.entryTriggered) byDir[d].entries++;
         if (l.result === 'TP1' || l.result === 'TP2') byDir[d].wins++;
+        if (l.result === 'SL') byDir[d].losses++;
       }
     }
+
+    // ── v5.3: By entry type (PULLBACK vs CONTINUATION) ───────────
+    const byEntryType = {};
+    for (const l of logs.filter(l => l.entryTriggered)) {
+      const t = l.entryType || 'PULLBACK';
+      if (!byEntryType[t]) byEntryType[t] = { entries:0, wins:0, losses:0 };
+      byEntryType[t].entries++;
+      if (l.result === 'TP1' || l.result === 'TP2') byEntryType[t].wins++;
+      if (l.result === 'SL') byEntryType[t].losses++;
+    }
+
+    // ── v5.3: By pullback tier ────────────────────────────────────
+    const byPullbackTier = {};
+    for (const l of logs.filter(l => l.entryTriggered && l.pullbackTier)) {
+      const t = l.pullbackTier;
+      if (!byPullbackTier[t]) byPullbackTier[t] = { entries:0, wins:0, losses:0, avgPct:[] };
+      byPullbackTier[t].entries++;
+      if (l.result === 'TP1' || l.result === 'TP2') byPullbackTier[t].wins++;
+      if (l.result === 'SL') byPullbackTier[t].losses++;
+      if (l.pullbackPercent) byPullbackTier[t].avgPct.push(l.pullbackPercent);
+    }
+    // Collapse avgPct arrays into averages
+    for (const t of Object.keys(byPullbackTier)) {
+      const arr = byPullbackTier[t].avgPct;
+      byPullbackTier[t].avgPct = arr.length
+        ? parseFloat((arr.reduce((s,v)=>s+v,0)/arr.length).toFixed(1)) : null;
+    }
+
+    // ── v5.3: By displacement strength ───────────────────────────
+    const byDisplacement = {};
+    for (const l of logs.filter(l => l.entryTriggered && l.displacementStrength)) {
+      const t = l.displacementStrength;
+      if (!byDisplacement[t]) byDisplacement[t] = { entries:0, wins:0, losses:0, avgRatio:[] };
+      byDisplacement[t].entries++;
+      if (l.result === 'TP1' || l.result === 'TP2') byDisplacement[t].wins++;
+      if (l.result === 'SL') byDisplacement[t].losses++;
+      if (l.displacementRatio) byDisplacement[t].avgRatio.push(l.displacementRatio);
+    }
+    for (const t of Object.keys(byDisplacement)) {
+      const arr = byDisplacement[t].avgRatio;
+      byDisplacement[t].avgRatio = arr.length
+        ? parseFloat((arr.reduce((s,v)=>s+v,0)/arr.length).toFixed(2)) : null;
+    }
+
+    // ── v5.3: By BOS type ─────────────────────────────────────────
+    const byBOS = {};
+    for (const l of logs.filter(l => l.entryTriggered && l.bosType)) {
+      const t = l.bosType;
+      if (!byBOS[t]) byBOS[t] = { entries:0, wins:0, losses:0 };
+      byBOS[t].entries++;
+      if (l.result === 'TP1' || l.result === 'TP2') byBOS[t].wins++;
+      if (l.result === 'SL') byBOS[t].losses++;
+    }
+
+    // ── Open trades ───────────────────────────────────────────────
+    const openTrades = Object.entries(tradeMonitor)
+      .filter(([, m]) => m && !m.resultLogged)
+      .map(([sym, m]) => ({
+        sym, direction: m.direction, entry: m.entry,
+        sl: m.sl, tp1: m.tp1, tp2: m.tp2,
+        openMins: Math.round((Date.now() - m.startedAt) / 60000),
+      }));
 
     res.json({
       totalSetups:      total,
       entriesTriggered: entries,
       invalidations,
       winRate,
+      wins,
       losses,
       avgZoneScore,
       conversionRate,
+      openTrades,
       bySession,
       byDirection:      byDir,
+      // v5.3 breakdowns
+      byEntryType,
+      byPullbackTier,
+      byDisplacement,
+      byBOS,
       recentSetups:     logs.slice(-10).reverse(),
     });
   } catch(e) {
@@ -3871,6 +4030,7 @@ function checkTradeMonitor(sym, livePrice, m5) {
   if (result) {
     mon.resultLogged = true;
     logTradeResult(mon.setupId, result);
+    updateTradeMonitorStatus(mon.setupId, result).catch(() => {});
     console.log('[monitor] ' + sym + ': ' + result + ' hit — ' + mon.direction +
       ' entry=' + mon.entry + ' sl=' + mon.sl + ' tp1=' + mon.tp1);
     tradeMonitor[sym] = null; // clear monitor
@@ -4656,6 +4816,8 @@ async function autoScan() {
           resultLogged: false,
           startedAt:    Date.now(),
         };
+        // Persist to Sheets so monitor survives Railway restarts
+        persistTradeMonitor(sym, tradeMonitor[sym]).catch(() => {});
         console.log('[monitor] ' + sym + ': trade monitor started — ' +
           rawSig.direction + ' entry=' + rawSig.entry + ' SL=' + rawSig.stop_loss +
           ' TP1=' + rawSig.take_profit_1 + ' TP2=' + rawSig.take_profit_2);
@@ -4702,86 +4864,67 @@ app.listen(PORT, () => {
   // Run once immediately on startup (after 10s to let server settle)
   setTimeout(autoScan, 10000);
   console.log('[scheduler] Auto-scan started — every 5 minutes during sessions');
-  // On boot: write sheet headers if row 1 is empty, then restore last 24h of logs
+  // On boot: write sheet headers, restore logs + open trade monitors
   ensureSheetHeaders()
     .then(() => hydrateFromSheets(_setupLogs))
+    .then(() => restoreTradeMonitors())
     .catch(e => console.error('[boot]', e.message));
 });
 
 // ── ENSURE SHEET HEADERS — runs once on boot ──────────────────────────────
-// Writes the 18-column header row to Aurum!A1:R1 only if it is empty.
-// Safe to run on every deploy — skips silently if headers already exist.
+// Writes 19-col Aurum headers + creates AurumTrades tab.
+// Safe to run on every deploy — skips if already present.
 async function ensureSheetHeaders() {
   const sheetId   = process.env.GOOGLE_SHEET_ID;
   const credsJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!sheetId || !credsJson) {
-    console.log("[sheets] Env vars not set — skipping header setup");
-    return;
-  }
+  if (!sheetId || !credsJson) { console.log("[sheets] Env vars not set — skipping"); return; }
   try {
     const { google } = require("googleapis");
-    const auth = new google.auth.GoogleAuth({
-      credentials: JSON.parse(credsJson),
-      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-    });
+    const auth   = new google.auth.GoogleAuth({ credentials: JSON.parse(credsJson), scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
     const sheets = google.sheets({ version: "v4", auth });
 
-    // Check if A1 already has content
-    const check = await sheets.spreadsheets.values.get({
-      spreadsheetId: sheetId,
-      range: "Aurum!A1",
-    });
-    if (check.data.values && check.data.values[0]?.[0]) {
-      console.log("[sheets] Headers already present — skipping");
-      return;
+    // ── Aurum tab — 19 cols (A:S) ─────────────────────────────
+    const aurumCheck = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: "Aurum!A1" });
+    if (!aurumCheck.data.values?.[0]?.[0]) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: sheetId, range: "Aurum!A1:S1", valueInputOption: "RAW",
+        requestBody: { values: [["Timestamp","Setup ID","Symbol","Direction","Session","Zone Low","Zone High","Zone Score","Touches","Event","Entry Price","Stop Loss","TP1","TP2","Candles to Event","Result","Invalidation Reason","Stages Confirmed","Notes (v5.3)"]] },
+      });
+      console.log("[sheets] Aurum headers written (19 cols)");
     }
 
-    // Write headers
-    const HEADERS = [
-      "Timestamp", "Setup ID", "Symbol", "Direction", "Session",
-      "Zone Low", "Zone High", "Zone Score", "Touches", "Event",
-      "Entry Price", "Stop Loss", "TP1", "TP2", "Candles to Event",
-      "Result", "Invalidation Reason", "Stages Confirmed",
-    ];
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: sheetId,
-      range: "Aurum!A1:R1",
-      valueInputOption: "RAW",
-      requestBody: { values: [HEADERS] },
-    });
+    // ── AurumTrades tab ───────────────────────────────────────
+    const meta       = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
+    const hasTrades  = meta.data.sheets.some(s => s.properties.title === "AurumTrades");
+    if (!hasTrades) {
+      await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId,
+        requestBody: { requests: [{ addSheet: { properties: { title: "AurumTrades",
+          tabColor: { red: 0.2, green: 0.6, blue: 1.0 } } } }] } });
+      console.log("[sheets] AurumTrades tab created");
+    }
+    const tradesCheck = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: "AurumTrades!A1" });
+    if (!tradesCheck.data.values?.[0]?.[0]) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: sheetId, range: "AurumTrades!A1:I1", valueInputOption: "RAW",
+        requestBody: { values: [["Timestamp","Setup ID","Symbol","Direction","Entry","SL","TP1","TP2","Status"]] },
+      });
+      console.log("[sheets] AurumTrades headers written");
+    }
 
-    // Get tab sheetId for formatting
-    const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
-    const tab  = meta.data.sheets.find(s => s.properties.title === "Aurum");
-    if (!tab) { console.log("[sheets] Aurum tab not found — headers written, no formatting"); return; }
-    const tabId = tab.properties.sheetId;
-
-    // Apply formatting in one batchUpdate
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId: sheetId,
-      requestBody: { requests: [
-        { repeatCell: {
-          range: { sheetId: tabId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 18 },
-          cell: { userEnteredFormat: {
-            backgroundColor: { red: 0.098, green: 0.098, blue: 0.098 },
+    // ── Format Aurum header row ───────────────────────────────
+    const aurumTab = meta.data.sheets.find(s => s.properties.title === "Aurum");
+    if (aurumTab) {
+      const tabId = aurumTab.properties.sheetId;
+      await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody: { requests: [
+        { repeatCell: { range: { sheetId: tabId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 19 },
+          cell: { userEnteredFormat: { backgroundColor: { red: 0.098, green: 0.098, blue: 0.098 },
             textFormat: { foregroundColor: { red: 1.0, green: 0.843, blue: 0.0 }, bold: true, fontSize: 10 },
-            horizontalAlignment: "CENTER",
-          }},
-          fields: "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
-        }},
-        { updateSheetProperties: {
-          properties: { sheetId: tabId, gridProperties: { frozenRowCount: 1 } },
-          fields: "gridProperties.frozenRowCount",
-        }},
-        { updateSheetProperties: {
-          properties: { sheetId: tabId, tabColor: { red: 1.0, green: 0.843, blue: 0.0 } },
-          fields: "tabColor",
-        }},
-      ]},
-    });
-
-    console.log("[sheets] Header setup complete — Aurum tab formatted");
-  } catch(e) {
-    console.error("[sheets] Header setup failed (non-fatal):", e.message);
-  }
+            horizontalAlignment: "CENTER" }},
+          fields: "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)" }},
+        { updateSheetProperties: { properties: { sheetId: tabId, gridProperties: { frozenRowCount: 1 } }, fields: "gridProperties.frozenRowCount" }},
+        { updateSheetProperties: { properties: { sheetId: tabId, tabColor: { red: 1.0, green: 0.843, blue: 0.0 } }, fields: "tabColor" }},
+      ]}});
+    }
+    console.log("[sheets] Sheet setup complete");
+  } catch(e) { console.error("[sheets] Header setup failed (non-fatal):", e.message); }
 }

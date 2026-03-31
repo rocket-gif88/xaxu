@@ -1,6 +1,6 @@
 {
   "name": "aurum-signal-engine",
-  "version": "5.2.0",
+  "version": "5.3.0",
   "description": "Aurum XAU/XAG Liquidity Sweep Signal Terminal",
   "main": "server.js",
   "scripts": {
