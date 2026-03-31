@@ -3421,21 +3421,169 @@ app.get('/config', (req, res) => {
 });
 
 // Send a Telegram message
+// ── TELEGRAM API HELPERS ───────────────────────────────────────────────────
+
+// Base send — plain text, no buttons. Returns message_id or null.
 async function sendTelegram(text) {
-  if (!TG_TOKEN || !TG_CHAT_ID) return;
+  if (!TG_TOKEN || !TG_CHAT_ID) return null;
   try {
     const url  = 'https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage';
     const body = JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: 'HTML' });
-    const resp = await fetch(url, { method:'POST',
-      headers:{'Content-Type':'application/json'}, body,
+    const resp = await fetch(url, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body,
       signal: AbortSignal.timeout(8000) });
     const json = await resp.json();
-    if (!json.ok) console.error('[telegram] send failed:', json.description);
-    else console.log('[telegram] message sent OK');
-  } catch(e) {
-    console.error('[telegram] error:', e.message);
-  }
+    if (!json.ok) { console.error('[telegram] send failed:', json.description); return null; }
+    console.log('[telegram] message sent OK (id=' + json.result?.message_id + ')');
+    return json.result?.message_id || null;
+  } catch(e) { console.error('[telegram] error:', e.message); return null; }
 }
+
+// Send with inline result buttons — returns message_id for later editing
+// callback_data format: "result:SETUPID:OUTCOME" (max 64 bytes — fits easily)
+async function sendTelegramWithButtons(text, setupId) {
+  if (!TG_TOKEN || !TG_CHAT_ID) return null;
+  try {
+    const keyboard = {
+      inline_keyboard: [[
+        { text: '✅ TP1',  callback_data: 'result:' + setupId + ':TP1' },
+        { text: '✅ TP2',  callback_data: 'result:' + setupId + ':TP2' },
+        { text: '❌ SL',   callback_data: 'result:' + setupId + ':SL'  },
+        { text: '🔁 BE',   callback_data: 'result:' + setupId + ':BE'  },
+      ]],
+    };
+    const url  = 'https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage';
+    const body = JSON.stringify({
+      chat_id:      TG_CHAT_ID,
+      text,
+      parse_mode:   'HTML',
+      reply_markup: keyboard,
+    });
+    const resp = await fetch(url, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body,
+      signal: AbortSignal.timeout(8000) });
+    const json = await resp.json();
+    if (!json.ok) { console.error('[telegram] send+buttons failed:', json.description); return null; }
+    console.log('[telegram] signal+buttons sent (id=' + json.result?.message_id + ')');
+    return json.result?.message_id || null;
+  } catch(e) { console.error('[telegram] buttons error:', e.message); return null; }
+}
+
+// Edit an existing message — removes buttons and appends result line
+async function editTelegramMessage(messageId, newText) {
+  if (!TG_TOKEN || !TG_CHAT_ID || !messageId) return;
+  try {
+    const url  = 'https://api.telegram.org/bot' + TG_TOKEN + '/editMessageText';
+    const body = JSON.stringify({
+      chat_id:      TG_CHAT_ID,
+      message_id:   messageId,
+      text:         newText,
+      parse_mode:   'HTML',
+      reply_markup: { inline_keyboard: [] }, // removes buttons
+    });
+    await fetch(url, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body,
+      signal: AbortSignal.timeout(8000) });
+  } catch(e) { console.error('[telegram] edit error:', e.message); }
+}
+
+// Answer a callback query — required by Telegram API (removes loading spinner)
+async function answerCallbackQuery(callbackQueryId, text) {
+  if (!TG_TOKEN) return;
+  try {
+    await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/answerCallbackQuery', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, text: text || 'Logged ✓', show_alert: false }),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch(e) { /* non-critical */ }
+}
+
+// In-memory map: setupId → { messageId, text } for editing after result tapped
+const _signalMessages = {};  // setupId → { messageId, originalText }
+
+// ── TELEGRAM WEBHOOK — receives button taps ───────────────────────────────
+// Register once via: GET /setup-webhook  (see below)
+app.post('/telegram-webhook', express.json(), async (req, res) => {
+  res.sendStatus(200); // always ack immediately
+
+  try {
+    const update = req.body;
+
+    // Only handle callback_query (button taps)
+    if (!update.callback_query) return;
+
+    const cq       = update.callback_query;
+    const data     = cq.data || '';          // "result:SETUPID:TP1"
+    const parts    = data.split(':');
+
+    if (parts[0] !== 'result' || parts.length < 3) return;
+
+    const setupId  = parts[1];
+    const outcome  = parts[2];               // TP1 | TP2 | SL | BE
+
+    if (!['TP1','TP2','SL','BE'].includes(outcome)) return;
+
+    // Log the result
+    logTradeResult(setupId, outcome);
+    updateTradeMonitorStatus(setupId, outcome).catch(() => {});
+    console.log('[webhook] Result logged: ' + setupId + ' → ' + outcome + ' (via Telegram button)');
+
+    // Answer the callback (removes spinner)
+    const resultEmoji = { TP1: '✅', TP2: '✅✅', SL: '❌', BE: '🔁' };
+    await answerCallbackQuery(cq.id, resultEmoji[outcome] + ' ' + outcome + ' logged');
+
+    // Edit the original message — append result, remove buttons
+    const msgData = _signalMessages[setupId];
+    if (msgData) {
+      const updatedText = msgData.originalText +
+        '\n\n─────────────────────────────' +
+        '\n' + resultEmoji[outcome] + ' <b>RESULT LOGGED: ' + outcome + '</b>' +
+        '\n<i>' + new Date().toUTCString().split(' ')[4] + ' UTC</i>';
+      await editTelegramMessage(msgData.messageId, updatedText);
+      delete _signalMessages[setupId]; // cleanup
+    }
+
+  } catch(e) {
+    console.error('[webhook] callback error:', e.message);
+  }
+});
+
+// ── REGISTER WEBHOOK with Telegram ───────────────────────────────────────
+// Call once: GET /setup-webhook
+// Railway URL must be set in RAILWAY_PUBLIC_URL env var, or pass ?url=https://...
+app.get('/setup-webhook', async (req, res) => {
+  if (!TG_TOKEN) return res.json({ ok: false, error: 'TG_TOKEN not set' });
+  try {
+    const baseUrl = req.query.url ||
+                    process.env.RAILWAY_PUBLIC_URL ||
+                    ('https://' + (req.headers.host || ''));
+    const webhookUrl = baseUrl.replace(/\/$/, '') + '/telegram-webhook';
+    const resp = await fetch(
+      'https://api.telegram.org/bot' + TG_TOKEN + '/setWebhook',
+      { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: webhookUrl, allowed_updates: ['callback_query'] }),
+        signal: AbortSignal.timeout(8000) }
+    );
+    const json = await resp.json();
+    console.log('[webhook] setWebhook response:', JSON.stringify(json));
+    res.json({ ok: json.ok, webhook_url: webhookUrl, telegram_response: json });
+  } catch(e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// ── CHECK WEBHOOK STATUS ──────────────────────────────────────────────────
+app.get('/webhook-status', async (req, res) => {
+  if (!TG_TOKEN) return res.json({ ok: false, error: 'TG_TOKEN not set' });
+  try {
+    const resp = await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/getWebhookInfo',
+      { signal: AbortSignal.timeout(8000) });
+    res.json(await resp.json());
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
 
 // Format full signal for Telegram — v5.2: entry type header, quality label, flexible fields
 function formatTelegramSignal(sig) {
@@ -5115,7 +5263,15 @@ async function autoScan() {
           setup.earlyLockUntil = Date.now() + 10 * 60 * 1000; // 10 min = 2 × M5 candles
           console.log('[lock] ' + sym + ': AGGRESSIVE_EARLY lock active for 10 min');
         }
-        await sendTelegram(formatTelegramSignal(rawSig));
+        await sendTelegramWithButtons(formatTelegramSignal(rawSig), setup.id)
+          .then(messageId => {
+            if (messageId) {
+              _signalMessages[setup.id] = {
+                messageId,
+                originalText: formatTelegramSignal(rawSig),
+              };
+            }
+          });
       });
 
     } catch(e) {
