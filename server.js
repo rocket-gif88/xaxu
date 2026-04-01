@@ -2,9 +2,295 @@ const express = require('express');
 const cors    = require('cors');
 const fetch   = require('node-fetch');
 const app     = express();
-const { hydrateFromSheets, updateZoneMemory, getZoneFreshness,
-        clearZoneMemory, detectVWAPReclaim, formatATRBlock,
-        getSessionQuality } = require('./aurum-upgrades');
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AURUM UPGRADES — inlined from aurum-upgrades.js (v5.4)
+// hydrateFromSheets, zone memory, VWAP reclaim, ATR sizing, session quality
+// ═══════════════════════════════════════════════════════════════════════════
+async function hydrateFromSheets(setupLogs) {
+  const sheetId   = process.env.GOOGLE_SHEET_ID;
+  const credsJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+
+  if (!sheetId || !credsJson) {
+    console.log('[hydrate] Sheets not configured — skipping boot hydration');
+    return;
+  }
+
+  try {
+    const { google } = require('googleapis');
+    const creds = JSON.parse(credsJson);
+    const auth  = new google.auth.GoogleAuth({
+      credentials: creds,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const sheets = google.sheets({ version: 'v4', auth });
+
+    const resp = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId,
+      range:         'Aurum!A:R',
+    });
+
+    const rows   = resp.data.values || [];
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000; // last 24h only
+    let restored = 0;
+
+    for (const row of rows.slice(1)) { // skip header row
+      const [ts, id, sym, dir, sess,
+             zLow, zHigh, zScore, touches,
+             event, entry, sl, tp1, tp2,
+             candles, result, , stages] = row;
+
+      if (!ts || !id || !event) continue;
+
+      const rowTime = new Date(ts).getTime();
+      if (isNaN(rowTime) || rowTime < cutoff) continue;
+
+      // Restore ENTRY rows — these are the actionable records
+      if (event === 'ENTRY' && !setupLogs[id]) {
+        setupLogs[id] = {
+          id,
+          symbol:        sym    || '',
+          direction:     dir    || '',
+          session:       sess   || '',
+          zone: {
+            low:    parseFloat(zLow)   || null,
+            high:   parseFloat(zHigh)  || null,
+            score:  parseFloat(zScore) || null,
+            touches: parseInt(touches) || null,
+          },
+          entryTriggered:  true,
+          entryPrice:      parseFloat(entry)   || null,
+          stopLoss:        parseFloat(sl)      || null,
+          takeProfits:     [tp1, tp2].filter(Boolean).map(Number),
+          candlesToEntry:  parseInt(candles)   || null,
+          result:          result              || null,
+          timestamp_start: ts,
+          stages:          stages ? stages.split(',').reduce((o,k) => { o[k]=true; return o; }, {}) : {},
+          _version:        1,
+          _restored:       true,   // flag: came from Sheets, not live
+        };
+        restored++;
+      }
+
+      // Also restore RESULT rows for already-restored setups
+      if (event === 'RESULT' && setupLogs[id] && result) {
+        setupLogs[id].result = result;
+      }
+    }
+
+    console.log('[hydrate] ✓ Restored ' + restored + ' entry log(s) from Sheets (last 24h)');
+
+  } catch (e) {
+    // Never crash on hydration failure — it's cosmetic
+    console.error('[hydrate] Failed (non-fatal):', e.message);
+  }
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// 2. ZONE MEMORY — fresh vs exhausted tracking
+// ──────────────────────────────────────────────────────────────────────────
+// Tracks how many times each zone has been "activated" (a setup was created
+// at that zone) within the current session and across restarts.
+//
+// KEY INSIGHT: A zone loses institutional order flow with each retest.
+//   Fresh  (0–1 tests) → full signal allowed
+//   Tested (2 tests)   → signal allowed but confidence docked
+//   Exhausted (3+)     → signal suppressed (no unfilled orders remain)
+//
+// Persisted per-session in memory. At session close, zones are aged out.
+// ──────────────────────────────────────────────────────────────────────────
+
+const zoneMemory = {
+  XAUUSD: {},  // priceRange → { firstSeenAt, touchCount, lastTouchedAt }
+  XAGUSD: {},
+};
+
+function updateZoneMemory(sym, zone) {
+  if (!zone || !zone.priceRange) return;
+  const key = zone.priceRange;
+  const mem = zoneMemory[sym];
+  if (!mem[key]) {
+    mem[key] = {
+      firstSeenAt:   Date.now(),
+      touchCount:    0,
+      lastTouchedAt: 0,
+      direction:     zone.direction || null,
+    };
+  }
+  mem[key].touchCount++;
+  mem[key].lastTouchedAt = Date.now();
+  console.log('[zone-mem] ' + sym + ' zone ' + key +
+    ' touch #' + mem[key].touchCount);
+}
+
+// Returns freshness info for a zone. Used in Telegram alerts and score gating.
+function getZoneFreshness(sym, zone) {
+  if (!zone || !zone.priceRange) {
+    return { fresh: true, touchCount: 0, label: '🟢 FRESH', suppress: false };
+  }
+  const key   = zone.priceRange;
+  const entry = zoneMemory[sym]?.[key];
+
+  if (!entry) {
+    return { fresh: true, touchCount: 0, label: '🟢 FRESH', suppress: false };
+  }
+
+  const count = entry.touchCount;
+
+  // v5.4: suppress raised from 4→6 touches
+  // (XAG was exhausted 63% of scans — too aggressive for current market)
+  if (count <= 1) return { fresh: true,  touchCount: count, label: '🟢 FRESH (1st test)',           suppress: false };
+  if (count === 2) return { fresh: false, touchCount: count, label: '🟡 RETESTED (2nd test)',        suppress: false };
+  if (count === 3) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (3rd test)',         suppress: false };
+  if (count === 4) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (4th test)',         suppress: false };
+  if (count === 5) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (5th test)',         suppress: false };
+  return             { fresh: false, touchCount: count, label: '🔴 EXHAUSTED (' + count + ' tests)', suppress: true  };
+}
+
+// Call at session close to clear per-session zone memory
+function clearZoneMemory(sym) {
+  zoneMemory[sym] = {};
+  console.log('[zone-mem] ' + sym + ': zone memory cleared (session close)');
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// 3. VWAP RECLAIM — post-sweep confirmation
+// ──────────────────────────────────────────────────────────────────────────
+// After a liquidity sweep, we check whether price has reclaimed the session
+// VWAP. A VWAP reclaim after a BUY sweep = genuine institutional demand.
+// Failure to reclaim = likely trap / continuation lower.
+//
+// VWAP here is range-weighted (no free-tier volume on XAU/USD) — standard
+// proxy used by retail prop firms and effective on 5M gold charts.
+// ──────────────────────────────────────────────────────────────────────────
+
+// Calculate session VWAP from a candle array (range-weighted typical price)
+function calcVWAP(candles) {
+  if (!candles || candles.length === 0) return null;
+  let cumTPV = 0;
+  let cumVol = 0;
+
+  for (const c of candles) {
+    const tp  = (c.h + c.l + c.c) / 3;  // typical price
+    const vol = Math.max(c.h - c.l, 0.0001); // range as volume proxy
+    cumTPV += tp * vol;
+    cumVol += vol;
+  }
+
+  return cumVol > 0 ? cumTPV / cumVol : null;
+}
+
+// Check whether price has reclaimed VWAP after a sweep
+// sweepIdx: candle index of the sweep
+// direction: 'BUY' or 'SELL'
+// Returns { reclaimed, vwap, candlesAfterSweep, note }
+function detectVWAPReclaim(candles, sweepIdx, direction) {
+  if (!candles || sweepIdx < 0 || sweepIdx >= candles.length) {
+    return { reclaimed: false, vwap: null, note: 'insufficient data' };
+  }
+
+  // Use candles up to and including sweep for VWAP calculation
+  const vwap = calcVWAP(candles.slice(0, sweepIdx + 1));
+  if (!vwap) return { reclaimed: false, vwap: null, note: 'VWAP calc failed' };
+
+  // Check candles AFTER the sweep
+  const postSweep = candles.slice(sweepIdx + 1);
+  if (postSweep.length === 0) {
+    return { reclaimed: false, vwap, note: 'no candles after sweep yet' };
+  }
+
+  // BUY sweep: we need at least one post-sweep candle to close ABOVE VWAP
+  // SELL sweep: at least one post-sweep candle to close BELOW VWAP
+  let reclaimed = false;
+  for (const c of postSweep) {
+    if (direction === 'BUY'  && c.c > vwap) { reclaimed = true; break; }
+    if (direction === 'SELL' && c.c < vwap) { reclaimed = true; break; }
+  }
+
+  const note = reclaimed
+    ? 'Price reclaimed VWAP ($' + vwap.toFixed(2) + ') after sweep ✓'
+    : 'Price has NOT reclaimed VWAP ($' + vwap.toFixed(2) + ') — weak follow-through';
+
+  return {
+    reclaimed,
+    vwap:              parseFloat(vwap.toFixed(3)),
+    candlesAfterSweep: postSweep.length,
+    note,
+  };
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// 4. ATR POSITION SIZING — per-signal lot recommendation
+// ──────────────────────────────────────────────────────────────────────────
+// Gold standard lot sizing: 1 standard lot XAU/USD = 100 oz = $100/pip ($1)
+// Position size formula:  lots = (accountRisk$) / (stopDistance$ × $100)
+// Example: $10,000 × 1% risk / ($5.00 stop × $100) = 0.20 lots
+//
+// Three account tiers shown in every signal: $10k · $50k · $100k
+// ──────────────────────────────────────────────────────────────────────────
+
+const RISK_PCT    = 1;      // 1% risk per trade
+const PIP_VALUE   = 100;    // $100 per full lot per $1 move on XAU/USD
+
+function calcLots(accountSize, entryPrice, stopLoss) {
+  const stopDist = Math.abs(entryPrice - stopLoss);
+  if (!stopDist || !accountSize) return null;
+  const riskAmount = accountSize * (RISK_PCT / 100);
+  const lots = riskAmount / (stopDist * PIP_VALUE);
+  return parseFloat(Math.max(lots, 0.01).toFixed(2));
+}
+
+// Returns the formatted ATR block string for insertion into Telegram signal
+function formatATRBlock(currentATR, entryPrice, stopLoss) {
+  if (!currentATR || !entryPrice || !stopLoss) return '';
+
+  const stopDist    = Math.abs(entryPrice - stopLoss);
+  const atrMultiple = (stopDist / currentATR).toFixed(1);
+
+  const lot10k  = calcLots(10000,  entryPrice, stopLoss);
+  const lot50k  = calcLots(50000,  entryPrice, stopLoss);
+  const lot100k = calcLots(100000, entryPrice, stopLoss);
+
+  return [
+    '',
+    '<b>📊 POSITION SIZING (1% risk)</b>',
+    'ATR: $' + currentATR.toFixed(2) + '  |  Stop dist: $' +
+      stopDist.toFixed(2) + ' (' + atrMultiple + '× ATR)',
+    '$10k  → ' + lot10k  + ' lots',
+    '$50k  → ' + lot50k  + ' lots',
+    '$100k → ' + lot100k + ' lots',
+  ].join('\n');
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// 5. SESSION QUALITY GATE
+// ──────────────────────────────────────────────────────────────────────────
+// Returns structured session quality. Used for logging and signal labelling.
+// The trading engine already blocks outside London/NY — this adds context
+// and a quality score that flows into the Telegram alert.
+// ──────────────────────────────────────────────────────────────────────────
+
+function getSessionQuality(utcHour) {
+  const isLondon  = utcHour >= 7  && utcHour < 16;
+  const isNY      = utcHour >= 13 && utcHour < 22;
+  const isOverlap = isLondon && isNY;
+
+  if (isOverlap) return { ok: true, quality: 'HIGH',   score: 10, label: 'London+NY Overlap ⭐' };
+  if (isNY)      return { ok: true, quality: 'MEDIUM', score: 7,  label: 'New York' };
+  if (isLondon)  return { ok: true, quality: 'MEDIUM', score: 5,  label: 'London' };
+
+  // Asia / dead zone — already blocked by autoScan but return for logging
+  return { ok: false, quality: 'LOW', score: 0, label: 'Asia/Off-Hours — signals suppressed' };
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// EXPORTS
+// ──────────────────────────────────────────────────────────────────────────
 // CORS: allow Netlify frontend and any origin (needed for Railway free tier)
 app.use(cors({
   origin: '*',                   // allow all origins — tighten if needed
@@ -528,12 +814,11 @@ function deriveM15FromM5(m5Candles) {
 
 
 // --- ATR RANGE VALIDATION ----------------------------------------------------
-// v5.2: Explicit absolute ATR ranges for XAUUSD (M5 candle basis):
-//   < 5  → low volatility, suppress (choppy/dead market)
-//   5–20 → valid trading range
-//   > 20 → news spike, suppress (unpredictable slippage)
+// v5.4: ATR ranges recalibrated from live data (mean ATR=3.18, max=9.63 in first 2 days)
+//   XAUUSD: < 1.5 → dead/illiquid, 1.5–20 → valid, > 20 → news spike
+//   (was 5–20: suppressed 57% of valid scans)
 const ATR_RANGE = {
-  XAUUSD: { min: 5.0,  max: 20.0 },  // explicit $ range per M5 candle — XAU/USD
+  XAUUSD: { min: 1.5,  max: 20.0 },  // recalibrated from live data — was 5.0
   XAGUSD: { min: 0.03, max: 1.50  }  // $0.03–$1.50 per M5 candle — SLV ETF
 };
 function checkATR(sym, atrValues) {
@@ -1139,17 +1424,18 @@ function detectSweep(candles, levels) {
 }
 
 // ─── DISPLACEMENT ──────────────────────────────────────────────────────────
-// v5.2: Minimum threshold lowered from 1.5x → 1.2x.
+// v5.4: Minimum threshold lowered from 1.2x → 1.0x.
 //   ≥1.5x = STRONG  (max score)
-//   ≥1.2x = VALID   (reduced score)
-//   <1.2x = invalid (unchanged)
+//   ≥1.2x = VALID+  (good score)
+//   ≥1.0x = VALID   (base score)
+//   <1.0x = invalid
 // Must occur within 1–3 candles after sweep candle
 // Returns: { found, candleIdx, bodySize, avgBody, ratio, strength }
 function detectDisplacement(candles, sweepIdx, direction, minRatioOverride) {
   // minRatioOverride: optional — allows caller to require stricter displacement
   const MIN_RATIO_OVERRIDE = minRatioOverride || null;
-  // v5.2: Min ratio 1.2x. STRONG=1.5x+, VALID=1.2–1.5x
-  const BODY_MULT  = 1.2;  // was 1.5 — lowered to accept valid displacement
+  // v5.4: Min ratio 1.0x. STRONG=1.5x+, VALID=1.0–1.5x (was 1.2x — live data showed collapse at displacement stage)
+  const BODY_MULT  = 1.0;  // was 1.2 → 1.0 based on live data
   const CLOSE_ZONE = 0.25;
   const slice = candles.slice(Math.max(0, sweepIdx - 10), sweepIdx);
   if (slice.length < 3) return { found: false, reason: 'insufficient candle history' };
@@ -1171,7 +1457,7 @@ function detectDisplacement(candles, sweepIdx, direction, minRatioOverride) {
       : (c.h - c.c) / r >= (1 - CLOSE_ZONE);
     if (bodyStrong && dirOk && closeZone) {
       const ratio    = parseFloat((b / avgBody10).toFixed(2));
-      const strength = ratio >= 1.5 ? 'STRONG' : 'VALID'; // v5.2 strength label
+      const strength = ratio >= 1.5 ? 'STRONG' : ratio >= 1.2 ? 'VALID+' : 'VALID'; // v5.4 strength label
       return { found: true, candleIdx: idx,
                ratio, avgBody: avgBody10, weakGap,
                strength,  // 'STRONG' | 'VALID'
@@ -1669,12 +1955,13 @@ function scoreSetup(sessionLabel, sessionOk, sweep, displacement, bos, pullback,
   if (!displacement || !displacement.found) {
     breakdown.displacement = { score: 0, max: 20, note: 'No displacement detected' };
   } else {
-    // v5.2: 1.2x = VALID (+12), 1.5x+ = STRONG (+20)
+    // v5.4: 1.0x = VALID (+8), 1.2x = VALID+ (+12), 1.5x+ = STRONG (+20)
     const dispScore = displacement.ratio >= 3.0 ? 20
                     : displacement.ratio >= 2.5 ? 18
                     : displacement.ratio >= 2.0 ? 16
                     : displacement.ratio >= 1.5 ? 20   // STRONG
-                    : displacement.ratio >= 1.2 ? 12   // VALID
+                    : displacement.ratio >= 1.2 ? 12   // VALID+
+                    : displacement.ratio >= 1.0 ? 8    // VALID
                     : 0;
     const dispFinal = displacement.weakGap ? Math.max(dispScore - 3, 0) : dispScore;
     breakdown.displacement = { score: dispFinal, max: 20, ratio: displacement.ratio, strength: displacement.strength || 'VALID' };
@@ -2217,7 +2504,7 @@ app.get('/analyze/:sym', async (req, res) => {
                 // Zone score gate applies here too
                 if (!analyzeZoneAllowSignal) {
                   setupState = 'invalidated';
-                  log.push('Signal blocked — zone score ' + pzConf + '/100 < 60 (zone too weak)');
+                  log.push('Signal blocked — zone score ' + pzConf + '/100 < 50 (zone too weak)');
                 } else if (scoreResult2.tier !== 'HIGH') {
                   setupState = 'invalidated';
                   log.push('Signal not generated — score ' + confidence + '/100 tier=' + scoreResult2.tier + ' (requires HIGH ≥75)');
@@ -2314,16 +2601,17 @@ app.get('/analyze/:sym', async (req, res) => {
       (pzConf >= 60 ? ' ✓' : ' ⚠ low'));
   }
   // Zone score gate for analyze route
-  // < 60  → no pre-signals, no signals
-  // 60–74 → pre-signals allowed, no aggressive entry
+  // v5.4: threshold 60→50
+  // < 50  → no pre-signals, no signals
+  // 50–74 → pre-signals allowed, no aggressive entry
   // ≥ 75  → full system
   const analyzeZoneAllowAggressive = pzConf >= 75;
-  const analyzeZoneAllowSignal     = pzConf >= 60;
+  const analyzeZoneAllowSignal     = pzConf >= 50;
   const sweepPotentials = (primaryZone && analyzeZoneAllowSignal && approachingLevels.length)
     ? detectSweepPotential(livePrice, approachingLevels, m5)
     : [];
   if (!analyzeZoneAllowSignal && primaryZone) {
-    log.push('Zone score ' + pzConf + '/100 < 60 — signals suppressed (zone not strong enough)');
+    log.push('Zone score ' + pzConf + '/100 < 50 — signals suppressed (zone not strong enough)');
   } else if (!analyzeZoneAllowAggressive && primaryZone) {
     log.push('Zone score ' + pzConf + '/100 [60–74] — standard entry only, aggressive suppressed');
   }
@@ -2391,7 +2679,7 @@ app.get('/analyze/:sym', async (req, res) => {
       primary_zone:      primaryZone,
       zone_confidence:   pzConf,
       zone_direction:    primaryZone?.direction || null,
-      zone_score_tier:   pzConf >= 75 ? 'FULL' : pzConf >= 60 ? 'STANDARD' : 'BLOCKED',
+      zone_score_tier:   pzConf >= 75 ? 'FULL' : pzConf >= 50 ? 'STANDARD' : 'BLOCKED',
       zone_grade:        pzGrade,
       directional_bias:  directionalBias,
       bias_score:        analyzeGlobalBias?.score || 0,
@@ -3103,9 +3391,9 @@ app.get('/debug/:sym', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.json({
-  status:'ok', version:'5.3',
+  status:'ok', version:'5.4',
   engine:'Liquidity Sweep — Adaptive Execution Engine (M5+M15)',
-  rules: ['PDH/PDL/ASH/ASL/EQH/EQL levels','0.02% sweep break required','1.2–3× body displacement','M5 BOS required / M15 optional +5','30–70% pullback (tiered scoring)','continuation entry (STRONG disp only)','confidence ≥ 70 (5×20 weighted)','ATR 5–20 XAUUSD','10-candle time decay']
+  rules: ['PDH/PDL/ASH/ASL/EQH/EQL levels','0.02% sweep break required','1.0–3× body displacement','M5 BOS required / M15 optional +5','30–70% pullback (tiered scoring)','continuation entry (STRONG disp only)','zone score ≥ 50, confidence ≥ 70','ATR 1.5–20 XAUUSD (recalibrated)','10-candle time decay']
 }));
 
 // ═══════════════════════════════════════════════════════════════
@@ -3133,21 +3421,169 @@ app.get('/config', (req, res) => {
 });
 
 // Send a Telegram message
+// ── TELEGRAM API HELPERS ───────────────────────────────────────────────────
+
+// Base send — plain text, no buttons. Returns message_id or null.
 async function sendTelegram(text) {
-  if (!TG_TOKEN || !TG_CHAT_ID) return;
+  if (!TG_TOKEN || !TG_CHAT_ID) return null;
   try {
     const url  = 'https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage';
     const body = JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: 'HTML' });
-    const resp = await fetch(url, { method:'POST',
-      headers:{'Content-Type':'application/json'}, body,
+    const resp = await fetch(url, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body,
       signal: AbortSignal.timeout(8000) });
     const json = await resp.json();
-    if (!json.ok) console.error('[telegram] send failed:', json.description);
-    else console.log('[telegram] message sent OK');
-  } catch(e) {
-    console.error('[telegram] error:', e.message);
-  }
+    if (!json.ok) { console.error('[telegram] send failed:', json.description); return null; }
+    console.log('[telegram] message sent OK (id=' + json.result?.message_id + ')');
+    return json.result?.message_id || null;
+  } catch(e) { console.error('[telegram] error:', e.message); return null; }
 }
+
+// Send with inline result buttons — returns message_id for later editing
+// callback_data format: "result:SETUPID:OUTCOME" (max 64 bytes — fits easily)
+async function sendTelegramWithButtons(text, setupId) {
+  if (!TG_TOKEN || !TG_CHAT_ID) return null;
+  try {
+    const keyboard = {
+      inline_keyboard: [[
+        { text: '✅ TP1',  callback_data: 'result:' + setupId + ':TP1' },
+        { text: '✅ TP2',  callback_data: 'result:' + setupId + ':TP2' },
+        { text: '❌ SL',   callback_data: 'result:' + setupId + ':SL'  },
+        { text: '🔁 BE',   callback_data: 'result:' + setupId + ':BE'  },
+      ]],
+    };
+    const url  = 'https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage';
+    const body = JSON.stringify({
+      chat_id:      TG_CHAT_ID,
+      text,
+      parse_mode:   'HTML',
+      reply_markup: keyboard,
+    });
+    const resp = await fetch(url, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body,
+      signal: AbortSignal.timeout(8000) });
+    const json = await resp.json();
+    if (!json.ok) { console.error('[telegram] send+buttons failed:', json.description); return null; }
+    console.log('[telegram] signal+buttons sent (id=' + json.result?.message_id + ')');
+    return json.result?.message_id || null;
+  } catch(e) { console.error('[telegram] buttons error:', e.message); return null; }
+}
+
+// Edit an existing message — removes buttons and appends result line
+async function editTelegramMessage(messageId, newText) {
+  if (!TG_TOKEN || !TG_CHAT_ID || !messageId) return;
+  try {
+    const url  = 'https://api.telegram.org/bot' + TG_TOKEN + '/editMessageText';
+    const body = JSON.stringify({
+      chat_id:      TG_CHAT_ID,
+      message_id:   messageId,
+      text:         newText,
+      parse_mode:   'HTML',
+      reply_markup: { inline_keyboard: [] }, // removes buttons
+    });
+    await fetch(url, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body,
+      signal: AbortSignal.timeout(8000) });
+  } catch(e) { console.error('[telegram] edit error:', e.message); }
+}
+
+// Answer a callback query — required by Telegram API (removes loading spinner)
+async function answerCallbackQuery(callbackQueryId, text) {
+  if (!TG_TOKEN) return;
+  try {
+    await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/answerCallbackQuery', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, text: text || 'Logged ✓', show_alert: false }),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch(e) { /* non-critical */ }
+}
+
+// In-memory map: setupId → { messageId, text } for editing after result tapped
+const _signalMessages = {};  // setupId → { messageId, originalText }
+
+// ── TELEGRAM WEBHOOK — receives button taps ───────────────────────────────
+// Register once via: GET /setup-webhook  (see below)
+app.post('/telegram-webhook', async (req, res) => {
+  res.sendStatus(200); // always ack immediately
+
+  try {
+    const update = req.body;
+
+    // Only handle callback_query (button taps)
+    if (!update.callback_query) return;
+
+    const cq       = update.callback_query;
+    const data     = cq.data || '';          // "result:SETUPID:TP1"
+    const parts    = data.split(':');
+
+    if (parts[0] !== 'result' || parts.length < 3) return;
+
+    const setupId  = parts[1];
+    const outcome  = parts[2];               // TP1 | TP2 | SL | BE
+
+    if (!['TP1','TP2','SL','BE'].includes(outcome)) return;
+
+    // Log the result
+    logTradeResult(setupId, outcome);
+    updateTradeMonitorStatus(setupId, outcome).catch(() => {});
+    console.log('[webhook] Result logged: ' + setupId + ' → ' + outcome + ' (via Telegram button)');
+
+    // Answer the callback (removes spinner)
+    const resultEmoji = { TP1: '✅', TP2: '✅✅', SL: '❌', BE: '🔁' };
+    await answerCallbackQuery(cq.id, resultEmoji[outcome] + ' ' + outcome + ' logged');
+
+    // Edit the original message — append result, remove buttons
+    const msgData = _signalMessages[setupId];
+    if (msgData) {
+      const updatedText = msgData.originalText +
+        '\n\n─────────────────────────────' +
+        '\n' + resultEmoji[outcome] + ' <b>RESULT LOGGED: ' + outcome + '</b>' +
+        '\n<i>' + new Date().toUTCString().split(' ')[4] + ' UTC</i>';
+      await editTelegramMessage(msgData.messageId, updatedText);
+      delete _signalMessages[setupId]; // cleanup
+    }
+
+  } catch(e) {
+    console.error('[webhook] callback error:', e.message);
+  }
+});
+
+// ── REGISTER WEBHOOK with Telegram ───────────────────────────────────────
+// Call once: GET /setup-webhook
+// Railway URL must be set in RAILWAY_PUBLIC_URL env var, or pass ?url=https://...
+app.get('/setup-webhook', async (req, res) => {
+  if (!TG_TOKEN) return res.json({ ok: false, error: 'TG_TOKEN not set' });
+  try {
+    const baseUrl = req.query.url ||
+                    process.env.RAILWAY_PUBLIC_URL ||
+                    ('https://' + (req.headers.host || ''));
+    const webhookUrl = baseUrl.replace(/\/$/, '') + '/telegram-webhook';
+    const resp = await fetch(
+      'https://api.telegram.org/bot' + TG_TOKEN + '/setWebhook',
+      { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: webhookUrl, allowed_updates: ['callback_query'] }),
+        signal: AbortSignal.timeout(8000) }
+    );
+    const json = await resp.json();
+    console.log('[webhook] setWebhook response:', JSON.stringify(json));
+    res.json({ ok: json.ok, webhook_url: webhookUrl, telegram_response: json });
+  } catch(e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// ── CHECK WEBHOOK STATUS ──────────────────────────────────────────────────
+app.get('/webhook-status', async (req, res) => {
+  if (!TG_TOKEN) return res.json({ ok: false, error: 'TG_TOKEN not set' });
+  try {
+    const resp = await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/getWebhookInfo',
+      { signal: AbortSignal.timeout(8000) });
+    res.json(await resp.json());
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
 
 // Format full signal for Telegram — v5.2: entry type header, quality label, flexible fields
 function formatTelegramSignal(sig) {
@@ -4205,7 +4641,7 @@ async function autoScan() {
       const zoneScore = primaryZone.confidence?.total || 0;
       console.log('[' + sym + '] Primary zone: ' + primaryZone.direction +
         ' ' + primaryZone.priceRange + ' score=' + zoneScore + '/100' +
-        (zoneScore >= 75 ? ' [FULL]' : zoneScore >= 60 ? ' [STANDARD]' : ' [BLOCKED]'));
+        (zoneScore >= 75 ? ' [FULL]' : zoneScore >= 50 ? ' [STANDARD]' : ' [BLOCKED]'));
 
       // ── ZONE DETECTION COOLDOWN ────────────────────────────────
       // (timing already declared above)
@@ -4249,27 +4685,28 @@ async function autoScan() {
       }
 
       // ── ZONE SCORE GATE ────────────────────────────────────────
-      // < 60  → no signals at all — zone not strong enough
-      // 60–74 → standard entry only, aggressive engine suppressed
+      // v5.4: threshold lowered 60→50 (live data: max score=70, 79% blocked under 60)
+      // < 50  → no signals at all
+      // 50–74 → standard entry only, aggressive engine suppressed
       // ≥ 75  → full system: standard + aggressive
-      if (zoneScore < 60) {
-        console.log('[' + sym + '] Zone score ' + zoneScore + ' < 60 — all signals suppressed');
-        // Cancel any active setup that depended on this zone
+      if (zoneScore < 50) {
+        console.log('[' + sym + '] Zone score ' + zoneScore + ' < 50 — all signals suppressed');
+        logScanEvent(sym, 'ZONE_SCORE_BLOCKED', 'Score ' + zoneScore + '/100 below 50 minimum',
+          { direction: primaryZone.direction, zoneLow: primaryZone.minPrice, zoneHigh: primaryZone.maxPrice,
+            zoneScore, touches: primaryZone.totalTouches });
         if (setup && setup.active) {
-          console.log('[' + sym + '] Cancelling active setup — zone score ' + zoneScore + ' fell below 60');
-          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 60).');
-          resetSetup(sym, 'Zone score below 60');
+          console.log('[' + sym + '] Cancelling active setup — zone score ' + zoneScore + ' fell below 50');
+          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 50).');
+          resetSetup(sym, 'Zone score below 50');
         }
         await delay(400); continue;
       }
 
       // ── ZONE STRENGTH CHECK AT TREND SHIFT+ STAGES ─────────────
-      // If setup has progressed past trend shift but zone score is now < 60,
-      // cancel — do not proceed to pullback or entry with a weak zone.
       if (setup && setup.active && setup.events?.trend) {
-        if (zoneScore < 60) {
-          console.log('[' + sym + '] Setup cancelled at trend+ stage — zone score ' + zoneScore + ' < 60');
-          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 60).');
+        if (zoneScore < 50) {
+          console.log('[' + sym + '] Setup cancelled at trend+ stage — zone score ' + zoneScore + ' < 50');
+          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 50).');
           resetSetup(sym, 'Zone too weak at trend+ stage');
           await delay(400); continue;
         }
@@ -4826,7 +5263,15 @@ async function autoScan() {
           setup.earlyLockUntil = Date.now() + 10 * 60 * 1000; // 10 min = 2 × M5 candles
           console.log('[lock] ' + sym + ': AGGRESSIVE_EARLY lock active for 10 min');
         }
-        await sendTelegram(formatTelegramSignal(rawSig));
+        await sendTelegramWithButtons(formatTelegramSignal(rawSig), setup.id)
+          .then(messageId => {
+            if (messageId) {
+              _signalMessages[setup.id] = {
+                messageId,
+                originalText: formatTelegramSignal(rawSig),
+              };
+            }
+          });
       });
 
     } catch(e) {
