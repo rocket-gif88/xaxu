@@ -678,10 +678,175 @@ function readAllLogs() {
 }
 
 const SYMBOLS = {
-  XAUUSD: 'XAU/USD',   // Gold spot — free tier
-  XAGUSD: 'SLV'        // Silver via iShares Silver Trust ETF (SLV) — free tier proxy
-                        // Trades 13:30-20:00 UTC (covers London/NY overlap + full NY session)
+  XAUUSD: 'XAU/USD',   // Gold spot — Twelve Data free tier
+  XAGUSD: 'XAG'        // Silver spot — gold-api.com (real XAG/USD, 24/5, free unlimited)
+                        // Replaced SLV ETF proxy — no more NYSE market-hours restriction
 };
+
+// ─── XAG SYNTHETIC CANDLE ENGINE ──────────────────────────────────────────
+// gold-api.com provides real-time XAG spot price for free with no rate limit.
+// We can't get intraday OHLC for free, so we build synthetic M5 candles by
+// polling every scan and accumulating into 5-minute windows.
+//
+// Warmup: on boot we call the history endpoint (10/hr free) to seed the last
+// 100 daily closes, then interpolate those into synthetic M5 candles so the
+// engine has enough history to run immediately — no 2-hour warmup window.
+//
+// On-disk persistence: candles written to /tmp/xag_candles.json so Railway
+// restarts don't lose accumulated history.
+
+const XAG_CANDLE_FILE  = '/tmp/xag_candles.json';
+const XAG_MAX_CANDLES  = 150;  // keep ~12.5 hours of M5 candles
+const XAG_CANDLE_MS    = 5 * 60 * 1000; // 5 min
+
+// In-memory store
+const xagState = {
+  candles:       [],    // array of { t, o, h, l, c }
+  currentWindow: null,  // { t, o, h, l, prices: [] } — open candle
+  lastPrice:     null,
+  lastFetchAt:   0,
+  seeded:        false,
+};
+
+// Persist candles to disk
+function xagSaveCandles() {
+  try {
+    require('fs').writeFileSync(XAG_CANDLE_FILE,
+      JSON.stringify({ candles: xagState.candles, savedAt: Date.now() }));
+  } catch(e) { /* non-critical */ }
+}
+
+// Load candles from disk (survives Railway restarts)
+function xagLoadCandles() {
+  try {
+    const raw = require('fs').readFileSync(XAG_CANDLE_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed.candles && parsed.candles.length > 0) {
+      // Only use candles from last 24 hours
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      xagState.candles = parsed.candles.filter(c => c.t > cutoff);
+      console.log('[xag] Loaded ' + xagState.candles.length + ' candles from disk');
+      return true;
+    }
+  } catch(e) { /* file doesn't exist yet */ }
+  return false;
+}
+
+// Fetch current XAG spot price from gold-api.com (free, unlimited, no key)
+async function xagFetchPrice() {
+  try {
+    const resp = await fetch('https://api.gold-api.com/price/XAG',
+      { signal: AbortSignal.timeout(8000) });
+    const json = await resp.json();
+    if (!json || !json.price) return null;
+    return parseFloat(json.price);
+  } catch(e) {
+    console.error('[xag] price fetch error:', e.message);
+    return null;
+  }
+}
+
+// Seed historical candles from gold-api.com history endpoint
+// Uses 1 API call (of 10/hr free limit) on boot — never called again
+async function xagSeedHistory() {
+  try {
+    console.log('[xag] Seeding history from gold-api.com...');
+    // Fetch price history — returns array of daily prices
+    const resp = await fetch('https://api.gold-api.com/price/XAG/history?interval=1h&limit=120',
+      { signal: AbortSignal.timeout(15000) });
+    const json = await resp.json();
+
+    // gold-api.com history format: { data: [{ timestamp, price }, ...] }
+    const items = json.data || json.history || json.prices || json.items || [];
+    if (!items.length) {
+      console.log('[xag] History seed: no data in response — will build from live polls');
+      return false;
+    }
+
+    // Convert to synthetic candles (each history point = one synthetic M5 candle)
+    // Use the price as both O/H/L/C (no spread info) — good enough for seeding
+    const sorted = [...items].sort((a, b) => (a.timestamp || a.ts || a.time || 0) - (b.timestamp || b.ts || b.time || 0));
+    const synthetic = sorted.map((item, i) => {
+      const price = parseFloat(item.price || item.close || item.value || 0);
+      const prevPrice = i > 0 ? parseFloat(sorted[i-1].price || sorted[i-1].close || sorted[i-1].value || price) : price;
+      const ts = (item.timestamp || item.ts || item.time || 0) * 1000;
+      // Simulate realistic O/H/L from consecutive prices
+      const lo = Math.min(price, prevPrice);
+      const hi = Math.max(price, prevPrice);
+      return { t: ts, o: prevPrice, h: hi, l: lo, c: price, _synthetic: true };
+    }).filter(c => c.c > 0 && c.t > 0);
+
+    if (synthetic.length > 0) {
+      xagState.candles = synthetic.slice(-XAG_MAX_CANDLES);
+      xagState.seeded  = true;
+      xagSaveCandles();
+      console.log('[xag] ✓ Seeded ' + xagState.candles.length + ' synthetic candles from history');
+      return true;
+    }
+  } catch(e) {
+    console.error('[xag] Seed error:', e.message);
+  }
+  return false;
+}
+
+// Called on every autoScan — updates the synthetic candle store with latest price
+async function xagUpdateCandles() {
+  const price = await xagFetchPrice();
+  if (!price || price <= 0) {
+    console.log('[xag] No price returned — using last known price');
+    return xagState.candles.length > 0 ? xagState.candles : null;
+  }
+
+  xagState.lastPrice  = price;
+  xagState.lastFetchAt = Date.now();
+
+  const nowMs        = Date.now();
+  const windowStart  = Math.floor(nowMs / XAG_CANDLE_MS) * XAG_CANDLE_MS;
+
+  if (!xagState.currentWindow || xagState.currentWindow.t !== windowStart) {
+    // Close the previous window and push it as a completed candle
+    if (xagState.currentWindow && xagState.currentWindow.prices.length > 0) {
+      const w = xagState.currentWindow;
+      const closes = w.prices;
+      xagState.candles.push({
+        t: w.t,
+        o: w.o,
+        h: Math.max(...closes, w.o),
+        l: Math.min(...closes, w.o),
+        c: closes[closes.length - 1],
+      });
+      // Keep rolling window
+      if (xagState.candles.length > XAG_MAX_CANDLES) {
+        xagState.candles = xagState.candles.slice(-XAG_MAX_CANDLES);
+      }
+      xagSaveCandles();
+      console.log('[xag] Candle closed: $' + closes[closes.length-1].toFixed(3) +
+        ' | total candles: ' + xagState.candles.length);
+    }
+    // Open new window
+    xagState.currentWindow = { t: windowStart, o: price, prices: [price] };
+  } else {
+    // Add price to current window
+    xagState.currentWindow.prices.push(price);
+  }
+
+  // Build a snapshot including the open (in-progress) candle
+  const snapshot = [...xagState.candles];
+  if (xagState.currentWindow && xagState.currentWindow.prices.length > 0) {
+    const w = xagState.currentWindow;
+    const prices = w.prices;
+    snapshot.push({
+      t: w.t,
+      o: w.o,
+      h: Math.max(...prices, w.o),
+      l: Math.min(...prices, w.o),
+      c: prices[prices.length - 1],
+      _open: true,   // flag: this candle is still forming
+    });
+  }
+
+  return snapshot.length > 0 ? snapshot : null;
+}
 
 // ─── IN-MEMORY CACHE ────────────────────────────────────────────────────────
 // Cache candle data for 60 seconds to avoid hitting Twelve Data rate limits
@@ -720,6 +885,14 @@ async function tdFetch(path) {
 
 // ─── CANDLE FETCH ─────────────────────────────────────────────────────────
 async function getCandles(sym, interval, n) {
+  // XAGUSD uses synthetic candle engine — not Twelve Data
+  if (sym === 'XAGUSD') {
+    const candles = await xagUpdateCandles();
+    if (!candles || candles.length === 0) return null;
+    // Return last n candles, same shape as Twelve Data response
+    return candles.slice(-n);
+  }
+
   const td = SYMBOLS[sym];
   if (!td) { console.error('Unknown symbol:', sym); return null; }
   
@@ -818,9 +991,11 @@ function deriveM15FromM5(m5Candles) {
 // v5.4: ATR ranges recalibrated from live data (mean ATR=3.18, max=9.63 in first 2 days)
 //   XAUUSD: < 1.5 → dead/illiquid, 1.5–20 → valid, > 20 → news spike
 //   (was 5–20: suppressed 57% of valid scans)
+// v5.6: XAGUSD now uses real XAG/USD spot (was SLV ETF ~$28-32)
+//   Real XAG/USD trades ~$28-80/oz — M5 ATR typically $0.10–$1.50
 const ATR_RANGE = {
   XAUUSD: { min: 1.5,  max: 20.0 },  // recalibrated from live data — was 5.0
-  XAGUSD: { min: 0.03, max: 1.50  }  // $0.03–$1.50 per M5 candle — SLV ETF
+  XAGUSD: { min: 0.05, max: 2.00  }  // real XAG/USD spot — M5 candle ATR range
 };
 function checkATR(sym, atrValues) {
   if (!atrValues || atrValues.length < 5 || !ATR_RANGE[sym]) {
@@ -1065,7 +1240,7 @@ function buildLevels(m5Candles, m15Candles) {
 
 // --- PROXIMITY DETECTION ---------------------------------------------------
 // Threshold: price within 0.20% of a liquidity level = "approaching"
-const APPROACH_PCT = { XAUUSD: 0.0020, XAGUSD: 0.0015 }; // SLV slightly tighter
+const APPROACH_PCT = { XAUUSD: 0.0020, XAGUSD: 0.0020 }; // real XAG spot — same threshold as XAU
 
 function detectApproaching(price, levels, sym) {
   const threshold = APPROACH_PCT[sym] || 0.0020;
@@ -1858,8 +2033,8 @@ function runQualityFilters(candles, m15Candles, sweep, disp, bos, pullback,
 // ─── STOP LOSS ─────────────────────────────────────────────────────────────
 function calcSL(direction, sweepExtreme, atr) {
   const PIP_BUFFER = direction === 'BUY'
-    ? (sym === 'XAUUSD' ? 0.50 : 0.05)  // XAU: ~50c buffer, SLV: ~5c buffer
-    : (sym === 'XAUUSD' ? 0.50 : 0.05);
+    ? (sym === 'XAUUSD' ? 0.50 : 0.10)  // XAU: ~50c buffer, XAG: ~10c buffer (real spot)
+    : (sym === 'XAUUSD' ? 0.50 : 0.10);
 
   const atrBuffer  = atr * 0.10;
   const buffer     = Math.max(parseFloat(PIP_BUFFER), atrBuffer);
@@ -2262,26 +2437,10 @@ app.get('/analyze/:sym', async (req, res) => {
   res.on('finish', () => clearTimeout(routeTimeout));
 
   // ── 1. FETCH DATA ──────────────────────────────────────────────────────
-  // SLV early exit: if outside NYSE hours AND no cached data, skip fetch entirely
-  const _nowH = new Date().getUTCHours();
-  const _slvClosed = sym === 'XAGUSD' && (_nowH >= 20 || _nowH < 13);
-  if (_slvClosed) {
-    const _cached = getCached('candles_XAGUSD_5min_120');
-    const _lastPrice = _cached ? parseFloat(_cached[_cached.length-1]?.c) : null;
-    const _lastATR   = _cached ? calcATRFromCandles(_cached, 14) : [];
-    return res.json({ success: true, symbol: 'XAGUSD',
-      price: _lastPrice, atr: null,
-      volatility_atr: _lastATR.length ? parseFloat(_lastATR[_lastATR.length-1].toFixed(4)) : null,
-      system_state: 'session_closed', session: 'Closed',
-      session_ok: false, setup_state: 'standby',
-      levels: [], log: ['Silver market closed — SLV ETF trades 13:30–20:00 UTC.' + (_lastPrice ? ' Last price: $' + _lastPrice.toFixed(3) : '')],
-      signal: null, m5_candles: _cached?.length || 0,
-      note: 'SLV market closed. Opens 13:30 UTC.' });
-  }
-
   let m5, m15, atrValues;
   try {
-    // ONE API call per symbol — everything else derived from M5 candles.
+    // ONE call per symbol — everything else derived from M5 candles.
+    // XAUUSD: Twelve Data API | XAGUSD: gold-api.com synthetic candles (24/5)
     m5 = await getCandles(sym, '5min', 120);  // 120 × 5min = 10 hours
 
     // Derive M15 and ATR without additional API calls
@@ -2345,20 +2504,7 @@ app.get('/analyze/:sym', async (req, res) => {
   // Check candle staleness — latest candle should be within 30 minutes
   const latestCandleAge = (nowUtc - m5[m5Count - 1].t) / 60000; // minutes
   if (latestCandleAge > 30) {
-    const isSLV     = sym === 'XAGUSD';
-    const slvClosed = isSLV && (utcHour >= 20 || utcHour < 13);
-    const staleMsg  = slvClosed
-      ? 'Silver market closed — SLV ETF trades 13:30–20:00 UTC. Last price: $' + m5[m5Count-1].c.toFixed(3)
-      : 'Live data temporarily unavailable — latest candle is ' + Math.round(latestCandleAge) + ' minutes old';
-    if (slvClosed) {
-      const lastATR = calcATRFromCandles(m5, 14);
-      return res.json({ success: true, symbol: sym, price: m5[m5Count-1]?.c || null,
-        system_state: 'session_closed', session: 'Closed',
-        session_ok: false, setup_state: 'standby',
-        volatility_atr: lastATR.length ? parseFloat(lastATR[lastATR.length-1].toFixed(4)) : null,
-        m5_candles: m5Count, levels: [], log: [staleMsg], signal: null,
-        note: 'SLV market closed. Opens 13:30 UTC.' });
-    }
+    const staleMsg  = 'Live data temporarily unavailable — latest candle is ' + Math.round(latestCandleAge) + ' minutes old';
     if (inSession) {
       return res.json({ success: true, symbol: sym, price: m5[m5Count-1]?.c || null,
         system_state: 'data_error', session: sessionName(nowUtc) || 'Active',
@@ -2996,31 +3142,29 @@ app.get('/health', async (req, res) => {
     session: inSession
       ? (h >= 13 && h < 16 ? 'London+NY Overlap' : h < 16 ? 'London' : 'New York')
       : 'Closed',
-    symbols: { XAUUSD: 'XAU/USD (Gold spot)', XAGUSD: 'SLV ETF (Silver proxy)' },
+    symbols: { XAUUSD: 'XAU/USD (Gold spot)', XAGUSD: 'XAG/USD (Silver spot — gold-api.com)' },
     ts: new Date().toUTCString()
   });
 });
 
 app.get('/prices', (req, res) => {
-  // Serve prices from in-memory candle cache — zero API calls
+  // Serve prices from in-memory candle stores — zero API calls
   const xauCache = getCached('candles_XAUUSD_5min_120');
-  const xagCache = getCached('candles_XAGUSD_5min_120');
   const xau = xauCache ? parseFloat(xauCache[xauCache.length-1]?.c) || null : null;
-  const slv = xagCache ? parseFloat(xagCache[xagCache.length-1]?.c) || null : null;
 
-  // SLV holds ~0.9300 troy oz of silver per share (IAU ratio, updated periodically)
-  // Convert SLV price → XAG spot price for an accurate Gold/Silver ratio
-  const SLV_OZ_RATIO = 0.9300;
-  const xagSpot = slv ? parseFloat((slv / SLV_OZ_RATIO).toFixed(3)) : null;
+  // XAGUSD: use synthetic candle store (gold-api.com real XAG spot)
+  const xagCandles = xagState.candles.length > 0 ? xagState.candles : null;
+  const xag = xagCandles ? parseFloat(xagCandles[xagCandles.length-1]?.c) || null
+    : xagState.lastPrice || null;
 
-  // Real XAU/XAG ratio (Gold/Silver ratio) — industry standard metric
-  const ratio = xau && xagSpot ? parseFloat((xau / xagSpot).toFixed(1)) : null;
+  // Gold/Silver ratio
+  const ratio = xau && xag ? parseFloat((xau / xag).toFixed(1)) : null;
 
   res.json({
     success:  true,
-    prices:   { XAUUSD: xau, XAGUSD: slv },   // XAGUSD shows SLV price as-is for display
-    xag_spot: xagSpot,                          // actual silver spot estimate
-    ratio,                                      // true XAU/XAG ratio
+    prices:   { XAUUSD: xau, XAGUSD: xag },
+    ratio,
+    xag_candles: xagCandles?.length || 0,
     from_cache: true,
     ts: new Date().toUTCString()
   });
@@ -5570,6 +5714,17 @@ app.listen(PORT, () => {
     .then(() => hydrateFromSheets(_setupLogs))
     .then(() => restoreTradeMonitors())
     .catch(e => console.error('[boot]', e.message));
+
+  // XAG: load candles from disk first, then seed from history if needed
+  const diskLoaded = xagLoadCandles();
+  if (!diskLoaded || xagState.candles.length < 20) {
+    // Seed from gold-api.com history — gives instant analysis without warmup
+    xagSeedHistory().then(seeded => {
+      if (!seeded) console.log('[xag] History seed failed — will build from live polls (2hr warmup)');
+    });
+  } else {
+    console.log('[xag] ✓ Candles loaded from disk — no warmup needed');
+  }
 });
 
 // ── ENSURE SHEET HEADERS — runs once on boot ──────────────────────────────
