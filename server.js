@@ -3511,11 +3511,31 @@ app.get('/test-signal', async (req, res) => {
 // Usage: /debug/XAUUSD or /debug/XAGUSD
 app.get('/debug/:sym', async (req, res) => {
   const sym = req.params.sym.toUpperCase();
-  const td  = SYMBOLS[sym];
-  if (!td) return res.status(400).json({ error: 'Unknown symbol' });
+  if (!SYMBOLS[sym]) return res.status(400).json({ error: 'Unknown symbol' });
+
+  // XAGUSD uses gold-api.com synthetic engine — not Twelve Data
+  if (sym === 'XAGUSD') {
+    try {
+      const price = await xagFetchPrice();
+      res.json({
+        symbol:        'XAGUSD',
+        source:        'gold-api.com (real XAG/USD spot)',
+        current_price: price,
+        candles_in_memory: xagState.candles.length,
+        last_candle:   xagState.candles[xagState.candles.length - 1] || null,
+        seeded:        xagState.seeded,
+        last_fetch:    xagState.lastFetchAt ? new Date(xagState.lastFetchAt).toUTCString() : 'never',
+        ok:            price !== null,
+      });
+    } catch(e) {
+      res.json({ symbol: 'XAGUSD', error: e.message });
+    }
+    return;
+  }
+
+  // XAUUSD — Twelve Data
+  const td = SYMBOLS[sym];
   try {
-    // Test the simplest possible request: last 5 M5 candles
-    // Note: XAGUSD uses SLV ETF as free-tier silver proxy
     const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(td)}&interval=5min&outputsize=5&apikey=${TWELVE_KEY}`;
     console.log('[debug] fetching:', url.replace(TWELVE_KEY, '***'));
     const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
