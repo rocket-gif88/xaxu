@@ -3739,6 +3739,148 @@ function formatTelegramPreSignal(sym, ns) {
 // No alert fires twice for the same event in the same setup lifecycle.
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ── FILTER 1: HTF ALIGNMENT ───────────────────────────────────────────────
+// Returns { allowed, reason, htfBias, strength }
+// Blocks direction that opposes a STRONG HTF bias.
+// STRONG = BOS confirmed + HH/HL or LH/LL structure both present.
+// NEUTRAL = no clear structure → both directions allowed.
+function checkHTFAlignment(m15Candles, direction) {
+  if (!m15Candles || m15Candles.length < 8) {
+    return { allowed: true, reason: 'Insufficient M15 data — filter skipped', htfBias: 'NEUTRAL', strength: 'WEAK' };
+  }
+
+  const candles = m15Candles.slice(-20);
+  const n = candles.length;
+
+  // Find swing highs and lows
+  const swingHighs = [], swingLows = [];
+  for (let i = 1; i < n - 1; i++) {
+    if (candles[i].h > candles[i-1].h && candles[i].h > candles[i+1].h)
+      swingHighs.push(candles[i].h);
+    if (candles[i].l < candles[i-1].l && candles[i].l < candles[i+1].l)
+      swingLows.push(candles[i].l);
+  }
+
+  if (swingHighs.length < 2 || swingLows.length < 2) {
+    return { allowed: true, reason: 'Insufficient swing structure', htfBias: 'NEUTRAL', strength: 'WEAK' };
+  }
+
+  const lastHigh = swingHighs[swingHighs.length - 1];
+  const prevHigh = swingHighs[swingHighs.length - 2];
+  const lastLow  = swingLows[swingLows.length  - 1];
+  const prevLow  = swingLows[swingLows.length  - 2];
+
+  const isHHHL = lastHigh > prevHigh && lastLow > prevLow;  // bullish
+  const isLHLL = lastHigh < prevHigh && lastLow < prevLow;  // bearish
+
+  // BOS check on last 5 candles
+  const BOS_MARGIN = 0.0002;
+  let hasBullishBOS = false, hasBearishBOS = false;
+  for (const c of candles.slice(-5)) {
+    if (c.c > lastHigh * (1 + BOS_MARGIN)) hasBullishBOS = true;
+    if (c.c < lastLow  * (1 - BOS_MARGIN)) hasBearishBOS = true;
+  }
+
+  // STRONG bias requires BOTH structure AND BOS
+  let htfBias = 'NEUTRAL';
+  let strength = 'WEAK';
+
+  if (isHHHL && hasBullishBOS) { htfBias = 'BULLISH'; strength = 'STRONG'; }
+  else if (isLHLL && hasBearishBOS) { htfBias = 'BEARISH'; strength = 'STRONG'; }
+  else if (isHHHL || hasBullishBOS) { htfBias = 'BULLISH'; strength = 'MODERATE'; }
+  else if (isLHLL || hasBearishBOS) { htfBias = 'BEARISH'; strength = 'MODERATE'; }
+
+  // Only block on STRONG bias
+  if (strength === 'STRONG') {
+    if (htfBias === 'BULLISH' && direction === 'SELL') {
+      return { allowed: false, reason: 'HTF strongly bullish (HH/HL + BOS UP) — SELL blocked', htfBias, strength };
+    }
+    if (htfBias === 'BEARISH' && direction === 'BUY') {
+      return { allowed: false, reason: 'HTF strongly bearish (LH/LL + BOS DOWN) — BUY blocked', htfBias, strength };
+    }
+  }
+
+  return { allowed: true, reason: 'HTF ' + htfBias + ' (' + strength + ') — ' + direction + ' allowed', htfBias, strength };
+}
+
+// ── FILTER 2: MICRO-CHOP FILTER ───────────────────────────────────────────
+// Returns { chop, reason, totalRange, atrRatio }
+// Detects low-conviction ranging using last 10 M5 candles.
+// Blocks setup creation when market is compressing with no structure.
+function checkMicroChop(m5Candles, currentATR) {
+  if (!m5Candles || m5Candles.length < 10 || !currentATR || currentATR === 0) {
+    return { chop: false, reason: 'Insufficient data — filter skipped', totalRange: 0, atrRatio: 0 };
+  }
+
+  const last10 = m5Candles.slice(-10);
+
+  // Condition 1: Total price range < 0.6 × ATR
+  const high10     = Math.max(...last10.map(c => c.h));
+  const low10      = Math.min(...last10.map(c => c.l));
+  const totalRange = high10 - low10;
+  const atrRatio   = parseFloat((totalRange / currentATR).toFixed(2));
+  const rangeTight = atrRatio < 0.6;
+
+  // Condition 2: No clear HH/HL or LH/LL in last 10 M5 candles
+  const closes = last10.map(c => c.c);
+  let higherHighs = 0, higherLows = 0, lowerHighs = 0, lowerLows = 0;
+  for (let i = 1; i < last10.length; i++) {
+    if (last10[i].h > last10[i-1].h) higherHighs++;
+    else lowerHighs++;
+    if (last10[i].l > last10[i-1].l) higherLows++;
+    else lowerLows++;
+  }
+  // No clear structure = neither trend dominates by >2 candles
+  const bullishCount = Math.min(higherHighs, higherLows);
+  const bearishCount = Math.min(lowerHighs, lowerLows);
+  const noStructure  = Math.abs(bullishCount - bearishCount) <= 2;
+
+  const isChop = rangeTight && noStructure;
+
+  const reason = isChop
+    ? 'Micro-chop: range=' + totalRange.toFixed(2) + ' (' + atrRatio + '×ATR < 0.6) + no structure'
+    : 'Not chop: range=' + totalRange.toFixed(2) + ' (' + atrRatio + '×ATR)' +
+      (noStructure ? ' [no structure but range OK]' : ' [structure present]');
+
+  return { chop: isChop, reason, totalRange: parseFloat(totalRange.toFixed(3)), atrRatio };
+}
+
+// ── FILTER 3: POST-SWEEP MOMENTUM FILTER ─────────────────────────────────
+// Returns { passed, reason, moveSize, atrMultiple }
+// Called AFTER sweep confirms, BEFORE displacement evaluation.
+// Requires price to move at least 0.5 × ATR away from sweep level within 2 candles.
+function checkPostSweepMomentum(m5Candles, sweepCandleIdx, sweepExtreme, direction, currentATR) {
+  if (!currentATR || currentATR === 0 || sweepCandleIdx < 0) {
+    return { passed: true, reason: 'Cannot evaluate — filter skipped', moveSize: 0, atrMultiple: 0 };
+  }
+
+  const threshold  = currentATR * 0.5;
+  const postCandles = m5Candles.slice(sweepCandleIdx + 1, sweepCandleIdx + 3); // up to 2 candles
+
+  if (postCandles.length === 0) {
+    return { passed: true, reason: 'No post-sweep candles yet — waiting', moveSize: 0, atrMultiple: 0 };
+  }
+
+  // BUY sweep: price should move UP from sweep extreme
+  // SELL sweep: price should move DOWN from sweep extreme
+  let maxMove = 0;
+  for (const c of postCandles) {
+    const move = direction === 'BUY'
+      ? c.h - sweepExtreme   // how far UP from the sweep low
+      : sweepExtreme - c.l;  // how far DOWN from the sweep high
+    if (move > maxMove) maxMove = move;
+  }
+
+  const atrMultiple = parseFloat((maxMove / currentATR).toFixed(2));
+  const passed      = maxMove >= threshold;
+
+  const reason = passed
+    ? 'Post-sweep momentum: moved ' + maxMove.toFixed(2) + ' (' + atrMultiple + '×ATR ≥ 0.5×) ✓'
+    : 'Post-sweep momentum FAILED: moved only ' + maxMove.toFixed(2) + ' (' + atrMultiple + '×ATR < 0.5×)';
+
+  return { passed, reason, moveSize: parseFloat(maxMove.toFixed(3)), atrMultiple };
+}
+
 const SETUP_STAGES = ['idle','approaching','sweep','move','trend','pullback','entry'];
 
 function createSetup(sym, direction, levelOrZone) {
@@ -4850,9 +4992,35 @@ async function autoScan() {
           console.log('[validate] ' + sym + ': setup creation blocked (' + vResult.reasons.length + ' failures)');
           await delay(400); continue;
         }
+
+        // ── FILTER 1: HTF ALIGNMENT ────────────────────────────
+        const htfAlign = checkHTFAlignment(m15, sweep.direction);
+        console.log('[filter1] ' + sym + ': ' + htfAlign.reason);
+        if (!htfAlign.allowed) {
+          logScanEvent(sym, 'FILTER_HTF_BLOCKED', htfAlign.reason, {
+            direction: sweep.direction,
+            notes: JSON.stringify({ htf_bias: htfAlign.htfBias, strength: htfAlign.strength,
+              filter_blocked_reason: htfAlign.reason }),
+          });
+          await delay(400); continue;
+        }
+
+        // ── FILTER 2: MICRO-CHOP ───────────────────────────────
+        const chopCheck = checkMicroChop(m5, currentATR);
+        console.log('[filter2] ' + sym + ': ' + chopCheck.reason);
+        if (chopCheck.chop) {
+          logScanEvent(sym, 'FILTER_CHOP_BLOCKED', chopCheck.reason, {
+            direction: sweep.direction,
+            notes: JSON.stringify({ chop_detected: true, total_range: chopCheck.totalRange,
+              atr_ratio: chopCheck.atrRatio, filter_blocked_reason: chopCheck.reason }),
+          });
+          await delay(400); continue;
+        }
+
         setup = createAndLogSetup(sym, sweep.direction, sweep.level);
         setups[sym] = setup;
-        console.log('[validate] ' + sym + ': setup passed all 8 rules — created id=' + setup.id);
+        console.log('[validate] ' + sym + ': setup passed all rules — created id=' + setup.id +
+          ' | HTF=' + htfAlign.htfBias + '/' + htfAlign.strength + ' | chop=false');
       }
 
       // Block if already invalidated
@@ -4915,6 +5083,30 @@ async function autoScan() {
         }
         console.log('[' + sym + '] Sweep fired this scan — waiting for next scan before displacement');
         await delay(400); continue;
+      }
+
+      // ── FILTER 3: POST-SWEEP MOMENTUM ────────────────────────
+      // Runs every scan after sweep confirms, until displacement is found.
+      // Allows 3 candles (15 min) before blocking — gives momentum time to form.
+      if (setup.events.sweep && !setup.events.move) {
+        const candlesSinceSweep = m5.length - 1 - sweep.candleIdx;
+        if (candlesSinceSweep >= 2) { // only evaluate after at least 2 post-sweep candles
+          const momentumCheck = checkPostSweepMomentum(m5, sweep.candleIdx, sweep.sweepExtreme, sweep.direction, currentATR);
+          console.log('[filter3] ' + sym + ': ' + momentumCheck.reason);
+          if (!momentumCheck.passed && candlesSinceSweep >= 3) {
+            // Hard block after 3 candles (15 min) with no momentum
+            logScanEvent(sym, 'FILTER_MOMENTUM_BLOCKED', momentumCheck.reason, {
+              direction: sweep.direction,
+              notes: JSON.stringify({ momentum_passed: false, move_size: momentumCheck.moveSize,
+                atr_multiple: momentumCheck.atrMultiple, candles_since_sweep: candlesSinceSweep,
+                filter_blocked_reason: momentumCheck.reason }),
+            });
+            await invalidateSetup(sym, 'Post-sweep momentum failed — price moved only ' +
+              momentumCheck.moveSize + ' (' + momentumCheck.atrMultiple + '×ATR < 0.5×) after sweep.');
+            resetSetup(sym, 'Post-sweep momentum failed');
+            await delay(400); continue;
+          }
+        }
       }
 
       // ── STAGE: DISPLACEMENT (MOVE) ────────────────────────────
