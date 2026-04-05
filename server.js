@@ -4622,6 +4622,23 @@ async function autoScan() {
         await delay(400); continue;
       }
 
+      // ── HTF NEUTRAL + LOW ATR GATE ─────────────────────────────
+      // Block NEW setup creation when market has no directional conviction
+      // AND volatility is low. Existing setups in progress are allowed to continue.
+      // Thresholds: HTF = NEUTRAL, ATR < 3.0 (below the session mean of 2.87)
+      const htfIsNeutral  = (timing?.htfBias || htfResult.bias) === 'NEUTRAL';
+      const atrIsBelowMid = currentATR !== null && currentATR < 3.0;
+      const hasActiveSetup = setup && setup.active && !setup.invalidated;
+
+      if (htfIsNeutral && atrIsBelowMid && !hasActiveSetup) {
+        console.log('[gate] ' + sym + ': HTF=NEUTRAL + ATR=' + (currentATR?.toFixed(2) || '—') +
+          ' < 3.0 — no new setups (choppy low-vol market)');
+        logScanEvent(sym, 'HTF_ATR_BLOCKED',
+          'HTF NEUTRAL + ATR ' + (currentATR?.toFixed(2) || '—') + ' < 3.0 — setup creation blocked',
+          { notes: htfResult.reason });
+        await delay(400); continue;
+      }
+
       // ── PRIMARY ZONE SELECTION — only this zone matters ─────────
       const structBias = timing
         ? { dir: timing.structuralBiasDir, stage: timing.structuralBiasStage }
