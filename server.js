@@ -138,13 +138,14 @@ function getZoneFreshness(sym, zone) {
 
   const count = entry.touchCount;
 
-  // v5.4: suppress raised from 4→6 touches
-  // (XAG was exhausted 63% of scans — too aggressive for current market)
+  // v5.5: suppress raised to 8 touches (XAG still 62% exhausted at 6)
   if (count <= 1) return { fresh: true,  touchCount: count, label: '🟢 FRESH (1st test)',           suppress: false };
   if (count === 2) return { fresh: false, touchCount: count, label: '🟡 RETESTED (2nd test)',        suppress: false };
   if (count === 3) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (3rd test)',         suppress: false };
   if (count === 4) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (4th test)',         suppress: false };
   if (count === 5) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (5th test)',         suppress: false };
+  if (count === 6) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (6th test)',         suppress: false };
+  if (count === 7) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (7th test)',         suppress: false };
   return             { fresh: false, touchCount: count, label: '🔴 EXHAUSTED (' + count + ' tests)', suppress: true  };
 }
 
@@ -1117,9 +1118,10 @@ function rankZone(z, price, sess, m5Candles) {
   const breakdown = {};
   let total = 0;
 
-  // ── A. TOUCH COUNT (max 30) ───────────────────────────────────
+  // ── A. TOUCH COUNT (max 30) — v5.5: boosted for high-touch zones
   const touches = z.totalTouches || 0;
-  const touchScore = touches >= 15 ? 30
+  const touchScore = touches >= 20 ? 30  // v5.5: explicit 20+ tier
+                   : touches >= 15 ? 28
                    : touches >= 10 ? 24
                    : touches >= 6  ? 18
                    : touches >= 3  ? 10 : 0;
@@ -1434,8 +1436,9 @@ function detectSweep(candles, levels) {
 function detectDisplacement(candles, sweepIdx, direction, minRatioOverride) {
   // minRatioOverride: optional — allows caller to require stricter displacement
   const MIN_RATIO_OVERRIDE = minRatioOverride || null;
-  // v5.4: Min ratio 1.0x. STRONG=1.5x+, VALID=1.0–1.5x (was 1.2x — live data showed collapse at displacement stage)
-  const BODY_MULT  = 1.0;  // was 1.2 → 1.0 based on live data
+  // v5.5: Min ratio 0.8x. STRONG=1.5x+, VALID=0.8–1.5x
+  // (was 1.0x — only 3/68 sweeps reaching displacement; small candle environment)
+  const BODY_MULT  = 0.8;  // was 1.0 → 0.8
   const CLOSE_ZONE = 0.25;
   const slice = candles.slice(Math.max(0, sweepIdx - 10), sweepIdx);
   if (slice.length < 3) return { found: false, reason: 'insufficient candle history' };
@@ -1457,7 +1460,7 @@ function detectDisplacement(candles, sweepIdx, direction, minRatioOverride) {
       : (c.h - c.c) / r >= (1 - CLOSE_ZONE);
     if (bodyStrong && dirOk && closeZone) {
       const ratio    = parseFloat((b / avgBody10).toFixed(2));
-      const strength = ratio >= 1.5 ? 'STRONG' : ratio >= 1.2 ? 'VALID+' : 'VALID'; // v5.4 strength label
+      const strength = ratio >= 1.5 ? 'STRONG' : ratio >= 1.2 ? 'GOOD' : ratio >= 1.0 ? 'VALID+' : 'VALID'; // v5.5 strength label
       return { found: true, candleIdx: idx,
                ratio, avgBody: avgBody10, weakGap,
                strength,  // 'STRONG' | 'VALID'
@@ -1955,13 +1958,14 @@ function scoreSetup(sessionLabel, sessionOk, sweep, displacement, bos, pullback,
   if (!displacement || !displacement.found) {
     breakdown.displacement = { score: 0, max: 20, note: 'No displacement detected' };
   } else {
-    // v5.4: 1.0x = VALID (+8), 1.2x = VALID+ (+12), 1.5x+ = STRONG (+20)
+    // v5.5: 0.8x = VALID (+5), 1.0x = VALID+ (+8), 1.2x = GOOD (+12), 1.5x+ = STRONG (+20)
     const dispScore = displacement.ratio >= 3.0 ? 20
                     : displacement.ratio >= 2.5 ? 18
                     : displacement.ratio >= 2.0 ? 16
                     : displacement.ratio >= 1.5 ? 20   // STRONG
-                    : displacement.ratio >= 1.2 ? 12   // VALID+
-                    : displacement.ratio >= 1.0 ? 8    // VALID
+                    : displacement.ratio >= 1.2 ? 12   // GOOD
+                    : displacement.ratio >= 1.0 ? 8    // VALID+
+                    : displacement.ratio >= 0.8 ? 5    // VALID
                     : 0;
     const dispFinal = displacement.weakGap ? Math.max(dispScore - 3, 0) : dispScore;
     breakdown.displacement = { score: dispFinal, max: 20, ratio: displacement.ratio, strength: displacement.strength || 'VALID' };
@@ -3391,9 +3395,9 @@ app.get('/debug/:sym', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.json({
-  status:'ok', version:'5.4',
+  status:'ok', version:'5.5',
   engine:'Liquidity Sweep — Adaptive Execution Engine (M5+M15)',
-  rules: ['PDH/PDL/ASH/ASL/EQH/EQL levels','0.02% sweep break required','1.0–3× body displacement','M5 BOS required / M15 optional +5','30–70% pullback (tiered scoring)','continuation entry (STRONG disp only)','zone score ≥ 50, confidence ≥ 70','ATR 1.5–20 XAUUSD (recalibrated)','10-candle time decay']
+  rules: ['PDH/PDL/ASH/ASL/EQH/EQL levels','0.02% sweep break required','0.8–3× body displacement','M5 BOS required / M15 optional +5','30–70% pullback (tiered scoring)','continuation entry (STRONG disp only)','zone score ≥ 50, confidence ≥ 70','ATR 1.5–20 XAUUSD','10-candle time decay']
 }));
 
 // ═══════════════════════════════════════════════════════════════
@@ -3800,6 +3804,10 @@ const tradeMonitor = { XAUUSD: null, XAGUSD: null };
 
 // Per-symbol timing state — persists through setup resets
 // Tracks cooldowns for zone detection, bias flips, invalidation windows
+// v5.5: ZONE_LOCK_SCANS — after sweep confirms, lock primary zone for N scans
+// Prevents zone selector from switching zones mid-setup (root cause of 55% instant resets)
+const ZONE_LOCK_SCANS = 5; // lock for 5 scans (25 min) after sweep
+
 const symTiming = {
   XAUUSD: {
     zoneDetectionAllowedAt:  0,
@@ -3811,17 +3819,19 @@ const symTiming = {
     lastSweepAlertAt:        0,
     lastSweepDir:            null,
     lastSweepZoneKey:        null,
-    // Structural bias — persists until opposite structure confirmed
     structuralBiasDir:       null,
     structuralBiasStage:     null,
     structuralBiasAt:        0,
     consecutiveFailures:     { BUY: 0, SELL: 0 },
-    // HTF (M15) structural bias — updated every scan
-    htfBias:                 'NEUTRAL',  // 'BULLISH' | 'BEARISH' | 'NEUTRAL'
-    htfLastBOS:              'NONE',     // 'UP' | 'DOWN' | 'NONE'
+    htfBias:                 'NEUTRAL',
+    htfLastBOS:              'NONE',
     htfLastHigh:             0,
     htfLastLow:              0,
     htfUpdatedAt:            0,
+    // v5.5: Zone lock after sweep
+    lockedZone:              null,   // the zone object locked after sweep confirms
+    lockedZoneKey:           null,   // priceRange string
+    lockedZoneScansLeft:     0,      // countdown — zone released when reaches 0
   },
   XAGUSD: {
     zoneDetectionAllowedAt:  0,
@@ -3842,6 +3852,9 @@ const symTiming = {
     htfLastHigh:             0,
     htfLastLow:              0,
     htfUpdatedAt:            0,
+    lockedZone:              null,
+    lockedZoneKey:           null,
+    lockedZoneScansLeft:     0,
   }
 };
 
@@ -4487,11 +4500,14 @@ async function autoScan() {
         console.log('[monitor] ' + sym + ': session closed — trade monitor cleared (no result)');
         tradeMonitor[sym] = null;
       }
-      // Reset consecutive failures and structural bias at session close
+      // Reset consecutive failures, structural bias, and zone lock at session close
       if (symTiming[sym]) {
         symTiming[sym].structuralBiasDir   = null;
         symTiming[sym].structuralBiasStage = null;
         symTiming[sym].consecutiveFailures = { BUY: 0, SELL: 0 };
+        symTiming[sym].lockedZone          = null;   // v5.5: clear zone lock
+        symTiming[sym].lockedZoneKey       = null;
+        symTiming[sym].lockedZoneScansLeft = 0;
       }
       clearZoneMemory(sym); // zone memory resets each session
     }
@@ -4610,7 +4626,25 @@ async function autoScan() {
       const structBias = timing
         ? { dir: timing.structuralBiasDir, stage: timing.structuralBiasStage }
         : null;
-      const primaryZone = selectPrimaryZone(levels, livePrice, sess, m5, structBias);
+
+      // v5.5: If a zone is locked (post-sweep), use it instead of re-ranking
+      // This prevents the zone selector from switching zones between sweep and BOS
+      let primaryZone;
+      if (timing && timing.lockedZone && timing.lockedZoneScansLeft > 0) {
+        timing.lockedZoneScansLeft--;
+        primaryZone = timing.lockedZone;
+        console.log('[zone-lock] ' + sym + ': using locked zone ' + timing.lockedZoneKey +
+          ' (' + timing.lockedZoneScansLeft + ' scans remaining)');
+      } else {
+        if (timing && timing.lockedZone) {
+          console.log('[zone-lock] ' + sym + ': zone lock expired — resuming normal selection');
+          timing.lockedZone          = null;
+          timing.lockedZoneKey       = null;
+          timing.lockedZoneScansLeft = 0;
+        }
+        primaryZone = selectPrimaryZone(levels, livePrice, sess, m5, structBias);
+      }
+
       if (!primaryZone) {
         console.log('[' + sym + '] No primary zone found — skip');
         logScanEvent(sym, 'NO_ZONE', 'No qualifying EQH/EQL zone found', { notes: 'Price=$' + livePrice });
@@ -4703,11 +4737,15 @@ async function autoScan() {
       }
 
       // ── ZONE STRENGTH CHECK AT TREND SHIFT+ STAGES ─────────────
-      if (setup && setup.active && setup.events?.trend) {
-        if (zoneScore < 50) {
-          console.log('[' + sym + '] Setup cancelled at trend+ stage — zone score ' + zoneScore + ' < 50');
-          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 50).');
-          resetSetup(sym, 'Zone too weak at trend+ stage');
+      // v5.5: Only cancel if truly catastrophic (<40) once past sweep stage.
+      // Before v5.5, setups with score 59 were killed mid-progress — live data
+      // showed this was the #2 cause of false invalidations.
+      if (setup && setup.active && setup.events?.sweep) {
+        const killThreshold = setup.events?.trend ? 40 : 50; // more lenient after sweep
+        if (zoneScore < killThreshold) {
+          console.log('[' + sym + '] Setup cancelled at ' + setup.stage + ' stage — zone score ' + zoneScore + ' < ' + killThreshold);
+          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength (score ' + zoneScore + '/100 < ' + killThreshold + ').');
+          resetSetup(sym, 'Zone too weak mid-progress');
           await delay(400); continue;
         }
       }
@@ -4765,14 +4803,18 @@ async function autoScan() {
       }
 
       // New sweep on a DIFFERENT zone than current setup → reset
+      // v5.5: Skip reset if setup has confirmed sweep stage (zone is locked)
       if (setup && sweep.found) {
         const newZoneId = sweep.level && sweep.level.isZone
           ? Math.round(sweep.level.minPrice) + '-' + Math.round(sweep.level.maxPrice)
           : Math.round(parseFloat(sweep.level?.price || 0));
-        if (setup.zoneId && setup.zoneId !== String(newZoneId)) {
+        const zoneLocked = timing && timing.lockedZoneScansLeft > 0;
+        if (setup.zoneId && setup.zoneId !== String(newZoneId) && !zoneLocked) {
           console.log('[' + sym + '] New sweep on different zone — resetting setup');
           resetSetup(sym, 'New sweep on different zone');
           setup = null;
+        } else if (setup.zoneId && setup.zoneId !== String(newZoneId) && zoneLocked) {
+          console.log('[zone-lock] ' + sym + ': different zone sweep ignored — zone locked after sweep');
         }
       }
 
@@ -4842,12 +4884,17 @@ async function autoScan() {
       // Prevents bulk-confirmation of multiple stages from historical data.
       if (sweepFired) {
         logStageUpdate(setup, 'sweep');
-        // Record structural bias at sweep stage
         if (timing) {
           timing.structuralBiasDir   = sweep.direction;
           timing.structuralBiasStage = 'sweep';
           timing.structuralBiasAt    = Date.now();
           console.log('[bias] ' + sym + ': structural bias set → ' + sweep.direction + ' (sweep stage)');
+          // v5.5: Lock this zone so selector can't switch it between stages
+          timing.lockedZone          = primaryZone;
+          timing.lockedZoneKey       = primaryZone.priceRange;
+          timing.lockedZoneScansLeft = ZONE_LOCK_SCANS;
+          console.log('[zone-lock] ' + sym + ': zone locked → ' + primaryZone.priceRange +
+            ' for ' + ZONE_LOCK_SCANS + ' scans after sweep');
         }
         console.log('[' + sym + '] Sweep fired this scan — waiting for next scan before displacement');
         await delay(400); continue;
@@ -5066,7 +5113,7 @@ async function autoScan() {
       // Run aggressive entry engine — gated by zone score
       // Zone score < 75 → aggressive engine suppressed, standard only
       // Zone score ≥ 75 → full aggressive engine enabled
-      const allowAggressive = zoneScore >= 75;
+      const allowAggressive = zoneScore >= 60; // v5.5: was 75 — no zone ever scored ≥75 in live data
       const entryResult = allowAggressive
         ? aggressiveEntryEngine(sym, m5, primaryZone, sess)
         : { type: 'NO_ENTRY', reason: 'Zone score ' + zoneScore + ' < 75 — aggressive suppressed' };
