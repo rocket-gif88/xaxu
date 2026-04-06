@@ -735,24 +735,54 @@ function xagLoadCandles() {
 // Fetch current XAG spot price from gold-api.com (free, unlimited, no key)
 async function xagFetchPrice() {
   try {
-    const token = process.env.GOLDAPI_IO_TOKEN || 'goldapi-eiqt6msmnmjlwa5-io';
-    const resp = await fetch('https://www.goldapi.io/api/XAG/USD', {
-      headers: { 'x-access-token': token, 'Content-Type': 'application/json' },
+    // Yahoo Finance public endpoint — no auth, no quota, real XAG/USD spot
+    const url  = 'https://query1.finance.yahoo.com/v8/finance/chart/XAGUSD=X?interval=1m&range=5m';
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
       signal: AbortSignal.timeout(8000),
     });
     const json = await resp.json();
-    if (!xagState._priceLoggedOnce) {
-      console.log('[xag] Raw price response:', JSON.stringify(json).slice(0, 200));
-      xagState._priceLoggedOnce = true;
-    }
-    const price = parseFloat(json.price || json.ask || json.bid || 0);
+    const price = json?.chart?.result?.[0]?.meta?.regularMarketPrice ||
+                  json?.chart?.result?.[0]?.meta?.previousClose || null;
     if (!price || price <= 0) {
-      console.log('[xag] No price in response. Keys:', Object.keys(json || {}).join(','));
+      console.log('[xag] Yahoo Finance: no price. Keys:', Object.keys(json?.chart || {}).join(','));
       return null;
     }
-    return price;
+    return parseFloat(price);
   } catch(e) {
     console.error('[xag] price fetch error:', e.message);
+    return null;
+  }
+}
+
+// Get full 5min candles from Yahoo Finance for seeding
+async function xagFetchCandles(count = 120) {
+  try {
+    const url  = `https://query1.finance.yahoo.com/v8/finance/chart/XAGUSD=X?interval=5m&range=2d`;
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(12000),
+    });
+    const json = await resp.json();
+    const result = json?.chart?.result?.[0];
+    if (!result) return null;
+
+    const ts        = result.timestamp || [];
+    const ohlc      = result.indicators?.quote?.[0] || {};
+    const { open, high, low, close } = ohlc;
+    if (!ts.length || !close) return null;
+
+    const candles = ts.map((t, i) => ({
+      t: t * 1000,
+      o: parseFloat(open?.[i]  || close[i]),
+      h: parseFloat(high?.[i]  || close[i]),
+      l: parseFloat(low?.[i]   || close[i]),
+      c: parseFloat(close[i]),
+    })).filter(c => c.c > 0 && !isNaN(c.c));
+
+    return candles.slice(-count);
+  } catch(e) {
+    console.error('[xag] candles fetch error:', e.message);
     return null;
   }
 }
@@ -762,147 +792,95 @@ async function xagFetchPrice() {
 // Falls back to current-price repetition if history endpoint fails.
 async function xagSeedHistory() {
   try {
-    console.log('[xag] Seeding history from gold-api.com...');
-
-    // Try history endpoint — goldapi.io free tier
-    let items = [];
-    try {
-      const token = process.env.GOLDAPI_IO_TOKEN || 'goldapi-eiqt6msmnmjlwa5-io';
-      // goldapi.io historical: /api/XAG/USD/YYYYMMDD
-      // Seed last 5 days of daily prices to establish structure
-      const dates = [];
-      for (let i = 5; i >= 1; i--) {
-        const d = new Date(Date.now() - i * 86400000);
-        // Skip weekends
-        if (d.getUTCDay() === 0 || d.getUTCDay() === 6) continue;
-        dates.push(d.toISOString().slice(0,10).replace(/-/g,''));
-      }
-      for (const date of dates) {
-        try {
-          const r = await fetch(`https://www.goldapi.io/api/XAG/USD/${date}`, {
-            headers: { 'x-access-token': token },
-            signal: AbortSignal.timeout(8000),
-          });
-          const d = await r.json();
-          if (d.price) items.push({ price: d.price, timestamp: new Date(date.slice(0,4)+'-'+date.slice(4,6)+'-'+date.slice(6,8)).getTime()/1000 });
-        } catch(e) { /* skip failed date */ }
-      }
-      console.log('[xag] History seed: fetched ' + items.length + ' daily prices');
-    } catch(e) {
-      console.log('[xag] History endpoint failed:', e.message);
-    }
-
-    if (items.length > 0) {
-      // Normalise each item — handle any field naming
-      const sorted = [...items].sort((a, b) => {
-        const ta = a.timestamp || a.ts || a.time || a.date || 0;
-        const tb = b.timestamp || b.ts || b.time || b.date || 0;
-        return (typeof ta === 'string' ? new Date(ta).getTime() : ta * 1000)
-             - (typeof tb === 'string' ? new Date(tb).getTime() : tb * 1000);
-      });
-
-      const synthetic = sorted.map((item, i) => {
-        const price    = parseFloat(item.price || item.close || item.value || item.rate || 0);
-        const prev     = i > 0 ? parseFloat(sorted[i-1].price || sorted[i-1].close || sorted[i-1].value || price) : price;
-        const rawTs    = item.timestamp || item.ts || item.time || item.date;
-        const ts       = typeof rawTs === 'string'
-          ? new Date(rawTs).getTime()
-          : (rawTs || 0) > 1e10 ? rawTs : rawTs * 1000;
-        return { t: ts || (Date.now() - (sorted.length - i) * 3600000),
-                 o: prev, h: Math.max(price, prev), l: Math.min(price, prev),
-                 c: price, _synthetic: true };
-      }).filter(c => c.c > 0);
-
-      if (synthetic.length > 0) {
-        xagState.candles = synthetic.slice(-XAG_MAX_CANDLES);
-        xagState.seeded  = true;
-        xagSaveCandles();
-        console.log('[xag] ✓ Seeded ' + xagState.candles.length + ' candles from history');
-        return true;
-      }
-    }
-
-    // History failed — seed with current price repeated as 60 synthetic candles
-    // so engine has enough data to run ATR/structure analysis immediately
-    console.log('[xag] History empty — seeding from current price...');
-    const currentPrice = await xagFetchPrice();
-    if (currentPrice && currentPrice > 0) {
-      const now = Date.now();
-      const seed = [];
-      for (let i = 59; i >= 0; i--) {
-        // Add tiny variation so ATR isn't exactly 0
-        const jitter = (Math.random() - 0.5) * 0.04;
-        const p      = parseFloat((currentPrice + jitter).toFixed(3));
-        seed.push({ t: now - i * XAG_CANDLE_MS, o: p, h: p + 0.01, l: p - 0.01, c: p, _synthetic: true });
-      }
-      xagState.candles = seed;
+    console.log('[xag] Seeding from Yahoo Finance (XAGUSD=X 5min)...');
+    const candles = await xagFetchCandles(120);
+    if (candles && candles.length >= 10) {
+      xagState.candles = candles;
       xagState.seeded  = true;
       xagSaveCandles();
-      console.log('[xag] ✓ Price-seeded ' + seed.length + ' candles at $' + currentPrice);
+      console.log('[xag] ✓ Seeded ' + candles.length + ' real M5 candles from Yahoo Finance');
       return true;
     }
   } catch(e) {
     console.error('[xag] Seed error:', e.message);
   }
+
+  // Fallback — seed with current price repeated
+  console.log('[xag] Yahoo seed failed — using price-repeat fallback');
+  const currentPrice = await xagFetchPrice();
+  if (currentPrice && currentPrice > 0) {
+    const now  = Date.now();
+    const seed = [];
+    for (let i = 59; i >= 0; i--) {
+      const jitter = (Math.random() - 0.5) * 0.04;
+      const p      = parseFloat((currentPrice + jitter).toFixed(3));
+      seed.push({ t: now - i * XAG_CANDLE_MS, o: p, h: p + 0.01, l: p - 0.01, c: p, _synthetic: true });
+    }
+    xagState.candles = seed;
+    xagState.seeded  = true;
+    xagSaveCandles();
+    console.log('[xag] ✓ Price-seeded ' + seed.length + ' candles at $' + currentPrice);
+    return true;
+  }
   return false;
 }
 
-// Called on every autoScan — updates the synthetic candle store with latest price
+// Called on every autoScan — fetches real 5min candles from Yahoo Finance
 async function xagUpdateCandles() {
+  try {
+    // Try to get real 5min candles directly — much better than synthetic accumulation
+    const candles = await xagFetchCandles(120);
+    if (candles && candles.length >= 10) {
+      xagState.candles     = candles;
+      xagState.lastPrice   = candles[candles.length - 1].c;
+      xagState.lastFetchAt = Date.now();
+      xagState.seeded      = true;
+      xagSaveCandles();
+      console.log('[xag] Yahoo Finance: ' + candles.length + ' M5 candles, last=$' + xagState.lastPrice.toFixed(3));
+      return candles;
+    }
+  } catch(e) {
+    console.error('[xag] updateCandles error:', e.message);
+  }
+
+  // Fallback: use last known price to extend existing candles
   const price = await xagFetchPrice();
   if (!price || price <= 0) {
-    console.log('[xag] No price returned — using last known price');
+    console.log('[xag] No price — using cached candles (' + xagState.candles.length + ')');
     return xagState.candles.length > 0 ? xagState.candles : null;
   }
 
-  xagState.lastPrice  = price;
+  xagState.lastPrice   = price;
   xagState.lastFetchAt = Date.now();
 
-  const nowMs        = Date.now();
-  const windowStart  = Math.floor(nowMs / XAG_CANDLE_MS) * XAG_CANDLE_MS;
+  const nowMs       = Date.now();
+  const windowStart = Math.floor(nowMs / XAG_CANDLE_MS) * XAG_CANDLE_MS;
 
   if (!xagState.currentWindow || xagState.currentWindow.t !== windowStart) {
-    // Close the previous window and push it as a completed candle
     if (xagState.currentWindow && xagState.currentWindow.prices.length > 0) {
       const w = xagState.currentWindow;
-      const closes = w.prices;
       xagState.candles.push({
-        t: w.t,
-        o: w.o,
-        h: Math.max(...closes, w.o),
-        l: Math.min(...closes, w.o),
-        c: closes[closes.length - 1],
+        t: w.t, o: w.o,
+        h: Math.max(...w.prices, w.o),
+        l: Math.min(...w.prices, w.o),
+        c: w.prices[w.prices.length - 1],
       });
-      // Keep rolling window
-      if (xagState.candles.length > XAG_MAX_CANDLES) {
+      if (xagState.candles.length > XAG_MAX_CANDLES)
         xagState.candles = xagState.candles.slice(-XAG_MAX_CANDLES);
-      }
       xagSaveCandles();
-      console.log('[xag] Candle closed: $' + closes[closes.length-1].toFixed(3) +
-        ' | total candles: ' + xagState.candles.length);
     }
-    // Open new window
     xagState.currentWindow = { t: windowStart, o: price, prices: [price] };
   } else {
-    // Add price to current window
     xagState.currentWindow.prices.push(price);
   }
 
-  // Build a snapshot including the open (in-progress) candle
   const snapshot = [...xagState.candles];
-  if (xagState.currentWindow && xagState.currentWindow.prices.length > 0) {
+  if (xagState.currentWindow?.prices.length > 0) {
     const w = xagState.currentWindow;
-    const prices = w.prices;
-    snapshot.push({
-      t: w.t,
-      o: w.o,
-      h: Math.max(...prices, w.o),
-      l: Math.min(...prices, w.o),
-      c: prices[prices.length - 1],
-      _open: true,   // flag: this candle is still forming
-    });
+    snapshot.push({ t: w.t, o: w.o,
+      h: Math.max(...w.prices, w.o), l: Math.min(...w.prices, w.o),
+      c: w.prices[w.prices.length - 1], _open: true });
   }
-
   return snapshot.length > 0 ? snapshot : null;
 }
 
@@ -3563,23 +3541,22 @@ app.get('/test-signal', async (req, res) => {
   res.json({ ok: true, tg_sent: tgSent, preview: msg });
 });
 
-// Raw goldapi.io response inspector — for debugging XAG data source
+// Raw Yahoo Finance response inspector — for debugging XAG data source
 app.get('/debug/xag-raw', async (req, res) => {
   try {
-    const token = process.env.GOLDAPI_IO_TOKEN || 'goldapi-eiqt6msmnmjlwa5-io';
-    const resp = await fetch('https://www.goldapi.io/api/XAG/USD', {
-      headers: { 'x-access-token': token, 'Content-Type': 'application/json' },
-      signal: AbortSignal.timeout(8000),
-    });
+    const url  = 'https://query1.finance.yahoo.com/v8/finance/chart/XAGUSD=X?interval=5m&range=1d';
+    const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(8000) });
     const json = await resp.json();
+    const price = json?.chart?.result?.[0]?.meta?.regularMarketPrice || null;
+    const candleCount = json?.chart?.result?.[0]?.timestamp?.length || 0;
     res.json({
       http_status:    resp.status,
-      raw_response:   json,
-      keys:           Object.keys(json || {}),
-      parsed_price:   parseFloat(json.price || json.ask || json.bid || 0) || null,
+      parsed_price:   price,
+      candle_count:   candleCount,
       candles_in_mem: xagState.candles.length,
       last_price:     xagState.lastPrice,
       seeded:         xagState.seeded,
+      raw_meta:       json?.chart?.result?.[0]?.meta || {},
     });
   } catch(e) {
     res.json({ error: e.message });
@@ -3592,19 +3569,21 @@ app.get('/debug/:sym', async (req, res) => {
   const sym = req.params.sym.toUpperCase();
   if (!SYMBOLS[sym]) return res.status(400).json({ error: 'Unknown symbol' });
 
-  // XAGUSD uses gold-api.com synthetic engine — not Twelve Data
+  // XAGUSD uses Yahoo Finance — not Twelve Data
   if (sym === 'XAGUSD') {
     try {
-      const price = await xagFetchPrice();
+      const candles = await xagFetchCandles(5);
+      const price   = candles?.[candles.length - 1]?.c || xagState.lastPrice;
       res.json({
-        symbol:        'XAGUSD',
-        source:        'gold-api.com (real XAG/USD spot)',
-        current_price: price,
+        symbol:            'XAGUSD',
+        source:            'Yahoo Finance (XAGUSD=X real spot)',
+        current_price:     price,
+        candles_returned:  candles?.length || 0,
         candles_in_memory: xagState.candles.length,
-        last_candle:   xagState.candles[xagState.candles.length - 1] || null,
-        seeded:        xagState.seeded,
-        last_fetch:    xagState.lastFetchAt ? new Date(xagState.lastFetchAt).toUTCString() : 'never',
-        ok:            price !== null,
+        last_candle:       xagState.candles[xagState.candles.length - 1] || null,
+        seeded:            xagState.seeded,
+        last_fetch:        xagState.lastFetchAt ? new Date(xagState.lastFetchAt).toUTCString() : 'never',
+        ok:                price != null,
       });
     } catch(e) {
       res.json({ symbol: 'XAGUSD', error: e.message });
