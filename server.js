@@ -27,7 +27,7 @@ async function hydrateFromSheets(setupLogs) {
 
     const resp = await sheets.spreadsheets.values.get({
       spreadsheetId: sheetId,
-      range:         'Aurum!A:R',
+      range:         'Aurum!A:S',
     });
 
     const rows   = resp.data.values || [];
@@ -1046,13 +1046,11 @@ function deriveM15FromM5(m5Candles) {
 
 
 // --- ATR RANGE VALIDATION ----------------------------------------------------
-// v5.4: ATR ranges recalibrated from live data (mean ATR=3.18, max=9.63 in first 2 days)
-//   XAUUSD: < 1.5 → dead/illiquid, 1.5–20 → valid, > 20 → news spike
-//   (was 5–20: suppressed 57% of valid scans)
-// v5.6: XAGUSD now uses real XAG/USD spot (was SLV ETF ~$28-32)
-//   Real XAG/USD trades ~$28-80/oz — M5 ATR typically $0.10–$1.50
+// v5.6: ATR floor lowered 1.5→1.0 for XAUUSD
+// Live data Apr 4-6: mean ATR=1.02, 83% of scans suppressed at 1.5 floor
+// 1.0 opens ~40 more scans/day without admitting genuinely dead markets
 const ATR_RANGE = {
-  XAUUSD: { min: 1.5,  max: 20.0 },  // recalibrated from live data — was 5.0
+  XAUUSD: { min: 1.0,  max: 20.0 },
   XAGUSD: { min: 0.05, max: 2.00  }  // real XAG/USD spot — M5 candle ATR range
 };
 function checkATR(sym, atrValues) {
@@ -2957,7 +2955,7 @@ app.get('/setup-sheets', async (req, res) => {
     ];
     await sheets.spreadsheets.values.update({
       spreadsheetId: sheetId,
-      range: 'Aurum!A1:R1',
+      range: 'Aurum!A1:S1',
       valueInputOption: 'RAW',
       requestBody: { values: [HEADERS] },
     });
@@ -3095,7 +3093,7 @@ app.get('/setup-sheet', async (req, res) => {
       'Candles to Event', 'Result', 'Invalidation Reason', 'Stages Confirmed'
     ];
     await sheets.spreadsheets.values.update({
-      spreadsheetId: sheetId, range: 'Aurum!A1:R1',
+      spreadsheetId: sheetId, range: 'Aurum!A1:S1',
       valueInputOption: 'RAW', requestBody: { values: [HEADERS] },
     });
 
@@ -3302,7 +3300,7 @@ app.get('/setup-sheets', async (req, res) => {
 
     // Write headers
     await sheets.spreadsheets.values.update({
-      spreadsheetId: sheetId, range: 'Aurum!A1:R1',
+      spreadsheetId: sheetId, range: 'Aurum!A1:S1',
       valueInputOption: 'RAW', requestBody: { values: [HEADERS] },
     });
 
@@ -3640,7 +3638,7 @@ app.get('/debug/:sym', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.json({
-  status:'ok', version:'5.5',
+  status:'ok', version:'5.6',
   engine:'Liquidity Sweep — Adaptive Execution Engine (M5+M15)',
   rules: ['PDH/PDL/ASH/ASL/EQH/EQL levels','0.02% sweep break required','0.8–3× body displacement','M5 BOS required / M15 optional +5','30–70% pullback (tiered scoring)','continuation entry (STRONG disp only)','zone score ≥ 50, confidence ≥ 70','ATR 1.5–20 XAUUSD','10-candle time decay']
 }));
@@ -5012,9 +5010,9 @@ async function autoScan() {
       // ── HTF NEUTRAL + LOW ATR GATE ─────────────────────────────
       // Block NEW setup creation when market has no directional conviction
       // AND volatility is low. Existing setups in progress are allowed to continue.
-      // Thresholds: HTF = NEUTRAL, ATR < 3.0 (below the session mean of 2.87)
+      // v5.6: threshold lowered 3.0→2.0 to match ATR floor change (was blocking too much)
       const htfIsNeutral  = (timing?.htfBias || htfResult.bias) === 'NEUTRAL';
-      const atrIsBelowMid = currentATR !== null && currentATR < 3.0;
+      const atrIsBelowMid = currentATR !== null && currentATR < 2.0;
       const hasActiveSetup = setup && setup.active && !setup.invalidated;
 
       if (htfIsNeutral && atrIsBelowMid && !hasActiveSetup) {
