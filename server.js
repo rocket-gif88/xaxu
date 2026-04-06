@@ -678,9 +678,8 @@ function readAllLogs() {
 }
 
 const SYMBOLS = {
-  XAUUSD: 'XAU/USD',   // Gold spot — Twelve Data free tier
-  XAGUSD: 'XAG'        // Silver spot — gold-api.com (real XAG/USD, 24/5, free unlimited)
-                        // Replaced SLV ETF proxy — no more NYSE market-hours restriction
+  XAUUSD: 'XAU/USD',   // Gold spot — Twelve Data
+  XAGUSD: 'XAG/USD'    // Silver spot — Twelve Data (same free tier, same API key)
 };
 
 // ─── XAG SYNTHETIC CANDLE ENGINE ──────────────────────────────────────────
@@ -921,14 +920,6 @@ async function tdFetch(path) {
 
 // ─── CANDLE FETCH ─────────────────────────────────────────────────────────
 async function getCandles(sym, interval, n) {
-  // XAGUSD uses synthetic candle engine — not Twelve Data
-  if (sym === 'XAGUSD') {
-    const candles = await xagUpdateCandles();
-    if (!candles || candles.length === 0) return null;
-    // Return last n candles, same shape as Twelve Data response
-    return candles.slice(-n);
-  }
-
   const td = SYMBOLS[sym];
   if (!td) { console.error('Unknown symbol:', sym); return null; }
   
@@ -1024,12 +1015,9 @@ function deriveM15FromM5(m5Candles) {
 
 
 // --- ATR RANGE VALIDATION ----------------------------------------------------
-// v5.6: ATR floor lowered 1.5→1.0 for XAUUSD
-// Live data Apr 4-6: mean ATR=1.02, 83% of scans suppressed at 1.5 floor
-// 1.0 opens ~40 more scans/day without admitting genuinely dead markets
 const ATR_RANGE = {
   XAUUSD: { min: 1.0,  max: 20.0 },
-  XAGUSD: { min: 0.05, max: 2.00  }  // real XAG/USD spot — M5 candle ATR range
+  XAGUSD: { min: 0.05, max: 2.00  }  // XAG/USD real spot via Twelve Data
 };
 function checkATR(sym, atrValues) {
   if (!atrValues || atrValues.length < 5 || !ATR_RANGE[sym]) {
@@ -3176,7 +3164,7 @@ app.get('/health', async (req, res) => {
     session: inSession
       ? (h >= 13 && h < 16 ? 'London+NY Overlap' : h < 16 ? 'London' : 'New York')
       : 'Closed',
-    symbols: { XAUUSD: 'XAU/USD (Gold spot)', XAGUSD: 'XAG/USD (Silver spot — gold-api.com)' },
+    symbols: { XAUUSD: 'XAU/USD (Gold spot)', XAGUSD: 'XAG/USD (Silver spot — Twelve Data)' },
     ts: new Date().toUTCString()
   });
 });
@@ -3569,29 +3557,7 @@ app.get('/debug/:sym', async (req, res) => {
   const sym = req.params.sym.toUpperCase();
   if (!SYMBOLS[sym]) return res.status(400).json({ error: 'Unknown symbol' });
 
-  // XAGUSD uses Yahoo Finance — not Twelve Data
-  if (sym === 'XAGUSD') {
-    try {
-      const candles = await xagFetchCandles(5);
-      const price   = candles?.[candles.length - 1]?.c || xagState.lastPrice;
-      res.json({
-        symbol:            'XAGUSD',
-        source:            'Yahoo Finance (XAGUSD=X real spot)',
-        current_price:     price,
-        candles_returned:  candles?.length || 0,
-        candles_in_memory: xagState.candles.length,
-        last_candle:       xagState.candles[xagState.candles.length - 1] || null,
-        seeded:            xagState.seeded,
-        last_fetch:        xagState.lastFetchAt ? new Date(xagState.lastFetchAt).toUTCString() : 'never',
-        ok:                price != null,
-      });
-    } catch(e) {
-      res.json({ symbol: 'XAGUSD', error: e.message });
-    }
-    return;
-  }
-
-  // XAUUSD — Twelve Data
+  // XAGUSD now uses Twelve Data same as XAUUSD
   const td = SYMBOLS[sym];
   try {
     const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(td)}&interval=5min&outputsize=5&apikey=${TWELVE_KEY}`;
