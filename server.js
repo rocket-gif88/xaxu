@@ -735,20 +735,17 @@ function xagLoadCandles() {
 // Fetch current XAG spot price from gold-api.com (free, unlimited, no key)
 async function xagFetchPrice() {
   try {
-    const resp = await fetch('https://api.gold-api.com/price/XAG',
-      { signal: AbortSignal.timeout(8000) });
+    const token = process.env.GOLDAPI_IO_TOKEN || 'goldapi-eiqt6msmnmjlwa5-io';
+    const resp = await fetch('https://www.goldapi.io/api/XAG/USD', {
+      headers: { 'x-access-token': token, 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
     const json = await resp.json();
-    // Log raw response once for debugging
     if (!xagState._priceLoggedOnce) {
       console.log('[xag] Raw price response:', JSON.stringify(json).slice(0, 200));
       xagState._priceLoggedOnce = true;
     }
-    // Try every known field name gold-api.com might use
-    const price = parseFloat(
-      json.price || json.Price || json.ask || json.bid ||
-      json.rate || json.XAG?.price || json.metal?.price ||
-      json.data?.price || json.result?.price || 0
-    );
+    const price = parseFloat(json.price || json.ask || json.bid || 0);
     if (!price || price <= 0) {
       console.log('[xag] No price in response. Keys:', Object.keys(json || {}).join(','));
       return null;
@@ -767,23 +764,30 @@ async function xagSeedHistory() {
   try {
     console.log('[xag] Seeding history from gold-api.com...');
 
-    // Try history endpoint — gold-api.com free tier: 10 calls/hr
-    // Endpoint returns: { items: [{ date, price }] } OR { data: [...] } depending on version
+    // Try history endpoint — goldapi.io free tier
     let items = [];
     try {
-      const resp = await fetch('https://api.gold-api.com/price/XAG/history',
-        { signal: AbortSignal.timeout(12000) });
-      const json = await resp.json();
-      console.log('[xag] History raw keys:', Object.keys(json).join(','));
-
-      // Try every known field name
-      items = json.items || json.data || json.history ||
-              json.prices || json.results || json.rates || [];
-
-      // If it's a flat array of numbers, wrap them
-      if (items.length && typeof items[0] === 'number') {
-        items = items.map((p, i) => ({ price: p, timestamp: Math.floor(Date.now()/1000) - (items.length - i) * 3600 }));
+      const token = process.env.GOLDAPI_IO_TOKEN || 'goldapi-eiqt6msmnmjlwa5-io';
+      // goldapi.io historical: /api/XAG/USD/YYYYMMDD
+      // Seed last 5 days of daily prices to establish structure
+      const dates = [];
+      for (let i = 5; i >= 1; i--) {
+        const d = new Date(Date.now() - i * 86400000);
+        // Skip weekends
+        if (d.getUTCDay() === 0 || d.getUTCDay() === 6) continue;
+        dates.push(d.toISOString().slice(0,10).replace(/-/g,''));
       }
+      for (const date of dates) {
+        try {
+          const r = await fetch(`https://www.goldapi.io/api/XAG/USD/${date}`, {
+            headers: { 'x-access-token': token },
+            signal: AbortSignal.timeout(8000),
+          });
+          const d = await r.json();
+          if (d.price) items.push({ price: d.price, timestamp: new Date(date.slice(0,4)+'-'+date.slice(4,6)+'-'+date.slice(6,8)).getTime()/1000 });
+        } catch(e) { /* skip failed date */ }
+      }
+      console.log('[xag] History seed: fetched ' + items.length + ' daily prices');
     } catch(e) {
       console.log('[xag] History endpoint failed:', e.message);
     }
@@ -3561,17 +3565,20 @@ app.get('/test-signal', async (req, res) => {
   res.json({ ok: true, tg_sent: tgSent, preview: msg });
 });
 
-// Raw gold-api.com response inspector — must be BEFORE /debug/:sym wildcard
+// Raw goldapi.io response inspector — for debugging XAG data source
 app.get('/debug/xag-raw', async (req, res) => {
   try {
-    const resp = await fetch('https://api.gold-api.com/price/XAG',
-      { signal: AbortSignal.timeout(8000) });
+    const token = process.env.GOLDAPI_IO_TOKEN || 'goldapi-eiqt6msmnmjlwa5-io';
+    const resp = await fetch('https://www.goldapi.io/api/XAG/USD', {
+      headers: { 'x-access-token': token, 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
     const json = await resp.json();
     res.json({
       http_status:    resp.status,
       raw_response:   json,
       keys:           Object.keys(json || {}),
-      parsed_price:   parseFloat(json.price || json.Price || json.ask || json.bid || json.rate || 0) || null,
+      parsed_price:   parseFloat(json.price || json.ask || json.bid || 0) || null,
       candles_in_mem: xagState.candles.length,
       last_price:     xagState.lastPrice,
       seeded:         xagState.seeded,
