@@ -3561,6 +3561,26 @@ app.get('/test-signal', async (req, res) => {
   res.json({ ok: true, tg_sent: tgSent, preview: msg });
 });
 
+// Raw gold-api.com response inspector — must be BEFORE /debug/:sym wildcard
+app.get('/debug/xag-raw', async (req, res) => {
+  try {
+    const resp = await fetch('https://api.gold-api.com/price/XAG',
+      { signal: AbortSignal.timeout(8000) });
+    const json = await resp.json();
+    res.json({
+      http_status:    resp.status,
+      raw_response:   json,
+      keys:           Object.keys(json || {}),
+      parsed_price:   parseFloat(json.price || json.Price || json.ask || json.bid || json.rate || 0) || null,
+      candles_in_mem: xagState.candles.length,
+      last_price:     xagState.lastPrice,
+      seeded:         xagState.seeded,
+    });
+  } catch(e) {
+    res.json({ error: e.message });
+  }
+});
+
 // Debug endpoint — shows raw Twelve Data response for a symbol
 // Usage: /debug/XAUUSD or /debug/XAGUSD
 app.get('/debug/:sym', async (req, res) => {
@@ -3606,26 +3626,6 @@ app.get('/debug/:sym', async (req, res) => {
       error_msg: json.message || null,
       status: json.status || null,
       raw_keys: Object.keys(json)
-    });
-  } catch(e) {
-    res.json({ error: e.message });
-  }
-});
-
-// Raw gold-api.com response inspector — for debugging XAG data source
-app.get('/debug/xag-raw', async (req, res) => {
-  try {
-    const resp = await fetch('https://api.gold-api.com/price/XAG',
-      { signal: AbortSignal.timeout(8000) });
-    const json = await resp.json();
-    res.json({
-      http_status:    resp.status,
-      raw_response:   json,
-      keys:           Object.keys(json || {}),
-      parsed_price:   parseFloat(json.price || json.Price || json.ask || json.bid || json.rate || 0) || null,
-      candles_in_mem: xagState.candles.length,
-      last_price:     xagState.lastPrice,
-      seeded:         xagState.seeded,
     });
   } catch(e) {
     res.json({ error: e.message });
