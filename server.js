@@ -738,8 +738,22 @@ async function xagFetchPrice() {
     const resp = await fetch('https://api.gold-api.com/price/XAG',
       { signal: AbortSignal.timeout(8000) });
     const json = await resp.json();
-    if (!json || !json.price) return null;
-    return parseFloat(json.price);
+    // Log raw response once for debugging
+    if (!xagState._priceLoggedOnce) {
+      console.log('[xag] Raw price response:', JSON.stringify(json).slice(0, 200));
+      xagState._priceLoggedOnce = true;
+    }
+    // Try every known field name gold-api.com might use
+    const price = parseFloat(
+      json.price || json.Price || json.ask || json.bid ||
+      json.rate || json.XAG?.price || json.metal?.price ||
+      json.data?.price || json.result?.price || 0
+    );
+    if (!price || price <= 0) {
+      console.log('[xag] No price in response. Keys:', Object.keys(json || {}).join(','));
+      return null;
+    }
+    return price;
   } catch(e) {
     console.error('[xag] price fetch error:', e.message);
     return null;
@@ -747,40 +761,80 @@ async function xagFetchPrice() {
 }
 
 // Seed historical candles from gold-api.com history endpoint
-// Uses 1 API call (of 10/hr free limit) on boot — never called again
+// Uses 1 API call (of 10/hr free limit) on boot — never called again.
+// Falls back to current-price repetition if history endpoint fails.
 async function xagSeedHistory() {
   try {
     console.log('[xag] Seeding history from gold-api.com...');
-    // Fetch price history — returns array of daily prices
-    const resp = await fetch('https://api.gold-api.com/price/XAG/history?interval=1h&limit=120',
-      { signal: AbortSignal.timeout(15000) });
-    const json = await resp.json();
 
-    // gold-api.com history format: { data: [{ timestamp, price }, ...] }
-    const items = json.data || json.history || json.prices || json.items || [];
-    if (!items.length) {
-      console.log('[xag] History seed: no data in response — will build from live polls');
-      return false;
+    // Try history endpoint — gold-api.com free tier: 10 calls/hr
+    // Endpoint returns: { items: [{ date, price }] } OR { data: [...] } depending on version
+    let items = [];
+    try {
+      const resp = await fetch('https://api.gold-api.com/price/XAG/history',
+        { signal: AbortSignal.timeout(12000) });
+      const json = await resp.json();
+      console.log('[xag] History raw keys:', Object.keys(json).join(','));
+
+      // Try every known field name
+      items = json.items || json.data || json.history ||
+              json.prices || json.results || json.rates || [];
+
+      // If it's a flat array of numbers, wrap them
+      if (items.length && typeof items[0] === 'number') {
+        items = items.map((p, i) => ({ price: p, timestamp: Math.floor(Date.now()/1000) - (items.length - i) * 3600 }));
+      }
+    } catch(e) {
+      console.log('[xag] History endpoint failed:', e.message);
     }
 
-    // Convert to synthetic candles (each history point = one synthetic M5 candle)
-    // Use the price as both O/H/L/C (no spread info) — good enough for seeding
-    const sorted = [...items].sort((a, b) => (a.timestamp || a.ts || a.time || 0) - (b.timestamp || b.ts || b.time || 0));
-    const synthetic = sorted.map((item, i) => {
-      const price = parseFloat(item.price || item.close || item.value || 0);
-      const prevPrice = i > 0 ? parseFloat(sorted[i-1].price || sorted[i-1].close || sorted[i-1].value || price) : price;
-      const ts = (item.timestamp || item.ts || item.time || 0) * 1000;
-      // Simulate realistic O/H/L from consecutive prices
-      const lo = Math.min(price, prevPrice);
-      const hi = Math.max(price, prevPrice);
-      return { t: ts, o: prevPrice, h: hi, l: lo, c: price, _synthetic: true };
-    }).filter(c => c.c > 0 && c.t > 0);
+    if (items.length > 0) {
+      // Normalise each item — handle any field naming
+      const sorted = [...items].sort((a, b) => {
+        const ta = a.timestamp || a.ts || a.time || a.date || 0;
+        const tb = b.timestamp || b.ts || b.time || b.date || 0;
+        return (typeof ta === 'string' ? new Date(ta).getTime() : ta * 1000)
+             - (typeof tb === 'string' ? new Date(tb).getTime() : tb * 1000);
+      });
 
-    if (synthetic.length > 0) {
-      xagState.candles = synthetic.slice(-XAG_MAX_CANDLES);
+      const synthetic = sorted.map((item, i) => {
+        const price    = parseFloat(item.price || item.close || item.value || item.rate || 0);
+        const prev     = i > 0 ? parseFloat(sorted[i-1].price || sorted[i-1].close || sorted[i-1].value || price) : price;
+        const rawTs    = item.timestamp || item.ts || item.time || item.date;
+        const ts       = typeof rawTs === 'string'
+          ? new Date(rawTs).getTime()
+          : (rawTs || 0) > 1e10 ? rawTs : rawTs * 1000;
+        return { t: ts || (Date.now() - (sorted.length - i) * 3600000),
+                 o: prev, h: Math.max(price, prev), l: Math.min(price, prev),
+                 c: price, _synthetic: true };
+      }).filter(c => c.c > 0);
+
+      if (synthetic.length > 0) {
+        xagState.candles = synthetic.slice(-XAG_MAX_CANDLES);
+        xagState.seeded  = true;
+        xagSaveCandles();
+        console.log('[xag] ✓ Seeded ' + xagState.candles.length + ' candles from history');
+        return true;
+      }
+    }
+
+    // History failed — seed with current price repeated as 60 synthetic candles
+    // so engine has enough data to run ATR/structure analysis immediately
+    console.log('[xag] History empty — seeding from current price...');
+    const currentPrice = await xagFetchPrice();
+    if (currentPrice && currentPrice > 0) {
+      const now = Date.now();
+      const seed = [];
+      for (let i = 59; i >= 0; i--) {
+        // Add tiny variation so ATR isn't exactly 0
+        const jitter = (Math.random() - 0.5) * 0.04;
+        const p      = parseFloat((currentPrice + jitter).toFixed(3));
+        seed.push({ t: now - i * XAG_CANDLE_MS, o: p, h: p + 0.01, l: p - 0.01, c: p, _synthetic: true });
+      }
+      xagState.candles = seed;
       xagState.seeded  = true;
       xagSaveCandles();
-      console.log('[xag] ✓ Seeded ' + xagState.candles.length + ' synthetic candles from history');
+      console.log('[xag] ✓ Price-seeded ' + seed.length + ' candles at $' + currentPrice);
       return true;
     }
   } catch(e) {
@@ -3552,6 +3606,26 @@ app.get('/debug/:sym', async (req, res) => {
       error_msg: json.message || null,
       status: json.status || null,
       raw_keys: Object.keys(json)
+    });
+  } catch(e) {
+    res.json({ error: e.message });
+  }
+});
+
+// Raw gold-api.com response inspector — for debugging XAG data source
+app.get('/debug/xag-raw', async (req, res) => {
+  try {
+    const resp = await fetch('https://api.gold-api.com/price/XAG',
+      { signal: AbortSignal.timeout(8000) });
+    const json = await resp.json();
+    res.json({
+      http_status:    resp.status,
+      raw_response:   json,
+      keys:           Object.keys(json || {}),
+      parsed_price:   parseFloat(json.price || json.Price || json.ask || json.bid || json.rate || 0) || null,
+      candles_in_mem: xagState.candles.length,
+      last_price:     xagState.lastPrice,
+      seeded:         xagState.seeded,
     });
   } catch(e) {
     res.json({ error: e.message });
