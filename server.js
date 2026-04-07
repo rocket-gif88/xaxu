@@ -614,7 +614,7 @@ async function restoreTradeMonitors() {
       const [ts, setupId, sym, dir, entry, sl, tp1, tp2, status] = row;
       if (status !== 'OPEN') continue;
       if (new Date(ts).getTime() < cutoff) continue;
-      if (!sym || !['XAUUSD','XAGUSD'].includes(sym)) continue;
+      if (!sym || sym !== 'XAUUSD') continue; // Gold only
       // Only restore if no monitor already active for this symbol
       if (tradeMonitor[sym]) continue;
       tradeMonitor[sym] = {
@@ -678,8 +678,7 @@ function readAllLogs() {
 }
 
 const SYMBOLS = {
-  XAUUSD: 'XAU/USD',   // Gold spot — Twelve Data
-  XAGUSD: 'XAG/USD'    // Silver spot — Twelve Data (same free tier, same API key)
+  XAUUSD: 'XAU/USD',   // Gold spot — Twelve Data (Silver disabled — no free intraday XAG API available)
 };
 
 // ─── XAG SYNTHETIC CANDLE ENGINE ──────────────────────────────────────────
@@ -3164,7 +3163,7 @@ app.get('/health', async (req, res) => {
     session: inSession
       ? (h >= 13 && h < 16 ? 'London+NY Overlap' : h < 16 ? 'London' : 'New York')
       : 'Closed',
-    symbols: { XAUUSD: 'XAU/USD (Gold spot)', XAGUSD: 'XAG/USD (Silver spot — Twelve Data)' },
+    symbols: { XAUUSD: 'XAU/USD (Gold spot)' }, // Silver disabled
     ts: new Date().toUTCString()
   });
 });
@@ -3583,7 +3582,7 @@ app.get('/debug/:sym', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.json({
-  status:'ok', version:'5.6',
+  status:'ok', version:'5.7',
   engine:'Liquidity Sweep — Adaptive Execution Engine (M5+M15)',
   rules: ['PDH/PDL/ASH/ASL/EQH/EQL levels','0.02% sweep break required','0.8–3× body displacement','M5 BOS required / M15 optional +5','30–70% pullback (tiered scoring)','continuation entry (STRONG disp only)','zone score ≥ 50, confidence ≥ 70','ATR 1.5–20 XAUUSD','10-candle time decay']
 }));
@@ -4126,11 +4125,11 @@ function createAndLogSetup(sym, direction, levelOrZone) {
 }
 
 // Setups keyed by symbol
-const setups = { XAUUSD: null, XAGUSD: null };
+const setups = { XAUUSD: null }; // XAGUSD disabled
 
 // Active trade monitor — tracks open positions after entry signal fires
 // { XAUUSD: { setupId, direction, entry, sl, tp1, tp2, high, low, resultLogged }, ... }
-const tradeMonitor = { XAUUSD: null, XAGUSD: null };
+const tradeMonitor = { XAUUSD: null }; // XAGUSD disabled
 
 // Per-symbol timing state — persists through setup resets
 // Tracks cooldowns for zone detection, bias flips, invalidation windows
@@ -4163,29 +4162,7 @@ const symTiming = {
     lockedZoneKey:           null,   // priceRange string
     lockedZoneScansLeft:     0,      // countdown — zone released when reaches 0
   },
-  XAGUSD: {
-    zoneDetectionAllowedAt:  0,
-    biasFlipAllowedAt:       0,
-    lastInvalidatedAt:       0,
-    lastInvalidatedDir:      null,
-    pullbackStartCandleIdx:  -1,
-    pullbackCandleCount:     0,
-    lastSweepAlertAt:        0,
-    lastSweepDir:            null,
-    lastSweepZoneKey:        null,
-    structuralBiasDir:       null,
-    structuralBiasStage:     null,
-    structuralBiasAt:        0,
-    consecutiveFailures:     { BUY: 0, SELL: 0 },
-    htfBias:                 'NEUTRAL',
-    htfLastBOS:              'NONE',
-    htfLastHigh:             0,
-    htfLastLow:              0,
-    htfUpdatedAt:            0,
-    lockedZone:              null,
-    lockedZoneKey:           null,
-    lockedZoneScansLeft:     0,
-  }
+  // XAGUSD disabled — gold only until paid silver API is sourced
 };
 
 const CANDLE_MS = 5 * 60 * 1000; // 5 minutes per M5 candle
@@ -4821,7 +4798,7 @@ async function autoScan() {
   const inSession = (h >= 7 && h < 16) || (h >= 13 && h < 22);
 
   if (!inSession) {
-    for (const sym of ['XAUUSD','XAGUSD']) {
+    for (const sym of ['XAUUSD']) { // Gold only — silver disabled pending paid API
       if (setups[sym]) {
         resetSetup(sym, 'Session closed');
       }
@@ -4856,7 +4833,7 @@ async function autoScan() {
 
   const delay = ms => new Promise(r => setTimeout(r, ms));
 
-  for (const sym of ['XAUUSD','XAGUSD']) {
+  for (const sym of ['XAUUSD']) { // Gold only
     try {
       const m5 = await getCandles(sym, '5min', 120);
       if (!m5 || m5.length < 50) {
