@@ -4290,8 +4290,21 @@ async function invalidateSetup(sym, reason) {
 
   const asset = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
   const dirEmoji = oppositeDir === 'BUY' ? '🟢' : '🔴';
-  await sendTelegram('⚠️ <b>' + asset + ' — SETUP INVALIDATED</b>\n\n' +
-    reason + '\n\n' + dirEmoji + ' ' + biasMsg +
+
+  // Differentiate between a missed entry (trend confirmed but no pullback) and a plain invalidation
+  const _trendWasConfirmed = setup.events?.trend && !setup.events?.entry;
+  const _invalidationType  = _trendWasConfirmed
+    ? asset + ' — ENTRY MISSED'
+    : asset + ' — SETUP INVALIDATED';
+  const _invalidEmoji = _trendWasConfirmed ? '⏰' : '⚠️';
+
+  // For missed entries, add a note about what happened
+  const _missedNote = _trendWasConfirmed
+    ? '\nAll 3 stages confirmed but price did not pull back into entry zone.\n'
+    : '\n';
+
+  await sendTelegram(_invalidEmoji + ' <b>' + _invalidationType + '</b>\n\n' +
+    reason + _missedNote + '\n' + dirEmoji + ' ' + biasMsg +
     '\n\n─────────────────\nAurum Signals');
 }
 
@@ -5372,8 +5385,8 @@ async function autoScan() {
           timing.structuralBiasAt    = Date.now();
           console.log('[bias] ' + sym + ': structural bias confirmed → ' + sweep.direction + ' (BOS stage)');
         }
-        // PRE-ENTRY ALERT: send at trend confirmation (not pullback)
-        // This ensures alert fires even if pullback immediately exceeds 70%
+        // PRE-ENTRY ALERT: send at trend confirmation — ACTIONABLE levels
+        // All 3 structural stages done. User needs to know exactly what to watch for.
         if (TELEGRAM_MODE !== 'FULL' && setup && !setup.tgAlerts?.preEntry) {
           if (setup.tgAlerts) setup.tgAlerts.preEntry = true;
           const _htfNow     = timing?.htfBias || 'NEUTRAL';
@@ -5384,18 +5397,60 @@ async function autoScan() {
           const _htfLine    = _htfNow === 'NEUTRAL'
             ? 'HTF Bias: Neutral ➖'
             : _htfAligned
-              ? 'HTF Bias: ' + _htfNow.charAt(0) + _htfNow.slice(1).toLowerCase() + ' ✅ (aligned)'
-              : 'HTF Bias: ' + _htfNow.charAt(0) + _htfNow.slice(1).toLowerCase() + ' ❌ (counter — stronger confirmation required)';
+              ? 'HTF Bias: ' + (_htfNow.charAt(0) + _htfNow.slice(1).toLowerCase()) + ' ✅ (aligned)'
+              : 'HTF Bias: ' + (_htfNow.charAt(0) + _htfNow.slice(1).toLowerCase()) + ' ❌ (counter)';
+
+          // Pre-calculate SL and TP so user can prepare a limit order right now
+          const _slPre  = sweep.sweepExtreme
+            ? calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5)
+            : null;
+
+          // Estimate entry price: midpoint of displacement candle at 55% retracement
+          let _entryEstPre = null;
+          if (disp.found && disp.impulseHigh != null && disp.impulseLow != null) {
+            const _range = disp.impulseHigh - disp.impulseLow;
+            _entryEstPre = sweep.direction === 'BUY'
+              ? parseFloat((disp.impulseHigh - _range * 0.55).toFixed(2))
+              : parseFloat((disp.impulseLow  + _range * 0.55).toFixed(2));
+          } else {
+            // Fallback: zone midpoint
+            _entryEstPre = parseFloat(((primaryZone.minPrice + primaryZone.maxPrice) / 2).toFixed(2));
+          }
+
+          const _tpsPre  = (_entryEstPre && _slPre) ? calcTP(sweep.direction, _entryEstPre, _slPre, levels) : null;
+          const _tp1Pre  = _tpsPre ? _tpsPre.tp1  : null;
+          const _tp2Pre  = _tpsPre ? _tpsPre.tp2  : null;
+          const _rrPre   = _tpsPre ? _tpsPre.rr1  : null;
+
+          const _isBuyNow   = sweep.direction === 'BUY';
+          const _dirEmoji   = _isBuyNow ? '🟢' : '🔴';
+          const _pullbackDir = _isBuyNow ? 'dips into' : 'rallies into';
+
+          const _levelsBlock = [
+            _entryEstPre ? 'Entry zone: ~$' + _entryEstPre          : null,
+            _slPre        ? 'Stop loss:   $' + _slPre                : null,
+            _tp1Pre       ? 'TP1:          $' + _tp1Pre + (_rrPre ? '  (1:' + _rrPre + 'R)' : '') : null,
+            _tp2Pre       ? 'TP2:          $' + _tp2Pre               : null,
+          ].filter(Boolean).join('\n');
+
           await sendTelegram(
-            '⚠️ <b>' + asset + ' ' + sweep.direction + ' — SETUP FORMING</b>\n\n' +
-            'Zone: $' + parseFloat(primaryZone.minPrice).toFixed(2) +
-            ' – $' + parseFloat(primaryZone.maxPrice).toFixed(2) + '\n' +
-            'Confidence: ' + zoneScore + '/100\n' +
-            'Touches: ' + primaryZone.totalTouches + '\n' +
+            _dirEmoji + ' <b>' + asset + ' ' + sweep.direction + ' — ENTRY IMMINENT</b>\n\n' +
+            '✅ Liquidity sweep confirmed\n' +
+            '✅ Strong move (' + disp.ratio + '× displacement)\n' +
+            '✅ Break of structure (' + bosType + ')\n\n' +
+            '<b>Waiting for price to ' + _pullbackDir + ' entry zone.</b>\n' +
+            'Zone: $' + parseFloat(primaryZone.minPrice).toFixed(2) + ' – $' + parseFloat(primaryZone.maxPrice).toFixed(2) + '\n' +
+            'Touches: ' + primaryZone.totalTouches + '  |  Conf: ' + zoneScore + '/100\n' +
             _htfLine + '\n\n' +
-            'Status: Waiting for pullback into entry zone.\n\n' +
-            '⏳ No action yet — monitor closely.\n\n─────────────────\nAurum Signals'
+            '<b>📌 Anticipated levels:</b>\n' +
+            _levelsBlock + '\n\n' +
+            '⚡ <b>Entry alert fires automatically when pullback confirms.</b>\n' +
+            'Do NOT enter manually — wait for the entry signal.\n' +
+            '─────────────────\nAurum Signals'
           );
+
+          // Store pre-calculated levels on setup for entry signal to reference
+          setup._preEntryLevels = { entry: _entryEstPre, sl: _slPre, tp1: _tp1Pre, tp2: _tp2Pre, rr: _rrPre };
         }
         console.log('[' + sym + '] Trend fired this scan — waiting for next scan before pullback');
         await delay(400); continue;
@@ -5412,7 +5467,13 @@ async function autoScan() {
         await delay(400); continue;
       }
 
-      const pb = detectPullback(m5, disp.candleIdx, sweep.direction, sweep.sweepExtreme);
+      // ── PULLBACK ANCHOR FIX ───────────────────────────────────
+      // By the time BOS fires, the 10-candle window after disp.candleIdx is often
+      // already exhausted. Anchor from the BOS candle instead so the window
+      // covers candles that actually occur AFTER structure confirmation.
+      const _bosCandleIdx = bos.bos_candle ?? bos.candleIdx ?? disp.candleIdx;
+      const pbStartIdx    = Math.max(disp.candleIdx, _bosCandleIdx - 2);
+      const pb = detectPullback(m5, pbStartIdx, sweep.direction, sweep.sweepExtreme);
 
       // Track pullback candle count — need min 2 candles of structure before 70% invalidation
       const curCandleIdx = m5.length - 1;
