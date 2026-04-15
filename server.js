@@ -1911,11 +1911,13 @@ function detectPullback(candles, dispIdx, direction, sweepExtreme) {
 // F1: DISPLACEMENT TIMING — must occur within 1-3 candles (strict), 4th only with no gap
 function filterDisplacementTiming(disp, sweepIdx) {
   const offset = disp.candleIdx - sweepIdx;
-  if (offset <= 3) return { pass: true };
-  if (offset === 4 && !disp.weakGap)
-    return { pass: true, note: 'offset 4 — no gap, acceptable' };
+  if (offset <= 4) return { pass: true };
+  if (offset <= 6 && !disp.weakGap)
+    return { pass: true, note: 'offset ' + offset + ' — no gap, acceptable' };
+  if (offset <= 6 && disp.weakGap)
+    return { pass: true, note: 'offset ' + offset + ' — one weak gap, acceptable' };
   return { pass: false,
-    reason: 'Displacement too delayed (' + offset + ' candles after sweep, max 3)' };
+    reason: 'Displacement too delayed (' + offset + ' candles after sweep, max 6)' };
 }
 
 // F2: DISPLACEMENT CHOP — reject slow drifts, require clean single-candle impulse
@@ -2052,10 +2054,9 @@ function runQualityFilters(candles, m15Candles, sweep, disp, bos, pullback,
 }
 
 // ─── STOP LOSS ─────────────────────────────────────────────────────────────
-function calcSL(direction, sweepExtreme, atr) {
-  const PIP_BUFFER = direction === 'BUY'
-    ? (sym === 'XAUUSD' ? 0.50 : 0.10)  // XAU: ~50c buffer, XAG: ~10c buffer (real spot)
-    : (sym === 'XAUUSD' ? 0.50 : 0.10);
+function calcSL(direction, sweepExtreme, atr, symOverride) {
+  const _sym = symOverride || 'XAUUSD'; // sym is not in scope here — always pass explicitly
+  const PIP_BUFFER = _sym === 'XAUUSD' ? 0.50 : 0.10;
 
   const atrBuffer  = atr * 0.10;
   const buffer     = Math.max(parseFloat(PIP_BUFFER), atrBuffer);
@@ -2642,7 +2643,7 @@ app.get('/analyze/:sym', async (req, res) => {
               log.push('Pullback entry confirmed: ' + pb.retracement + '% retracement — entry price $' + pb.entry.toFixed(3));
 
               // ── 9. LEVELS ─────────────────────────────────────────
-              const sl   = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5);
+              const sl   = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym);
               const tps  = calcTP(sweep.direction, pb.entry, sl, levels);
 
               if (tps.rr1 < 1.5) {
@@ -4335,14 +4336,15 @@ function resetSetup(sym, reason) {
   setups[sym] = null;
 }
 
-// Session time remaining in minutes
+// Session time remaining in minutes — returns the LONGEST remaining active session
+// so overlap (13:00–16:00 UTC) uses NY's remaining time, not London's
 function sessionMinutesRemaining() {
   const h = new Date().getUTCHours();
   const m = new Date().getUTCMinutes();
   const nowMins = h * 60 + m;
-  if (nowMins >= 7*60  && nowMins < 16*60) return 16*60 - nowMins;
-  if (nowMins >= 13*60 && nowMins < 22*60) return 22*60 - nowMins;
-  return 0;
+  const londonLeft = (nowMins >= 7*60 && nowMins < 16*60) ? (16*60 - nowMins) : 0;
+  const nyLeft     = (nowMins >= 13*60 && nowMins < 22*60) ? (22*60 - nowMins) : 0;
+  return Math.max(londonLeft, nyLeft);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4838,8 +4840,8 @@ async function autoScan() {
   }
 
   const minsLeft = sessionMinutesRemaining();
-  if (minsLeft < 60) {
-    console.log('[auto-scan] <60min in session (' + minsLeft + 'min) — no new signals');
+  if (minsLeft < 30) {
+    console.log('[auto-scan] <30min in session (' + minsLeft + 'min) — no new signals');
     return;
   }
 
@@ -5003,8 +5005,9 @@ async function autoScan() {
         await delay(400); continue;
       }
 
-      // ── ZONE MEMORY: track retest count + gate exhausted zones ──
-      updateZoneMemory(sym, primaryZone);
+      // ── ZONE MEMORY: read freshness for logging — DO NOT count here ──
+      // updateZoneMemory is called only when a sweep is confirmed (below),
+      // so exhaustion reflects actual price interaction, not scan frequency.
       const zoneFreshness = getZoneFreshness(sym, primaryZone);
       console.log('[zone-mem] ' + sym + ': ' + zoneFreshness.label +
         ' (session touches: ' + zoneFreshness.touchCount + ')');
@@ -5262,6 +5265,9 @@ async function autoScan() {
       // Prevents bulk-confirmation of multiple stages from historical data.
       if (sweepFired) {
         logStageUpdate(setup, 'sweep');
+        // Count this zone touch only when price actually sweeps it
+        updateZoneMemory(sym, primaryZone);
+        console.log('[zone-mem] ' + sym + ': zone touch recorded at sweep (total: ' + (getZoneFreshness(sym, primaryZone).touchCount) + ')');
         if (timing) {
           timing.structuralBiasDir   = sweep.direction;
           timing.structuralBiasStage = 'sweep';
@@ -5307,7 +5313,7 @@ async function autoScan() {
       const _htfBiasNow = timing?.htfBias || 'NEUTRAL';
       const _htfCounter = (_htfBiasNow === 'BULLISH' && sweep.direction === 'SELL') ||
                           (_htfBiasNow === 'BEARISH' && sweep.direction === 'BUY');
-      const dispMinRatio = _htfCounter ? 1.5 : 1.2; // stricter for counter-HTF setups
+      const dispMinRatio = _htfCounter ? 1.2 : null; // counter-HTF: stricter 1.2×; normal: use function default (0.8×)
 
       const disp = detectDisplacement(m5, sweep.candleIdx, sweep.direction, dispMinRatio);
       if (!disp.found) {
@@ -5398,7 +5404,7 @@ async function autoScan() {
 
           // Pre-calculate SL and TP so user can prepare a limit order right now
           const _slPre  = sweep.sweepExtreme
-            ? calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5)
+            ? calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym)
             : null;
 
           // Estimate entry price: midpoint of displacement candle at 55% retracement
@@ -5598,7 +5604,7 @@ async function autoScan() {
 
       const sl  = isContinuation
         ? activePb.sl  // continuation uses tighter SL from detectContinuation
-        : calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5);
+        : calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym);
       const tps = calcTP(sweep.direction, activePb.entry, sl, levels);
 
       if (tps.rr1 < 1.5) {
@@ -5615,7 +5621,8 @@ async function autoScan() {
       }
 
       const scoreResult = scoreSetup(sess, sessionOk, sweep, disp, bos, activePb,
-        volatility.ok === true || volatility.ok === undefined, directionalBias, biasPenalty);
+        volatility.ok === true || volatility.ok === undefined, directionalBias, biasPenalty,
+        timing?.htfBias || 'NEUTRAL');
 
       // Continuation penalty: -10 (higher risk, no pullback confirmation)
       if (isContinuation) {
