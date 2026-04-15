@@ -1641,7 +1641,7 @@ function detectDisplacement(candles, sweepIdx, direction, minRatioOverride) {
   const avgBody10 = slice.reduce((s,c) => s + body(c), 0) / slice.length;
   let weakGap = false;
 
-  for (let offset = 1; offset <= 4; offset++) {
+  for (let offset = 1; offset <= 6; offset++) {
     const idx = sweepIdx + offset;
     if (idx >= candles.length) break;
     const c = candles[idx];
@@ -1656,17 +1656,17 @@ function detectDisplacement(candles, sweepIdx, direction, minRatioOverride) {
       : (c.h - c.c) / r >= (1 - CLOSE_ZONE);
     if (bodyStrong && dirOk && closeZone) {
       const ratio    = parseFloat((b / avgBody10).toFixed(2));
-      const strength = ratio >= 1.5 ? 'STRONG' : ratio >= 1.2 ? 'GOOD' : ratio >= 1.0 ? 'VALID+' : 'VALID'; // v5.5 strength label
+      const strength = ratio >= 1.5 ? 'STRONG' : ratio >= 1.2 ? 'GOOD' : ratio >= 1.0 ? 'VALID+' : 'VALID';
       return { found: true, candleIdx: idx,
                ratio, avgBody: avgBody10, weakGap,
-               strength,  // 'STRONG' | 'VALID'
+               strength,
                impulseHigh: c.h, impulseLow: c.l };
     }
-    // Allow 1 weak/indecisive candle gap before invalidating
+    // Allow up to 2 weak/indecisive candle gaps (was 1) — accounts for consolidation after sweep
     if (!weakGap && (!dirOk || b < avgBody10 * 0.5)) { weakGap = true; continue; }
-    if (offset > 2 && !bodyStrong) break;
+    if (offset > 4 && !bodyStrong) break;
   }
-  return { found: false, reason: 'no displacement within 4 bars (1 weak gap allowed)' };
+  return { found: false, reason: 'no displacement within 6 bars (2 weak gaps allowed)' };
 }
 
 // ─── MARKET STRUCTURE SHIFT (BOS) ─────────────────────────────────────────
@@ -4044,7 +4044,9 @@ function checkPostSweepMomentum(m5Candles, sweepCandleIdx, sweepExtreme, directi
   const threshold  = currentATR * 0.5;
   const postCandles = m5Candles.slice(sweepCandleIdx + 1, sweepCandleIdx + 3); // up to 2 candles
 
-  if (postCandles.length === 0) {
+  // No candles yet after sweep — or sweep is the last candle in the array (index bug)
+  // Either way: too early to evaluate, skip and wait
+  if (!postCandles.length || postCandles.every(c => !c || (c.h - c.l) === 0)) {
     return { passed: true, reason: 'No post-sweep candles yet — waiting', moveSize: 0, atrMultiple: 0 };
   }
 
@@ -4911,25 +4913,38 @@ async function autoScan() {
           await delay(400); continue;
         }
 
-        // Counter-structure: only check PRIMARY ZONE for opposing sweep
-        // (using all levels caused secondary zones to trigger false invalidations)
+        // Counter-structure: only invalidate if price CLOSES beyond the zone
+        // (not just wicks through it). A wick touch of an opposing zone during
+        // a pullback is normal — it was triggering 91 false invalidations.
+        // Require: opposing sweep candle closes fully through zone boundary.
         const primaryZoneForCheck = selectPrimaryZone(levels, livePrice, sess, m5);
         if (primaryZoneForCheck) {
           const sweep2 = detectSweep(m5, [primaryZoneForCheck]);
           if (sweep2.found) {
             const sweep2Corrected = correctSweepDirection(sweep2);
             if (sweep2Corrected.direction !== setup.direction) {
-              await invalidateSetup(sym, 'Structure broke against ' + setup.direction + ' direction on primary zone.');
-              resetSetup(sym, 'Counter-structure');
-              // Counter-structure sweep = opposite structure confirmed → clear bias
-              if (symTiming[sym]) {
-                symTiming[sym].structuralBiasDir   = sweep2Corrected.direction;
-                symTiming[sym].structuralBiasStage = 'sweep';
-                symTiming[sym].structuralBiasAt    = Date.now();
-                console.log('[bias] ' + sym + ': structural bias flipped → ' +
-                  sweep2Corrected.direction + ' (counter-structure confirmed)');
+              // Only kill if the close is clearly beyond the zone (not a wick)
+              const s2c = m5[sweep2Corrected.candleIdx];
+              const zoneRef = sweep2Corrected.direction === 'BUY'
+                ? primaryZoneForCheck.minPrice  // opposing buy = price closed below zone low
+                : primaryZoneForCheck.maxPrice; // opposing sell = price closed above zone high
+              const closeThrough = sweep2Corrected.direction === 'BUY'
+                ? s2c && s2c.c < zoneRef * 0.9985   // close >0.15% below zone low
+                : s2c && s2c.c > zoneRef * 1.0015;  // close >0.15% above zone high
+              if (closeThrough) {
+                await invalidateSetup(sym, 'Structure broke against ' + setup.direction + ' direction on primary zone.');
+                resetSetup(sym, 'Counter-structure');
+                if (symTiming[sym]) {
+                  symTiming[sym].structuralBiasDir   = sweep2Corrected.direction;
+                  symTiming[sym].structuralBiasStage = 'sweep';
+                  symTiming[sym].structuralBiasAt    = Date.now();
+                  console.log('[bias] ' + sym + ': structural bias flipped → ' +
+                    sweep2Corrected.direction + ' (confirmed close through zone)');
+                }
+                await delay(400); continue;
+              } else {
+                console.log('[counter-str] ' + sym + ': opposing sweep found but close did not break zone — not invalidating');
               }
-              await delay(400); continue;
             }
           }
         }
@@ -5326,34 +5341,15 @@ async function autoScan() {
         await delay(400); continue;
       }
 
-      // ── VWAP RECLAIM CHECK (HARD GATE) ────────────────────────
-      // Requires price to close back through session VWAP after the sweep
-      // before BOS is evaluated. Eliminates fake displacement moves that
-      // fail to reclaim value area — the most common source of false signals.
-      //
-      // Grace period: 3 candles (15 min) after the sweep before blocking.
-      // This allows the reclaim candle time to form without firing too early.
+      // ── VWAP RECLAIM — soft check only ────────────────────────
+      // VWAP reclaim is a quality indicator, not a hard gate.
+      // Strong trending gold moves frequently displace through VWAP without
+      // retracing to it — killing those setups was the primary cause of
+      // MOVE-stage setups never reaching TREND (4 of 9 killed here).
+      // Log for context and scoring; do not block pipeline progression.
       const vwapCheck = detectVWAPReclaim(m5, sweep.candleIdx, sweep.direction);
-      console.log('[vwap] ' + sym + ': ' + vwapCheck.note);
-      if (!vwapCheck.reclaimed) {
-        const candlesSinceSweep = m5.length - 1 - sweep.candleIdx;
-        if (candlesSinceSweep > 3) {
-          // Hard block: no VWAP reclaim after 15 min = weak institutional follow-through
-          console.log('[vwap] ' + sym + ': ❌ BLOCKED — no VWAP reclaim after ' +
-            candlesSinceSweep + ' candles (VWAP $' + (vwapCheck.vwap || '—') + ')');
-          // Log the invalidation so it appears in /stats and Sheets
-          if (setup && !setup.invalidated) {
-            await invalidateSetup(sym, 'VWAP reclaim failed — price could not close through session VWAP after sweep.');
-            resetSetup(sym, 'VWAP reclaim failed');
-          }
-          await delay(400); continue;
-        }
-        // Within grace period — wait silently
-        console.log('[vwap] ' + sym + ': waiting for VWAP reclaim (candle ' +
-          candlesSinceSweep + '/3 grace period)');
-        await delay(400); continue;
-      }
-      console.log('[vwap] ' + sym + ': ✓ VWAP reclaimed — BOS evaluation unlocked');
+      console.log('[vwap] ' + sym + ': ' + vwapCheck.note + (vwapCheck.reclaimed ? ' ✓' : ' (soft — not blocking)'));
+
 
       // ── STAGE: TREND SHIFT (BOS) ──────────────────────────────
       const bos = detectBOS(m5, sweep.candleIdx, sweep.direction);
