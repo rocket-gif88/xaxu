@@ -2054,15 +2054,18 @@ function runQualityFilters(candles, m15Candles, sweep, disp, bos, pullback,
 }
 
 // ─── STOP LOSS ─────────────────────────────────────────────────────────────
-function calcSL(direction, sweepExtreme, atr, symOverride) {
-  const _sym = symOverride || 'XAUUSD'; // sym is not in scope here — always pass explicitly
+function calcSL(direction, sweepExtreme, atr, symOverride, zoneExtreme) {
+  const _sym = symOverride || 'XAUUSD';
   const PIP_BUFFER = _sym === 'XAUUSD' ? 0.50 : 0.10;
-
-  const atrBuffer  = atr * 0.10;
-  const buffer     = Math.max(parseFloat(PIP_BUFFER), atrBuffer);
-
-  if (direction === 'BUY')  return parseFloat((sweepExtreme - buffer).toFixed(3));
-  else                       return parseFloat((sweepExtreme + buffer).toFixed(3));
+  const atrBuffer = atr * 0.10;
+  const buffer = Math.max(parseFloat(PIP_BUFFER), atrBuffer);
+  if (direction === 'BUY') {
+    const anchor = (zoneExtreme != null) ? Math.min(sweepExtreme, zoneExtreme) : sweepExtreme;
+    return parseFloat((anchor - buffer).toFixed(3));
+  } else {
+    const anchor = (zoneExtreme != null) ? Math.max(sweepExtreme, zoneExtreme) : sweepExtreme;
+    return parseFloat((anchor + buffer).toFixed(3));
+  }
 }
 
 // ─── TAKE PROFIT ───────────────────────────────────────────────────────────
@@ -2643,7 +2646,7 @@ app.get('/analyze/:sym', async (req, res) => {
               log.push('Pullback entry confirmed: ' + pb.retracement + '% retracement — entry price $' + pb.entry.toFixed(3));
 
               // ── 9. LEVELS ─────────────────────────────────────────
-              const sl   = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym);
+              const sl   = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym, sweep.direction === 'SELL' ? sweep.zoneMax : sweep.zoneMin);
               const tps  = calcTP(sweep.direction, pb.entry, sl, levels);
 
               if (tps.rr1 < 1.5) {
@@ -5404,7 +5407,7 @@ async function autoScan() {
 
           // Pre-calculate SL and TP so user can prepare a limit order right now
           const _slPre  = sweep.sweepExtreme
-            ? calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym)
+            ? calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym, sweep.direction === 'SELL' ? sweep.zoneMax : sweep.zoneMin)
             : null;
 
           // Estimate entry price: midpoint of displacement candle at 55% retracement
@@ -5426,7 +5429,7 @@ async function autoScan() {
 
           const _isBuyNow   = sweep.direction === 'BUY';
           const _dirEmoji   = _isBuyNow ? '🟢' : '🔴';
-          const _pullbackDir = _isBuyNow ? 'dips into' : 'rallies into';
+          const _pullbackDir = _isBuyNow ? 'dip into' : 'rally into';
 
           const _levelsBlock = [
             _entryEstPre ? 'Entry zone: ~$' + _entryEstPre          : null,
@@ -5604,7 +5607,7 @@ async function autoScan() {
 
       const sl  = isContinuation
         ? activePb.sl  // continuation uses tighter SL from detectContinuation
-        : calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym);
+        : calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym, sweep.direction === 'SELL' ? sweep.zoneMax : sweep.zoneMin);
       const tps = calcTP(sweep.direction, activePb.entry, sl, levels);
 
       if (tps.rr1 < 1.5) {
