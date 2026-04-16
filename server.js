@@ -5392,7 +5392,27 @@ async function autoScan() {
         }
         // PRE-ENTRY ALERT: send at trend confirmation — ACTIONABLE levels
         // All 3 structural stages done. User needs to know exactly what to watch for.
-        if (TELEGRAM_MODE !== 'FULL' && setup && !setup.tgAlerts?.preEntry) {
+        // ── HARD FILTERS before pre-signal fires ─────────────────
+        // 1. Displacement must be ≥ 1.0× — weak momentum = noise
+        // 2. Zone touches must be > 14 — fewer = insufficient institutional interest
+        // 3. HTF Neutral setups require score ≥ 65 — no structural tailwind = higher bar
+        const _dispRatioNow  = disp?.ratio || 0;
+        const _touchesNow    = primaryZone?.totalTouches || 0;
+        const _htfBiasNow2   = timing?.htfBias || 'NEUTRAL';
+        const _preSignalBlock =
+          _dispRatioNow < 1.0
+            ? 'Displacement ' + _dispRatioNow + 'x < 1.0x minimum — pre-signal suppressed'
+          : _touchesNow <= 14
+            ? 'Zone touches ' + _touchesNow + ' ≤ 14 — insufficient institutional interest'
+          : (_htfBiasNow2 === 'NEUTRAL' && zoneScore < 65)
+            ? 'HTF Neutral + score ' + zoneScore + '/100 < 65 — pre-signal suppressed'
+          : null;
+
+        if (_preSignalBlock) {
+          console.log('[pre-signal filter] ' + sym + ': BLOCKED — ' + _preSignalBlock);
+        }
+
+        if (TELEGRAM_MODE !== 'FULL' && setup && !setup.tgAlerts?.preEntry && !_preSignalBlock) {
           if (setup.tgAlerts) setup.tgAlerts.preEntry = true;
           const _htfNow     = timing?.htfBias || 'NEUTRAL';
           const _htfAligned = (_htfNow === 'BULLISH' && sweep.direction === 'BUY') ||
