@@ -2,296 +2,9 @@ const express = require('express');
 const cors    = require('cors');
 const fetch   = require('node-fetch');
 const app     = express();
-
-// ═══════════════════════════════════════════════════════════════════════════
-// AURUM UPGRADES — inlined from aurum-upgrades.js (v5.4)
-// hydrateFromSheets, zone memory, VWAP reclaim, ATR sizing, session quality
-// ═══════════════════════════════════════════════════════════════════════════
-async function hydrateFromSheets(setupLogs) {
-  const sheetId   = process.env.GOOGLE_SHEET_ID;
-  const credsJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-
-  if (!sheetId || !credsJson) {
-    console.log('[hydrate] Sheets not configured — skipping boot hydration');
-    return;
-  }
-
-  try {
-    const { google } = require('googleapis');
-    const creds = JSON.parse(credsJson);
-    const auth  = new google.auth.GoogleAuth({
-      credentials: creds,
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
-    const sheets = google.sheets({ version: 'v4', auth });
-
-    const resp = await sheets.spreadsheets.values.get({
-      spreadsheetId: sheetId,
-      range:         'Aurum!A:S',
-    });
-
-    const rows   = resp.data.values || [];
-    const cutoff = Date.now() - 24 * 60 * 60 * 1000; // last 24h only
-    let restored = 0;
-
-    for (const row of rows.slice(1)) { // skip header row
-      const [ts, id, sym, dir, sess,
-             zLow, zHigh, zScore, touches,
-             event, entry, sl, tp1, tp2,
-             candles, result, , stages] = row;
-
-      if (!ts || !id || !event) continue;
-
-      const rowTime = new Date(ts).getTime();
-      if (isNaN(rowTime) || rowTime < cutoff) continue;
-
-      // Restore ENTRY rows — these are the actionable records
-      if (event === 'ENTRY' && !setupLogs[id]) {
-        setupLogs[id] = {
-          id,
-          symbol:        sym    || '',
-          direction:     dir    || '',
-          session:       sess   || '',
-          zone: {
-            low:    parseFloat(zLow)   || null,
-            high:   parseFloat(zHigh)  || null,
-            score:  parseFloat(zScore) || null,
-            touches: parseInt(touches) || null,
-          },
-          entryTriggered:  true,
-          entryPrice:      parseFloat(entry)   || null,
-          stopLoss:        parseFloat(sl)      || null,
-          takeProfits:     [tp1, tp2].filter(Boolean).map(Number),
-          candlesToEntry:  parseInt(candles)   || null,
-          result:          result              || null,
-          timestamp_start: ts,
-          stages:          stages ? stages.split(',').reduce((o,k) => { o[k]=true; return o; }, {}) : {},
-          _version:        1,
-          _restored:       true,   // flag: came from Sheets, not live
-        };
-        restored++;
-      }
-
-      // Also restore RESULT rows for already-restored setups
-      if (event === 'RESULT' && setupLogs[id] && result) {
-        setupLogs[id].result = result;
-      }
-    }
-
-    console.log('[hydrate] ✓ Restored ' + restored + ' entry log(s) from Sheets (last 24h)');
-
-  } catch (e) {
-    // Never crash on hydration failure — it's cosmetic
-    console.error('[hydrate] Failed (non-fatal):', e.message);
-  }
-}
-
-
-// ──────────────────────────────────────────────────────────────────────────
-// 2. ZONE MEMORY — fresh vs exhausted tracking
-// ──────────────────────────────────────────────────────────────────────────
-// Tracks how many times each zone has been "activated" (a setup was created
-// at that zone) within the current session and across restarts.
-//
-// KEY INSIGHT: A zone loses institutional order flow with each retest.
-//   Fresh  (0–1 tests) → full signal allowed
-//   Tested (2 tests)   → signal allowed but confidence docked
-//   Exhausted (3+)     → signal suppressed (no unfilled orders remain)
-//
-// Persisted per-session in memory. At session close, zones are aged out.
-// ──────────────────────────────────────────────────────────────────────────
-
-const zoneMemory = {
-  XAUUSD: {},  // priceRange → { firstSeenAt, touchCount, lastTouchedAt }
-  XAGUSD: {},
-};
-
-function updateZoneMemory(sym, zone) {
-  if (!zone || !zone.priceRange) return;
-  const key = zone.priceRange;
-  const mem = zoneMemory[sym];
-  if (!mem[key]) {
-    mem[key] = {
-      firstSeenAt:   Date.now(),
-      touchCount:    0,
-      lastTouchedAt: 0,
-      direction:     zone.direction || null,
-    };
-  }
-  mem[key].touchCount++;
-  mem[key].lastTouchedAt = Date.now();
-  console.log('[zone-mem] ' + sym + ' zone ' + key +
-    ' touch #' + mem[key].touchCount);
-}
-
-// Returns freshness info for a zone. Used in Telegram alerts and score gating.
-function getZoneFreshness(sym, zone) {
-  if (!zone || !zone.priceRange) {
-    return { fresh: true, touchCount: 0, label: '🟢 FRESH', suppress: false };
-  }
-  const key   = zone.priceRange;
-  const entry = zoneMemory[sym]?.[key];
-
-  if (!entry) {
-    return { fresh: true, touchCount: 0, label: '🟢 FRESH', suppress: false };
-  }
-
-  const count = entry.touchCount;
-
-  // v5.5: suppress raised to 8 touches (XAG still 62% exhausted at 6)
-  if (count <= 1) return { fresh: true,  touchCount: count, label: '🟢 FRESH (1st test)',           suppress: false };
-  if (count === 2) return { fresh: false, touchCount: count, label: '🟡 RETESTED (2nd test)',        suppress: false };
-  if (count === 3) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (3rd test)',         suppress: false };
-  if (count === 4) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (4th test)',         suppress: false };
-  if (count === 5) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (5th test)',         suppress: false };
-  if (count === 6) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (6th test)',         suppress: false };
-  if (count === 7) return { fresh: false, touchCount: count, label: '🟠 WEAKENED (7th test)',         suppress: false };
-  return             { fresh: false, touchCount: count, label: '🔴 EXHAUSTED (' + count + ' tests)', suppress: true  };
-}
-
-// Call at session close to clear per-session zone memory
-function clearZoneMemory(sym) {
-  zoneMemory[sym] = {};
-  console.log('[zone-mem] ' + sym + ': zone memory cleared (session close)');
-}
-
-
-// ──────────────────────────────────────────────────────────────────────────
-// 3. VWAP RECLAIM — post-sweep confirmation
-// ──────────────────────────────────────────────────────────────────────────
-// After a liquidity sweep, we check whether price has reclaimed the session
-// VWAP. A VWAP reclaim after a BUY sweep = genuine institutional demand.
-// Failure to reclaim = likely trap / continuation lower.
-//
-// VWAP here is range-weighted (no free-tier volume on XAU/USD) — standard
-// proxy used by retail prop firms and effective on 5M gold charts.
-// ──────────────────────────────────────────────────────────────────────────
-
-// Calculate session VWAP from a candle array (range-weighted typical price)
-function calcVWAP(candles) {
-  if (!candles || candles.length === 0) return null;
-  let cumTPV = 0;
-  let cumVol = 0;
-
-  for (const c of candles) {
-    const tp  = (c.h + c.l + c.c) / 3;  // typical price
-    const vol = Math.max(c.h - c.l, 0.0001); // range as volume proxy
-    cumTPV += tp * vol;
-    cumVol += vol;
-  }
-
-  return cumVol > 0 ? cumTPV / cumVol : null;
-}
-
-// Check whether price has reclaimed VWAP after a sweep
-// sweepIdx: candle index of the sweep
-// direction: 'BUY' or 'SELL'
-// Returns { reclaimed, vwap, candlesAfterSweep, note }
-function detectVWAPReclaim(candles, sweepIdx, direction) {
-  if (!candles || sweepIdx < 0 || sweepIdx >= candles.length) {
-    return { reclaimed: false, vwap: null, note: 'insufficient data' };
-  }
-
-  // Use candles up to and including sweep for VWAP calculation
-  const vwap = calcVWAP(candles.slice(0, sweepIdx + 1));
-  if (!vwap) return { reclaimed: false, vwap: null, note: 'VWAP calc failed' };
-
-  // Check candles AFTER the sweep
-  const postSweep = candles.slice(sweepIdx + 1);
-  if (postSweep.length === 0) {
-    return { reclaimed: false, vwap, note: 'no candles after sweep yet' };
-  }
-
-  // BUY sweep: we need at least one post-sweep candle to close ABOVE VWAP
-  // SELL sweep: at least one post-sweep candle to close BELOW VWAP
-  let reclaimed = false;
-  for (const c of postSweep) {
-    if (direction === 'BUY'  && c.c > vwap) { reclaimed = true; break; }
-    if (direction === 'SELL' && c.c < vwap) { reclaimed = true; break; }
-  }
-
-  const note = reclaimed
-    ? 'Price reclaimed VWAP ($' + vwap.toFixed(2) + ') after sweep ✓'
-    : 'Price has NOT reclaimed VWAP ($' + vwap.toFixed(2) + ') — weak follow-through';
-
-  return {
-    reclaimed,
-    vwap:              parseFloat(vwap.toFixed(3)),
-    candlesAfterSweep: postSweep.length,
-    note,
-  };
-}
-
-
-// ──────────────────────────────────────────────────────────────────────────
-// 4. ATR POSITION SIZING — per-signal lot recommendation
-// ──────────────────────────────────────────────────────────────────────────
-// Gold standard lot sizing: 1 standard lot XAU/USD = 100 oz = $100/pip ($1)
-// Position size formula:  lots = (accountRisk$) / (stopDistance$ × $100)
-// Example: $10,000 × 1% risk / ($5.00 stop × $100) = 0.20 lots
-//
-// Three account tiers shown in every signal: $10k · $50k · $100k
-// ──────────────────────────────────────────────────────────────────────────
-
-const RISK_PCT    = 1;      // 1% risk per trade
-const PIP_VALUE   = 100;    // $100 per full lot per $1 move on XAU/USD
-
-function calcLots(accountSize, entryPrice, stopLoss) {
-  const stopDist = Math.abs(entryPrice - stopLoss);
-  if (!stopDist || !accountSize) return null;
-  const riskAmount = accountSize * (RISK_PCT / 100);
-  const lots = riskAmount / (stopDist * PIP_VALUE);
-  return parseFloat(Math.max(lots, 0.01).toFixed(2));
-}
-
-// Returns the formatted ATR block string for insertion into Telegram signal
-function formatATRBlock(currentATR, entryPrice, stopLoss) {
-  if (!currentATR || !entryPrice || !stopLoss) return '';
-
-  const stopDist    = Math.abs(entryPrice - stopLoss);
-  const atrMultiple = (stopDist / currentATR).toFixed(1);
-
-  const lot10k  = calcLots(10000,  entryPrice, stopLoss);
-  const lot50k  = calcLots(50000,  entryPrice, stopLoss);
-  const lot100k = calcLots(100000, entryPrice, stopLoss);
-
-  return [
-    '',
-    '<b>📊 POSITION SIZING (1% risk)</b>',
-    'ATR: $' + currentATR.toFixed(2) + '  |  Stop dist: $' +
-      stopDist.toFixed(2) + ' (' + atrMultiple + '× ATR)',
-    '$10k  → ' + lot10k  + ' lots',
-    '$50k  → ' + lot50k  + ' lots',
-    '$100k → ' + lot100k + ' lots',
-  ].join('\n');
-}
-
-
-// ──────────────────────────────────────────────────────────────────────────
-// 5. SESSION QUALITY GATE
-// ──────────────────────────────────────────────────────────────────────────
-// Returns structured session quality. Used for logging and signal labelling.
-// The trading engine already blocks outside London/NY — this adds context
-// and a quality score that flows into the Telegram alert.
-// ──────────────────────────────────────────────────────────────────────────
-
-function getSessionQuality(utcHour) {
-  const isLondon  = utcHour >= 7  && utcHour < 16;
-  const isNY      = utcHour >= 13 && utcHour < 22;
-  const isOverlap = isLondon && isNY;
-
-  if (isOverlap) return { ok: true, quality: 'HIGH',   score: 10, label: 'London+NY Overlap ⭐' };
-  if (isNY)      return { ok: true, quality: 'MEDIUM', score: 7,  label: 'New York' };
-  if (isLondon)  return { ok: true, quality: 'MEDIUM', score: 5,  label: 'London' };
-
-  // Asia / dead zone — already blocked by autoScan but return for logging
-  return { ok: false, quality: 'LOW', score: 0, label: 'Asia/Off-Hours — signals suppressed' };
-}
-
-
-// ──────────────────────────────────────────────────────────────────────────
-// EXPORTS
-// ──────────────────────────────────────────────────────────────────────────
+const { hydrateFromSheets, updateZoneMemory, getZoneFreshness,
+        clearZoneMemory, detectVWAPReclaim, formatATRBlock,
+        getSessionQuality } = require('./aurum-upgrades');
 // CORS: allow Netlify frontend and any origin (needed for Railway free tier)
 app.use(cors({
   origin: '*',                   // allow all origins — tighten if needed
@@ -359,7 +72,7 @@ async function appendToSheet(row) {
     if (!sheets)  return;
     await sheets.spreadsheets.values.append({
       spreadsheetId: sheetId,
-      range:         'Aurum!A:S',
+      range:         'Aurum!A:R',
       valueInputOption: 'RAW',
       insertDataOption: 'INSERT_ROWS',
       requestBody: { values: [row] },
@@ -545,96 +258,7 @@ function logTradeResult(setupId, result) {
   } catch(e) { console.error('[log] logTradeResult error:', e.message); }
 }
 
-// ── TRADE MONITOR PERSISTENCE ─────────────────────────────────────────────
-// Saves open trade monitor state to Sheets on entry so it survives Railway restarts.
-// On boot, restores any monitors that haven't resolved yet.
-// Sheet tab: AurumTrades  Columns: A=ts B=setupId C=sym D=dir E=entry F=sl G=tp1 H=tp2 I=status
-
-async function persistTradeMonitor(sym, monData) {
-  try {
-    const sheetId = process.env.GOOGLE_SHEET_ID;
-    const sheets  = await getSheetsClient();
-    if (!sheetId || !sheets) return;
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: sheetId,
-      range:         'AurumTrades!A:I',
-      valueInputOption: 'RAW',
-      insertDataOption: 'INSERT_ROWS',
-      requestBody: { values: [[
-        new Date().toISOString(),
-        monData.setupId, sym, monData.direction,
-        monData.entry, monData.sl, monData.tp1, monData.tp2,
-        'OPEN'
-      ]]},
-    });
-    console.log('[persist] Trade monitor saved for ' + sym + ' ' + monData.direction + ' @ ' + monData.entry);
-  } catch(e) { console.error('[persist] Failed to save trade monitor:', e.message); }
-}
-
-async function updateTradeMonitorStatus(setupId, status) {
-  // Marks a monitor as CLOSED in AurumTrades — best-effort, non-blocking
-  try {
-    const sheetId = process.env.GOOGLE_SHEET_ID;
-    const sheets  = await getSheetsClient();
-    if (!sheetId || !sheets) return;
-    const resp = await sheets.spreadsheets.values.get({
-      spreadsheetId: sheetId, range: 'AurumTrades!A:I',
-    });
-    const rows = resp.data.values || [];
-    for (let i = 1; i < rows.length; i++) {
-      if (rows[i][1] === setupId && rows[i][8] === 'OPEN') {
-        await sheets.spreadsheets.values.update({
-          spreadsheetId: sheetId,
-          range:         'AurumTrades!I' + (i + 1),
-          valueInputOption: 'RAW',
-          requestBody: { values: [[status]] },
-        });
-        console.log('[persist] Trade monitor ' + setupId + ' marked ' + status);
-        return;
-      }
-    }
-  } catch(e) { console.error('[persist] Failed to update trade monitor:', e.message); }
-}
-
-async function restoreTradeMonitors() {
-  try {
-    const sheetId = process.env.GOOGLE_SHEET_ID;
-    const sheets  = await getSheetsClient();
-    if (!sheetId || !sheets) {
-      console.log('[restore] Sheets not configured — skipping trade monitor restore');
-      return;
-    }
-    const resp = await sheets.spreadsheets.values.get({
-      spreadsheetId: sheetId, range: 'AurumTrades!A:I',
-    });
-    const rows   = resp.data.values || [];
-    const cutoff = Date.now() - 24 * 60 * 60 * 1000; // only last 24h
-    let restored = 0;
-    for (const row of rows.slice(1)) {
-      const [ts, setupId, sym, dir, entry, sl, tp1, tp2, status] = row;
-      if (status !== 'OPEN') continue;
-      if (new Date(ts).getTime() < cutoff) continue;
-      if (!sym || sym !== 'XAUUSD') continue; // Gold only
-      // Only restore if no monitor already active for this symbol
-      if (tradeMonitor[sym]) continue;
-      tradeMonitor[sym] = {
-        setupId,
-        direction:    dir,
-        entry:        parseFloat(entry),
-        sl:           parseFloat(sl),
-        tp1:          parseFloat(tp1)  || null,
-        tp2:          parseFloat(tp2)  || null,
-        maxFav:       parseFloat(entry),
-        resultLogged: false,
-        startedAt:    new Date(ts).getTime(),
-        _restored:    true,
-      };
-      restored++;
-      console.log('[restore] Trade monitor restored: ' + sym + ' ' + dir + ' @ ' + entry);
-    }
-    if (restored > 0) console.log('[restore] ✓ Restored ' + restored + ' open trade monitor(s)');
-  } catch(e) { console.error('[restore] Failed (non-fatal):', e.message); }
-}
+// ── SCAN-LEVEL EVENT LOGGING ──────────────────────────────────────────────
 // Logs every engine decision to Sheets — not just signals.
 // Non-blocking, never throws. Gives full visibility into filter logic.
 //
@@ -678,209 +302,10 @@ function readAllLogs() {
 }
 
 const SYMBOLS = {
-  XAUUSD: 'XAU/USD',   // Gold spot — Twelve Data (Silver disabled — no free intraday XAG API available)
+  XAUUSD: 'XAU/USD',   // Gold spot — free tier
+  XAGUSD: 'SLV'        // Silver via iShares Silver Trust ETF (SLV) — free tier proxy
+                        // Trades 13:30-20:00 UTC (covers London/NY overlap + full NY session)
 };
-
-// ─── XAG SYNTHETIC CANDLE ENGINE ──────────────────────────────────────────
-// gold-api.com provides real-time XAG spot price for free with no rate limit.
-// We can't get intraday OHLC for free, so we build synthetic M5 candles by
-// polling every scan and accumulating into 5-minute windows.
-//
-// Warmup: on boot we call the history endpoint (10/hr free) to seed the last
-// 100 daily closes, then interpolate those into synthetic M5 candles so the
-// engine has enough history to run immediately — no 2-hour warmup window.
-//
-// On-disk persistence: candles written to /tmp/xag_candles.json so Railway
-// restarts don't lose accumulated history.
-
-const XAG_CANDLE_FILE  = '/tmp/xag_candles.json';
-const XAG_MAX_CANDLES  = 150;  // keep ~12.5 hours of M5 candles
-const XAG_CANDLE_MS    = 5 * 60 * 1000; // 5 min
-
-// In-memory store
-const xagState = {
-  candles:       [],    // array of { t, o, h, l, c }
-  currentWindow: null,  // { t, o, h, l, prices: [] } — open candle
-  lastPrice:     null,
-  lastFetchAt:   0,
-  seeded:        false,
-};
-
-// Persist candles to disk
-function xagSaveCandles() {
-  try {
-    require('fs').writeFileSync(XAG_CANDLE_FILE,
-      JSON.stringify({ candles: xagState.candles, savedAt: Date.now() }));
-  } catch(e) { /* non-critical */ }
-}
-
-// Load candles from disk (survives Railway restarts)
-function xagLoadCandles() {
-  try {
-    const raw = require('fs').readFileSync(XAG_CANDLE_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
-    if (parsed.candles && parsed.candles.length > 0) {
-      // Only use candles from last 24 hours
-      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-      xagState.candles = parsed.candles.filter(c => c.t > cutoff);
-      console.log('[xag] Loaded ' + xagState.candles.length + ' candles from disk');
-      return true;
-    }
-  } catch(e) { /* file doesn't exist yet */ }
-  return false;
-}
-
-// Fetch current XAG spot price from gold-api.com (free, unlimited, no key)
-async function xagFetchPrice() {
-  try {
-    // Yahoo Finance public endpoint — no auth, no quota, real XAG/USD spot
-    const url  = 'https://query1.finance.yahoo.com/v8/finance/chart/XAGUSD=X?interval=1m&range=5m';
-    const resp = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      signal: AbortSignal.timeout(8000),
-    });
-    const json = await resp.json();
-    const price = json?.chart?.result?.[0]?.meta?.regularMarketPrice ||
-                  json?.chart?.result?.[0]?.meta?.previousClose || null;
-    if (!price || price <= 0) {
-      console.log('[xag] Yahoo Finance: no price. Keys:', Object.keys(json?.chart || {}).join(','));
-      return null;
-    }
-    return parseFloat(price);
-  } catch(e) {
-    console.error('[xag] price fetch error:', e.message);
-    return null;
-  }
-}
-
-// Get full 5min candles from Yahoo Finance for seeding
-async function xagFetchCandles(count = 120) {
-  try {
-    const url  = `https://query1.finance.yahoo.com/v8/finance/chart/XAGUSD=X?interval=5m&range=2d`;
-    const resp = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      signal: AbortSignal.timeout(12000),
-    });
-    const json = await resp.json();
-    const result = json?.chart?.result?.[0];
-    if (!result) return null;
-
-    const ts        = result.timestamp || [];
-    const ohlc      = result.indicators?.quote?.[0] || {};
-    const { open, high, low, close } = ohlc;
-    if (!ts.length || !close) return null;
-
-    const candles = ts.map((t, i) => ({
-      t: t * 1000,
-      o: parseFloat(open?.[i]  || close[i]),
-      h: parseFloat(high?.[i]  || close[i]),
-      l: parseFloat(low?.[i]   || close[i]),
-      c: parseFloat(close[i]),
-    })).filter(c => c.c > 0 && !isNaN(c.c));
-
-    return candles.slice(-count);
-  } catch(e) {
-    console.error('[xag] candles fetch error:', e.message);
-    return null;
-  }
-}
-
-// Seed historical candles from gold-api.com history endpoint
-// Uses 1 API call (of 10/hr free limit) on boot — never called again.
-// Falls back to current-price repetition if history endpoint fails.
-async function xagSeedHistory() {
-  try {
-    console.log('[xag] Seeding from Yahoo Finance (XAGUSD=X 5min)...');
-    const candles = await xagFetchCandles(120);
-    if (candles && candles.length >= 10) {
-      xagState.candles = candles;
-      xagState.seeded  = true;
-      xagSaveCandles();
-      console.log('[xag] ✓ Seeded ' + candles.length + ' real M5 candles from Yahoo Finance');
-      return true;
-    }
-  } catch(e) {
-    console.error('[xag] Seed error:', e.message);
-  }
-
-  // Fallback — seed with current price repeated
-  console.log('[xag] Yahoo seed failed — using price-repeat fallback');
-  const currentPrice = await xagFetchPrice();
-  if (currentPrice && currentPrice > 0) {
-    const now  = Date.now();
-    const seed = [];
-    for (let i = 59; i >= 0; i--) {
-      const jitter = (Math.random() - 0.5) * 0.04;
-      const p      = parseFloat((currentPrice + jitter).toFixed(3));
-      seed.push({ t: now - i * XAG_CANDLE_MS, o: p, h: p + 0.01, l: p - 0.01, c: p, _synthetic: true });
-    }
-    xagState.candles = seed;
-    xagState.seeded  = true;
-    xagSaveCandles();
-    console.log('[xag] ✓ Price-seeded ' + seed.length + ' candles at $' + currentPrice);
-    return true;
-  }
-  return false;
-}
-
-// Called on every autoScan — fetches real 5min candles from Yahoo Finance
-async function xagUpdateCandles() {
-  try {
-    // Try to get real 5min candles directly — much better than synthetic accumulation
-    const candles = await xagFetchCandles(120);
-    if (candles && candles.length >= 10) {
-      xagState.candles     = candles;
-      xagState.lastPrice   = candles[candles.length - 1].c;
-      xagState.lastFetchAt = Date.now();
-      xagState.seeded      = true;
-      xagSaveCandles();
-      console.log('[xag] Yahoo Finance: ' + candles.length + ' M5 candles, last=$' + xagState.lastPrice.toFixed(3));
-      return candles;
-    }
-  } catch(e) {
-    console.error('[xag] updateCandles error:', e.message);
-  }
-
-  // Fallback: use last known price to extend existing candles
-  const price = await xagFetchPrice();
-  if (!price || price <= 0) {
-    console.log('[xag] No price — using cached candles (' + xagState.candles.length + ')');
-    return xagState.candles.length > 0 ? xagState.candles : null;
-  }
-
-  xagState.lastPrice   = price;
-  xagState.lastFetchAt = Date.now();
-
-  const nowMs       = Date.now();
-  const windowStart = Math.floor(nowMs / XAG_CANDLE_MS) * XAG_CANDLE_MS;
-
-  if (!xagState.currentWindow || xagState.currentWindow.t !== windowStart) {
-    if (xagState.currentWindow && xagState.currentWindow.prices.length > 0) {
-      const w = xagState.currentWindow;
-      xagState.candles.push({
-        t: w.t, o: w.o,
-        h: Math.max(...w.prices, w.o),
-        l: Math.min(...w.prices, w.o),
-        c: w.prices[w.prices.length - 1],
-      });
-      if (xagState.candles.length > XAG_MAX_CANDLES)
-        xagState.candles = xagState.candles.slice(-XAG_MAX_CANDLES);
-      xagSaveCandles();
-    }
-    xagState.currentWindow = { t: windowStart, o: price, prices: [price] };
-  } else {
-    xagState.currentWindow.prices.push(price);
-  }
-
-  const snapshot = [...xagState.candles];
-  if (xagState.currentWindow?.prices.length > 0) {
-    const w = xagState.currentWindow;
-    snapshot.push({ t: w.t, o: w.o,
-      h: Math.max(...w.prices, w.o), l: Math.min(...w.prices, w.o),
-      c: w.prices[w.prices.length - 1], _open: true });
-  }
-  return snapshot.length > 0 ? snapshot : null;
-}
 
 // ─── IN-MEMORY CACHE ────────────────────────────────────────────────────────
 // Cache candle data for 60 seconds to avoid hitting Twelve Data rate limits
@@ -1014,9 +439,13 @@ function deriveM15FromM5(m5Candles) {
 
 
 // --- ATR RANGE VALIDATION ----------------------------------------------------
+// v5.2: Explicit absolute ATR ranges for XAUUSD (M5 candle basis):
+//   < 5  → low volatility, suppress (choppy/dead market)
+//   5–20 → valid trading range
+//   > 20 → news spike, suppress (unpredictable slippage)
 const ATR_RANGE = {
-  XAUUSD: { min: 1.0,  max: 20.0 },
-  XAGUSD: { min: 0.05, max: 2.00  }  // XAG/USD real spot via Twelve Data
+  XAUUSD: { min: 5.0,  max: 20.0 },  // explicit $ range per M5 candle — XAU/USD
+  XAGUSD: { min: 0.03, max: 1.50  }  // $0.03–$1.50 per M5 candle — SLV ETF
 };
 function checkATR(sym, atrValues) {
   if (!atrValues || atrValues.length < 5 || !ATR_RANGE[sym]) {
@@ -1261,7 +690,7 @@ function buildLevels(m5Candles, m15Candles) {
 
 // --- PROXIMITY DETECTION ---------------------------------------------------
 // Threshold: price within 0.20% of a liquidity level = "approaching"
-const APPROACH_PCT = { XAUUSD: 0.0020, XAGUSD: 0.0020 }; // real XAG spot — same threshold as XAU
+const APPROACH_PCT = { XAUUSD: 0.0020, XAGUSD: 0.0015 }; // SLV slightly tighter
 
 function detectApproaching(price, levels, sym) {
   const threshold = APPROACH_PCT[sym] || 0.0020;
@@ -1314,10 +743,9 @@ function rankZone(z, price, sess, m5Candles) {
   const breakdown = {};
   let total = 0;
 
-  // ── A. TOUCH COUNT (max 30) — v5.5: boosted for high-touch zones
+  // ── A. TOUCH COUNT (max 30) ───────────────────────────────────
   const touches = z.totalTouches || 0;
-  const touchScore = touches >= 20 ? 30  // v5.5: explicit 20+ tier
-                   : touches >= 15 ? 28
+  const touchScore = touches >= 15 ? 30
                    : touches >= 10 ? 24
                    : touches >= 6  ? 18
                    : touches >= 3  ? 10 : 0;
@@ -1622,26 +1050,24 @@ function detectSweep(candles, levels) {
 }
 
 // ─── DISPLACEMENT ──────────────────────────────────────────────────────────
-// v5.4: Minimum threshold lowered from 1.2x → 1.0x.
+// v5.2: Minimum threshold lowered from 1.5x → 1.2x.
 //   ≥1.5x = STRONG  (max score)
-//   ≥1.2x = VALID+  (good score)
-//   ≥1.0x = VALID   (base score)
-//   <1.0x = invalid
+//   ≥1.2x = VALID   (reduced score)
+//   <1.2x = invalid (unchanged)
 // Must occur within 1–3 candles after sweep candle
 // Returns: { found, candleIdx, bodySize, avgBody, ratio, strength }
 function detectDisplacement(candles, sweepIdx, direction, minRatioOverride) {
   // minRatioOverride: optional — allows caller to require stricter displacement
   const MIN_RATIO_OVERRIDE = minRatioOverride || null;
-  // v5.5: Min ratio 0.8x. STRONG=1.5x+, VALID=0.8–1.5x
-  // (was 1.0x — only 3/68 sweeps reaching displacement; small candle environment)
-  const BODY_MULT  = 0.8;  // was 1.0 → 0.8
+  // v5.2: Min ratio 1.2x. STRONG=1.5x+, VALID=1.2–1.5x
+  const BODY_MULT  = 1.2;  // was 1.5 — lowered to accept valid displacement
   const CLOSE_ZONE = 0.25;
   const slice = candles.slice(Math.max(0, sweepIdx - 10), sweepIdx);
   if (slice.length < 3) return { found: false, reason: 'insufficient candle history' };
   const avgBody10 = slice.reduce((s,c) => s + body(c), 0) / slice.length;
   let weakGap = false;
 
-  for (let offset = 1; offset <= 6; offset++) {
+  for (let offset = 1; offset <= 4; offset++) {
     const idx = sweepIdx + offset;
     if (idx >= candles.length) break;
     const c = candles[idx];
@@ -1656,17 +1082,17 @@ function detectDisplacement(candles, sweepIdx, direction, minRatioOverride) {
       : (c.h - c.c) / r >= (1 - CLOSE_ZONE);
     if (bodyStrong && dirOk && closeZone) {
       const ratio    = parseFloat((b / avgBody10).toFixed(2));
-      const strength = ratio >= 1.5 ? 'STRONG' : ratio >= 1.2 ? 'GOOD' : ratio >= 1.0 ? 'VALID+' : 'VALID';
+      const strength = ratio >= 1.5 ? 'STRONG' : 'VALID'; // v5.2 strength label
       return { found: true, candleIdx: idx,
                ratio, avgBody: avgBody10, weakGap,
-               strength,
+               strength,  // 'STRONG' | 'VALID'
                impulseHigh: c.h, impulseLow: c.l };
     }
-    // Allow up to 2 weak/indecisive candle gaps (was 1) — accounts for consolidation after sweep
+    // Allow 1 weak/indecisive candle gap before invalidating
     if (!weakGap && (!dirOk || b < avgBody10 * 0.5)) { weakGap = true; continue; }
-    if (offset > 4 && !bodyStrong) break;
+    if (offset > 2 && !bodyStrong) break;
   }
-  return { found: false, reason: 'no displacement within 6 bars (2 weak gaps allowed)' };
+  return { found: false, reason: 'no displacement within 4 bars (1 weak gap allowed)' };
 }
 
 // ─── MARKET STRUCTURE SHIFT (BOS) ─────────────────────────────────────────
@@ -1911,13 +1337,11 @@ function detectPullback(candles, dispIdx, direction, sweepExtreme) {
 // F1: DISPLACEMENT TIMING — must occur within 1-3 candles (strict), 4th only with no gap
 function filterDisplacementTiming(disp, sweepIdx) {
   const offset = disp.candleIdx - sweepIdx;
-  if (offset <= 4) return { pass: true };
-  if (offset <= 6 && !disp.weakGap)
-    return { pass: true, note: 'offset ' + offset + ' — no gap, acceptable' };
-  if (offset <= 6 && disp.weakGap)
-    return { pass: true, note: 'offset ' + offset + ' — one weak gap, acceptable' };
+  if (offset <= 3) return { pass: true };
+  if (offset === 4 && !disp.weakGap)
+    return { pass: true, note: 'offset 4 — no gap, acceptable' };
   return { pass: false,
-    reason: 'Displacement too delayed (' + offset + ' candles after sweep, max 6)' };
+    reason: 'Displacement too delayed (' + offset + ' candles after sweep, max 3)' };
 }
 
 // F2: DISPLACEMENT CHOP — reject slow drifts, require clean single-candle impulse
@@ -2054,18 +1478,16 @@ function runQualityFilters(candles, m15Candles, sweep, disp, bos, pullback,
 }
 
 // ─── STOP LOSS ─────────────────────────────────────────────────────────────
-function calcSL(direction, sweepExtreme, atr, symOverride, zoneExtreme) {
-  const _sym = symOverride || 'XAUUSD';
-  const PIP_BUFFER = _sym === 'XAUUSD' ? 0.50 : 0.10;
-  const atrBuffer = atr * 0.10;
-  const buffer = Math.max(parseFloat(PIP_BUFFER), atrBuffer);
-  if (direction === 'BUY') {
-    const anchor = (zoneExtreme != null) ? Math.min(sweepExtreme, zoneExtreme) : sweepExtreme;
-    return parseFloat((anchor - buffer).toFixed(3));
-  } else {
-    const anchor = (zoneExtreme != null) ? Math.max(sweepExtreme, zoneExtreme) : sweepExtreme;
-    return parseFloat((anchor + buffer).toFixed(3));
-  }
+function calcSL(direction, sweepExtreme, atr) {
+  const PIP_BUFFER = direction === 'BUY'
+    ? (sym === 'XAUUSD' ? 0.50 : 0.05)  // XAU: ~50c buffer, SLV: ~5c buffer
+    : (sym === 'XAUUSD' ? 0.50 : 0.05);
+
+  const atrBuffer  = atr * 0.10;
+  const buffer     = Math.max(parseFloat(PIP_BUFFER), atrBuffer);
+
+  if (direction === 'BUY')  return parseFloat((sweepExtreme - buffer).toFixed(3));
+  else                       return parseFloat((sweepExtreme + buffer).toFixed(3));
 }
 
 // ─── TAKE PROFIT ───────────────────────────────────────────────────────────
@@ -2121,8 +1543,9 @@ function checkVolatility(atrValues) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 function scoreSetup(sessionLabel, sessionOk, sweep, displacement, bos, pullback,
-                    volatilityOk, directionalBias, biasPenalty, htfBias) {
+                    volatilityOk, directionalBias, biasPenalty, htfBias, h1Bias) {
   const _htfBias = htfBias || 'NEUTRAL';
+  const _h1Bias  = h1Bias  || 'NEUTRAL';
   const breakdown = {};
   let total = 0;
 
@@ -2158,14 +1581,12 @@ function scoreSetup(sessionLabel, sessionOk, sweep, displacement, bos, pullback,
   if (!displacement || !displacement.found) {
     breakdown.displacement = { score: 0, max: 20, note: 'No displacement detected' };
   } else {
-    // v5.5: 0.8x = VALID (+5), 1.0x = VALID+ (+8), 1.2x = GOOD (+12), 1.5x+ = STRONG (+20)
+    // v5.2: 1.2x = VALID (+12), 1.5x+ = STRONG (+20)
     const dispScore = displacement.ratio >= 3.0 ? 20
                     : displacement.ratio >= 2.5 ? 18
                     : displacement.ratio >= 2.0 ? 16
                     : displacement.ratio >= 1.5 ? 20   // STRONG
-                    : displacement.ratio >= 1.2 ? 12   // GOOD
-                    : displacement.ratio >= 1.0 ? 8    // VALID+
-                    : displacement.ratio >= 0.8 ? 5    // VALID
+                    : displacement.ratio >= 1.2 ? 12   // VALID
                     : 0;
     const dispFinal = displacement.weakGap ? Math.max(dispScore - 3, 0) : dispScore;
     breakdown.displacement = { score: dispFinal, max: 20, ratio: displacement.ratio, strength: displacement.strength || 'VALID' };
@@ -2239,6 +1660,24 @@ function scoreSetup(sessionLabel, sessionOk, sweep, displacement, bos, pullback,
       total -= 15;
       breakdown.htfBias = { adjustment: -15, alignment: 'COUNTER', htfBias: _htfBias };
       console.log('[htf] ' + dir + ' COUNTER to ' + _htfBias + ' HTF bias → -15');
+    }
+  }
+
+  // ── H1 STRUCTURAL BIAS (max +5 / min -20) ────────────────────
+  // H1 is the broader structural context. Aligned = extra conviction.
+  // Counter = serious penalty on top of the gate already applied earlier.
+  if (_h1Bias !== 'NEUTRAL' && sweep.found) {
+    const dir       = sweep.direction;
+    const h1Aligned = (_h1Bias === 'BULLISH' && dir === 'BUY')  || (_h1Bias === 'BEARISH' && dir === 'SELL');
+    const h1Counter = (_h1Bias === 'BULLISH' && dir === 'SELL') || (_h1Bias === 'BEARISH' && dir === 'BUY');
+    if (h1Aligned) {
+      total += 5;
+      breakdown.h1Bias = { adjustment: +5, alignment: 'ALIGNED', h1Bias: _h1Bias };
+      console.log('[h1]  ' + dir + ' ALIGNED with ' + _h1Bias + ' H1 bias → +5');
+    } else if (h1Counter) {
+      total -= 20;
+      breakdown.h1Bias = { adjustment: -20, alignment: 'COUNTER', h1Bias: _h1Bias };
+      console.log('[h1]  ' + dir + ' COUNTER to ' + _h1Bias + ' H1 bias → -20');
     }
   }
 
@@ -2462,18 +1901,33 @@ app.get('/analyze/:sym', async (req, res) => {
   res.on('finish', () => clearTimeout(routeTimeout));
 
   // ── 1. FETCH DATA ──────────────────────────────────────────────────────
+  // SLV early exit: if outside NYSE hours AND no cached data, skip fetch entirely
+  const _nowH = new Date().getUTCHours();
+  const _slvClosed = sym === 'XAGUSD' && (_nowH >= 20 || _nowH < 13);
+  if (_slvClosed) {
+    const _cached = getCached('candles_XAGUSD_5min_120');
+    const _lastPrice = _cached ? parseFloat(_cached[_cached.length-1]?.c) : null;
+    const _lastATR   = _cached ? calcATRFromCandles(_cached, 14) : [];
+    return res.json({ success: true, symbol: 'XAGUSD',
+      price: _lastPrice, atr: null,
+      volatility_atr: _lastATR.length ? parseFloat(_lastATR[_lastATR.length-1].toFixed(4)) : null,
+      system_state: 'session_closed', session: 'Closed',
+      session_ok: false, setup_state: 'standby',
+      levels: [], log: ['Silver market closed — SLV ETF trades 13:30–20:00 UTC.' + (_lastPrice ? ' Last price: $' + _lastPrice.toFixed(3) : '')],
+      signal: null, m5_candles: _cached?.length || 0,
+      note: 'SLV market closed. Opens 13:30 UTC.' });
+  }
+
   let m5, m15, atrValues;
   try {
-    // ONE call per symbol — everything else derived from M5 candles.
-    // XAUUSD: Twelve Data API | XAGUSD: gold-api.com synthetic candles (24/5)
+    // ONE API call per symbol — everything else derived from M5 candles.
     m5 = await getCandles(sym, '5min', 120);  // 120 × 5min = 10 hours
 
     // Derive M15 and ATR without additional API calls
     m15       = m5 ? deriveM15FromM5(m5) : [];
     atrValues = m5 ? calcATRFromCandles(m5, 14) : [];
 
-    console.log('[' + sym + '] M5: ' + (m5?.length||0) + ' M15 (derived): ' + (m15?.length||0) + ' ATR (calc): ' + (atrValues?.length||0) + ' — 1 API call used');
-  } catch(e) {
+    console.log('[' + sym + '] M5: ' + (m5?.length||0) + ' M15 (derived): ' + (m15?.length||0) + ' ATR (calc): ' + (atrValues?.length||0) + ' — 1 API call used');  } catch(e) {
     console.error('[' + sym + '] Data fetch exception:', e.message);
     return res.json({ success: true, symbol: sym, price: null, atr: null,
       system_state: 'data_error', session: 'Unknown', session_ok: false,
@@ -2529,7 +1983,20 @@ app.get('/analyze/:sym', async (req, res) => {
   // Check candle staleness — latest candle should be within 30 minutes
   const latestCandleAge = (nowUtc - m5[m5Count - 1].t) / 60000; // minutes
   if (latestCandleAge > 30) {
-    const staleMsg  = 'Live data temporarily unavailable — latest candle is ' + Math.round(latestCandleAge) + ' minutes old';
+    const isSLV     = sym === 'XAGUSD';
+    const slvClosed = isSLV && (utcHour >= 20 || utcHour < 13);
+    const staleMsg  = slvClosed
+      ? 'Silver market closed — SLV ETF trades 13:30–20:00 UTC. Last price: $' + m5[m5Count-1].c.toFixed(3)
+      : 'Live data temporarily unavailable — latest candle is ' + Math.round(latestCandleAge) + ' minutes old';
+    if (slvClosed) {
+      const lastATR = calcATRFromCandles(m5, 14);
+      return res.json({ success: true, symbol: sym, price: m5[m5Count-1]?.c || null,
+        system_state: 'session_closed', session: 'Closed',
+        session_ok: false, setup_state: 'standby',
+        volatility_atr: lastATR.length ? parseFloat(lastATR[lastATR.length-1].toFixed(4)) : null,
+        m5_candles: m5Count, levels: [], log: [staleMsg], signal: null,
+        note: 'SLV market closed. Opens 13:30 UTC.' });
+    }
     if (inSession) {
       return res.json({ success: true, symbol: sym, price: m5[m5Count-1]?.c || null,
         system_state: 'data_error', session: sessionName(nowUtc) || 'Active',
@@ -2562,6 +2029,13 @@ app.get('/analyze/:sym', async (req, res) => {
   analyzeGlobalBias = calcGlobalBias(levels, currentPrice, null);
   const htfResult     = calcHTFBias(m15);
   console.log('[htf] ' + sym + ' (analyze): bias=' + htfResult.bias + ' — ' + htfResult.reason);
+
+  // H1 structural bias for analyze route — same H1 data that autoScan uses
+  const h1Candles = await getCandles(sym, '1h', 50);
+  const h1Result  = (h1Candles && h1Candles.length >= 10)
+    ? calcH1Bias(h1Candles)
+    : { bias: 'NEUTRAL', lastBOS: 'NONE', reason: 'no H1 data' };
+  console.log('[h1]  ' + sym + ' (analyze): bias=' + h1Result.bias + ' — ' + h1Result.reason);
   const directionalBias   = analyzeGlobalBias.bias === 'BUY'  ? 'bullish_bias'
                           : analyzeGlobalBias.bias === 'SELL' ? 'bearish_bias'
                           : 'neutral';
@@ -2646,7 +2120,7 @@ app.get('/analyze/:sym', async (req, res) => {
               log.push('Pullback entry confirmed: ' + pb.retracement + '% retracement — entry price $' + pb.entry.toFixed(3));
 
               // ── 9. LEVELS ─────────────────────────────────────────
-              const sl   = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym, sweep.direction === 'SELL' ? sweep.zoneMax : sweep.zoneMin);
+              const sl   = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5);
               const tps  = calcTP(sweep.direction, pb.entry, sl, levels);
 
               if (tps.rr1 < 1.5) {
@@ -2675,11 +2149,11 @@ app.get('/analyze/:sym', async (req, res) => {
                 const _htfBiasState = timing?.htfBias || 'NEUTRAL';
         const scoreResult2 = scoreSetup(sess, sessionOk, sweep, disp, bos, pb,
                   volatility.ok === true || volatility.ok === undefined, directionalBias, biasPenalty,
-                  _htfBiasState);
+                  _htfBiasState, h1Result.bias || 'NEUTRAL');
                 // Zone score gate applies here too
                 if (!analyzeZoneAllowSignal) {
                   setupState = 'invalidated';
-                  log.push('Signal blocked — zone score ' + pzConf + '/100 < 50 (zone too weak)');
+                  log.push('Signal blocked — zone score ' + pzConf + '/100 < 60 (zone too weak)');
                 } else if (scoreResult2.tier !== 'HIGH') {
                   setupState = 'invalidated';
                   log.push('Signal not generated — score ' + confidence + '/100 tier=' + scoreResult2.tier + ' (requires HIGH ≥75)');
@@ -2776,17 +2250,16 @@ app.get('/analyze/:sym', async (req, res) => {
       (pzConf >= 60 ? ' ✓' : ' ⚠ low'));
   }
   // Zone score gate for analyze route
-  // v5.4: threshold 60→50
-  // < 50  → no pre-signals, no signals
-  // 50–74 → pre-signals allowed, no aggressive entry
+  // < 60  → no pre-signals, no signals
+  // 60–74 → pre-signals allowed, no aggressive entry
   // ≥ 75  → full system
   const analyzeZoneAllowAggressive = pzConf >= 75;
-  const analyzeZoneAllowSignal     = pzConf >= 50;
+  const analyzeZoneAllowSignal     = pzConf >= 60;
   const sweepPotentials = (primaryZone && analyzeZoneAllowSignal && approachingLevels.length)
     ? detectSweepPotential(livePrice, approachingLevels, m5)
     : [];
   if (!analyzeZoneAllowSignal && primaryZone) {
-    log.push('Zone score ' + pzConf + '/100 < 50 — signals suppressed (zone not strong enough)');
+    log.push('Zone score ' + pzConf + '/100 < 60 — signals suppressed (zone not strong enough)');
   } else if (!analyzeZoneAllowAggressive && primaryZone) {
     log.push('Zone score ' + pzConf + '/100 [60–74] — standard entry only, aggressive suppressed');
   }
@@ -2854,7 +2327,7 @@ app.get('/analyze/:sym', async (req, res) => {
       primary_zone:      primaryZone,
       zone_confidence:   pzConf,
       zone_direction:    primaryZone?.direction || null,
-      zone_score_tier:   pzConf >= 75 ? 'FULL' : pzConf >= 50 ? 'STANDARD' : 'BLOCKED',
+      zone_score_tier:   pzConf >= 75 ? 'FULL' : pzConf >= 60 ? 'STANDARD' : 'BLOCKED',
       zone_grade:        pzGrade,
       directional_bias:  directionalBias,
       bias_score:        analyzeGlobalBias?.score || 0,
@@ -2862,6 +2335,9 @@ app.get('/analyze/:sym', async (req, res) => {
       htf_bias:          htfResult?.bias || 'NEUTRAL',
       htf_last_bos:      htfResult?.lastBOS || 'NONE',
       htf_reason:        htfResult?.reason || '',
+      h1_bias:           h1Result?.bias || 'NEUTRAL',
+      h1_last_bos:       h1Result?.lastBOS || 'NONE',
+      h1_reason:         h1Result?.reason || '',
       m5_candles:   m5.length,
       ratio
     });
@@ -2924,7 +2400,7 @@ app.get('/setup-sheets', async (req, res) => {
     ];
     await sheets.spreadsheets.values.update({
       spreadsheetId: sheetId,
-      range: 'Aurum!A1:S1',
+      range: 'Aurum!A1:R1',
       valueInputOption: 'RAW',
       requestBody: { values: [HEADERS] },
     });
@@ -3062,7 +2538,7 @@ app.get('/setup-sheet', async (req, res) => {
       'Candles to Event', 'Result', 'Invalidation Reason', 'Stages Confirmed'
     ];
     await sheets.spreadsheets.values.update({
-      spreadsheetId: sheetId, range: 'Aurum!A1:S1',
+      spreadsheetId: sheetId, range: 'Aurum!A1:R1',
       valueInputOption: 'RAW', requestBody: { values: [HEADERS] },
     });
 
@@ -3167,29 +2643,31 @@ app.get('/health', async (req, res) => {
     session: inSession
       ? (h >= 13 && h < 16 ? 'London+NY Overlap' : h < 16 ? 'London' : 'New York')
       : 'Closed',
-    symbols: { XAUUSD: 'XAU/USD (Gold spot)' }, // Silver disabled
+    symbols: { XAUUSD: 'XAU/USD (Gold spot)', XAGUSD: 'SLV ETF (Silver proxy)' },
     ts: new Date().toUTCString()
   });
 });
 
 app.get('/prices', (req, res) => {
-  // Serve prices from in-memory candle stores — zero API calls
+  // Serve prices from in-memory candle cache — zero API calls
   const xauCache = getCached('candles_XAUUSD_5min_120');
+  const xagCache = getCached('candles_XAGUSD_5min_120');
   const xau = xauCache ? parseFloat(xauCache[xauCache.length-1]?.c) || null : null;
+  const slv = xagCache ? parseFloat(xagCache[xagCache.length-1]?.c) || null : null;
 
-  // XAGUSD: use synthetic candle store (gold-api.com real XAG spot)
-  const xagCandles = xagState.candles.length > 0 ? xagState.candles : null;
-  const xag = xagCandles ? parseFloat(xagCandles[xagCandles.length-1]?.c) || null
-    : xagState.lastPrice || null;
+  // SLV holds ~0.9300 troy oz of silver per share (IAU ratio, updated periodically)
+  // Convert SLV price → XAG spot price for an accurate Gold/Silver ratio
+  const SLV_OZ_RATIO = 0.9300;
+  const xagSpot = slv ? parseFloat((slv / SLV_OZ_RATIO).toFixed(3)) : null;
 
-  // Gold/Silver ratio
-  const ratio = xau && xag ? parseFloat((xau / xag).toFixed(1)) : null;
+  // Real XAU/XAG ratio (Gold/Silver ratio) — industry standard metric
+  const ratio = xau && xagSpot ? parseFloat((xau / xagSpot).toFixed(1)) : null;
 
   res.json({
     success:  true,
-    prices:   { XAUUSD: xau, XAGUSD: xag },
-    ratio,
-    xag_candles: xagCandles?.length || 0,
+    prices:   { XAUUSD: xau, XAGUSD: slv },   // XAGUSD shows SLV price as-is for display
+    xag_spot: xagSpot,                          // actual silver spot estimate
+    ratio,                                      // true XAU/XAG ratio
     from_cache: true,
     ts: new Date().toUTCString()
   });
@@ -3269,7 +2747,7 @@ app.get('/setup-sheets', async (req, res) => {
 
     // Write headers
     await sheets.spreadsheets.values.update({
-      spreadsheetId: sheetId, range: 'Aurum!A1:S1',
+      spreadsheetId: sheetId, range: 'Aurum!A1:R1',
       valueInputOption: 'RAW', requestBody: { values: [HEADERS] },
     });
 
@@ -3344,123 +2822,53 @@ app.get('/setup-sheets', async (req, res) => {
   }
 });
 
-// ── GET /stats — setup analytics (v5.3)
+// ── GET /stats — setup analytics
 app.get('/stats', (req, res) => {
   try {
     const logs = readAllLogs();
-    const total         = logs.length;
-    const entries       = logs.filter(l => l.entryTriggered).length;
-    const invalidations = logs.filter(l => l.invalidated && !l.entryTriggered).length;
-    const withResult    = logs.filter(l => l.result);
-    const wins          = withResult.filter(l => l.result === 'TP1' || l.result === 'TP2').length;
-    const losses        = withResult.filter(l => l.result === 'SL').length;
-    const winRate       = withResult.length > 0 ? Math.round(wins / withResult.length * 100) : null;
-    const avgZoneScore  = total > 0
-      ? parseFloat((logs.reduce((s,l) => s + (l.zone?.score||0), 0) / total).toFixed(1)) : null;
+    const total        = logs.length;
+    const entries      = logs.filter(l => l.entryTriggered).length;
+    const invalidations= logs.filter(l => l.invalidated && !l.entryTriggered).length;
+    const withResult   = logs.filter(l => l.result);
+    const wins         = withResult.filter(l => l.result === 'TP1' || l.result === 'TP2').length;
+    const losses       = withResult.filter(l => l.result === 'SL').length;
+    const winRate      = withResult.length > 0 ? Math.round(wins / withResult.length * 100) : null;
+    const avgZoneScore = total > 0
+      ? parseFloat((logs.reduce((s,l) => s + (l.zone?.score||0), 0) / total).toFixed(1))
+      : null;
     const conversionRate = total > 0 ? Math.round(entries / total * 100) : null;
 
-    // ── Per-session breakdown ────────────────────────────────────
+    // Per-session breakdown
     const bySession = {};
     for (const l of logs) {
       const sess = l.session || 'UNKNOWN';
-      if (!bySession[sess]) bySession[sess] = { setups:0, entries:0, wins:0, losses:0 };
+      if (!bySession[sess]) bySession[sess] = { setups:0, entries:0, wins:0 };
       bySession[sess].setups++;
       if (l.entryTriggered) bySession[sess].entries++;
       if (l.result === 'TP1' || l.result === 'TP2') bySession[sess].wins++;
-      if (l.result === 'SL') bySession[sess].losses++;
     }
 
-    // ── By direction ─────────────────────────────────────────────
-    const byDir = { BUY:{setups:0,entries:0,wins:0,losses:0}, SELL:{setups:0,entries:0,wins:0,losses:0} };
+    // By direction
+    const byDir = { BUY:{setups:0,entries:0,wins:0}, SELL:{setups:0,entries:0,wins:0} };
     for (const l of logs) {
       const d = l.direction;
       if (byDir[d]) {
         byDir[d].setups++;
         if (l.entryTriggered) byDir[d].entries++;
         if (l.result === 'TP1' || l.result === 'TP2') byDir[d].wins++;
-        if (l.result === 'SL') byDir[d].losses++;
       }
     }
-
-    // ── v5.3: By entry type (PULLBACK vs CONTINUATION) ───────────
-    const byEntryType = {};
-    for (const l of logs.filter(l => l.entryTriggered)) {
-      const t = l.entryType || 'PULLBACK';
-      if (!byEntryType[t]) byEntryType[t] = { entries:0, wins:0, losses:0 };
-      byEntryType[t].entries++;
-      if (l.result === 'TP1' || l.result === 'TP2') byEntryType[t].wins++;
-      if (l.result === 'SL') byEntryType[t].losses++;
-    }
-
-    // ── v5.3: By pullback tier ────────────────────────────────────
-    const byPullbackTier = {};
-    for (const l of logs.filter(l => l.entryTriggered && l.pullbackTier)) {
-      const t = l.pullbackTier;
-      if (!byPullbackTier[t]) byPullbackTier[t] = { entries:0, wins:0, losses:0, avgPct:[] };
-      byPullbackTier[t].entries++;
-      if (l.result === 'TP1' || l.result === 'TP2') byPullbackTier[t].wins++;
-      if (l.result === 'SL') byPullbackTier[t].losses++;
-      if (l.pullbackPercent) byPullbackTier[t].avgPct.push(l.pullbackPercent);
-    }
-    // Collapse avgPct arrays into averages
-    for (const t of Object.keys(byPullbackTier)) {
-      const arr = byPullbackTier[t].avgPct;
-      byPullbackTier[t].avgPct = arr.length
-        ? parseFloat((arr.reduce((s,v)=>s+v,0)/arr.length).toFixed(1)) : null;
-    }
-
-    // ── v5.3: By displacement strength ───────────────────────────
-    const byDisplacement = {};
-    for (const l of logs.filter(l => l.entryTriggered && l.displacementStrength)) {
-      const t = l.displacementStrength;
-      if (!byDisplacement[t]) byDisplacement[t] = { entries:0, wins:0, losses:0, avgRatio:[] };
-      byDisplacement[t].entries++;
-      if (l.result === 'TP1' || l.result === 'TP2') byDisplacement[t].wins++;
-      if (l.result === 'SL') byDisplacement[t].losses++;
-      if (l.displacementRatio) byDisplacement[t].avgRatio.push(l.displacementRatio);
-    }
-    for (const t of Object.keys(byDisplacement)) {
-      const arr = byDisplacement[t].avgRatio;
-      byDisplacement[t].avgRatio = arr.length
-        ? parseFloat((arr.reduce((s,v)=>s+v,0)/arr.length).toFixed(2)) : null;
-    }
-
-    // ── v5.3: By BOS type ─────────────────────────────────────────
-    const byBOS = {};
-    for (const l of logs.filter(l => l.entryTriggered && l.bosType)) {
-      const t = l.bosType;
-      if (!byBOS[t]) byBOS[t] = { entries:0, wins:0, losses:0 };
-      byBOS[t].entries++;
-      if (l.result === 'TP1' || l.result === 'TP2') byBOS[t].wins++;
-      if (l.result === 'SL') byBOS[t].losses++;
-    }
-
-    // ── Open trades ───────────────────────────────────────────────
-    const openTrades = Object.entries(tradeMonitor)
-      .filter(([, m]) => m && !m.resultLogged)
-      .map(([sym, m]) => ({
-        sym, direction: m.direction, entry: m.entry,
-        sl: m.sl, tp1: m.tp1, tp2: m.tp2,
-        openMins: Math.round((Date.now() - m.startedAt) / 60000),
-      }));
 
     res.json({
       totalSetups:      total,
       entriesTriggered: entries,
       invalidations,
       winRate,
-      wins,
       losses,
       avgZoneScore,
       conversionRate,
-      openTrades,
       bySession,
       byDirection:      byDir,
-      // v5.3 breakdowns
-      byEntryType,
-      byPullbackTier,
-      byDisplacement,
-      byBOS,
       recentSetups:     logs.slice(-10).reverse(),
     });
   } catch(e) {
@@ -3532,37 +2940,15 @@ app.get('/test-signal', async (req, res) => {
   res.json({ ok: true, tg_sent: tgSent, preview: msg });
 });
 
-// Raw Yahoo Finance response inspector — for debugging XAG data source
-app.get('/debug/xag-raw', async (req, res) => {
-  try {
-    const url  = 'https://query1.finance.yahoo.com/v8/finance/chart/XAGUSD=X?interval=5m&range=1d';
-    const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(8000) });
-    const json = await resp.json();
-    const price = json?.chart?.result?.[0]?.meta?.regularMarketPrice || null;
-    const candleCount = json?.chart?.result?.[0]?.timestamp?.length || 0;
-    res.json({
-      http_status:    resp.status,
-      parsed_price:   price,
-      candle_count:   candleCount,
-      candles_in_mem: xagState.candles.length,
-      last_price:     xagState.lastPrice,
-      seeded:         xagState.seeded,
-      raw_meta:       json?.chart?.result?.[0]?.meta || {},
-    });
-  } catch(e) {
-    res.json({ error: e.message });
-  }
-});
-
 // Debug endpoint — shows raw Twelve Data response for a symbol
 // Usage: /debug/XAUUSD or /debug/XAGUSD
 app.get('/debug/:sym', async (req, res) => {
   const sym = req.params.sym.toUpperCase();
-  if (!SYMBOLS[sym]) return res.status(400).json({ error: 'Unknown symbol' });
-
-  // XAGUSD now uses Twelve Data same as XAUUSD
-  const td = SYMBOLS[sym];
+  const td  = SYMBOLS[sym];
+  if (!td) return res.status(400).json({ error: 'Unknown symbol' });
   try {
+    // Test the simplest possible request: last 5 M5 candles
+    // Note: XAGUSD uses SLV ETF as free-tier silver proxy
     const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(td)}&interval=5min&outputsize=5&apikey=${TWELVE_KEY}`;
     console.log('[debug] fetching:', url.replace(TWELVE_KEY, '***'));
     const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
@@ -3586,9 +2972,9 @@ app.get('/debug/:sym', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.json({
-  status:'ok', version:'5.7',
+  status:'ok', version:'5.3',
   engine:'Liquidity Sweep — Adaptive Execution Engine (M5+M15)',
-  rules: ['PDH/PDL/ASH/ASL/EQH/EQL levels','0.02% sweep break required','0.8–3× body displacement','M5 BOS required / M15 optional +5','30–70% pullback (tiered scoring)','continuation entry (STRONG disp only)','zone score ≥ 50, confidence ≥ 70','ATR 1.5–20 XAUUSD','10-candle time decay']
+  rules: ['PDH/PDL/ASH/ASL/EQH/EQL levels','0.02% sweep break required','1.2–3× body displacement','M5 BOS required / M15 optional +5','30–70% pullback (tiered scoring)','continuation entry (STRONG disp only)','confidence ≥ 70 (5×20 weighted)','ATR 5–20 XAUUSD','10-candle time decay']
 }));
 
 // ═══════════════════════════════════════════════════════════════
@@ -3616,169 +3002,21 @@ app.get('/config', (req, res) => {
 });
 
 // Send a Telegram message
-// ── TELEGRAM API HELPERS ───────────────────────────────────────────────────
-
-// Base send — plain text, no buttons. Returns message_id or null.
 async function sendTelegram(text) {
-  if (!TG_TOKEN || !TG_CHAT_ID) return null;
+  if (!TG_TOKEN || !TG_CHAT_ID) return;
   try {
     const url  = 'https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage';
     const body = JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: 'HTML' });
-    const resp = await fetch(url, { method: 'POST',
-      headers: { 'Content-Type': 'application/json' }, body,
+    const resp = await fetch(url, { method:'POST',
+      headers:{'Content-Type':'application/json'}, body,
       signal: AbortSignal.timeout(8000) });
     const json = await resp.json();
-    if (!json.ok) { console.error('[telegram] send failed:', json.description); return null; }
-    console.log('[telegram] message sent OK (id=' + json.result?.message_id + ')');
-    return json.result?.message_id || null;
-  } catch(e) { console.error('[telegram] error:', e.message); return null; }
-}
-
-// Send with inline result buttons — returns message_id for later editing
-// callback_data format: "result:SETUPID:OUTCOME" (max 64 bytes — fits easily)
-async function sendTelegramWithButtons(text, setupId) {
-  if (!TG_TOKEN || !TG_CHAT_ID) return null;
-  try {
-    const keyboard = {
-      inline_keyboard: [[
-        { text: '✅ TP1',  callback_data: 'result:' + setupId + ':TP1' },
-        { text: '✅ TP2',  callback_data: 'result:' + setupId + ':TP2' },
-        { text: '❌ SL',   callback_data: 'result:' + setupId + ':SL'  },
-        { text: '🔁 BE',   callback_data: 'result:' + setupId + ':BE'  },
-      ]],
-    };
-    const url  = 'https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage';
-    const body = JSON.stringify({
-      chat_id:      TG_CHAT_ID,
-      text,
-      parse_mode:   'HTML',
-      reply_markup: keyboard,
-    });
-    const resp = await fetch(url, { method: 'POST',
-      headers: { 'Content-Type': 'application/json' }, body,
-      signal: AbortSignal.timeout(8000) });
-    const json = await resp.json();
-    if (!json.ok) { console.error('[telegram] send+buttons failed:', json.description); return null; }
-    console.log('[telegram] signal+buttons sent (id=' + json.result?.message_id + ')');
-    return json.result?.message_id || null;
-  } catch(e) { console.error('[telegram] buttons error:', e.message); return null; }
-}
-
-// Edit an existing message — removes buttons and appends result line
-async function editTelegramMessage(messageId, newText) {
-  if (!TG_TOKEN || !TG_CHAT_ID || !messageId) return;
-  try {
-    const url  = 'https://api.telegram.org/bot' + TG_TOKEN + '/editMessageText';
-    const body = JSON.stringify({
-      chat_id:      TG_CHAT_ID,
-      message_id:   messageId,
-      text:         newText,
-      parse_mode:   'HTML',
-      reply_markup: { inline_keyboard: [] }, // removes buttons
-    });
-    await fetch(url, { method: 'POST',
-      headers: { 'Content-Type': 'application/json' }, body,
-      signal: AbortSignal.timeout(8000) });
-  } catch(e) { console.error('[telegram] edit error:', e.message); }
-}
-
-// Answer a callback query — required by Telegram API (removes loading spinner)
-async function answerCallbackQuery(callbackQueryId, text) {
-  if (!TG_TOKEN) return;
-  try {
-    await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/answerCallbackQuery', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ callback_query_id: callbackQueryId, text: text || 'Logged ✓', show_alert: false }),
-      signal: AbortSignal.timeout(5000),
-    });
-  } catch(e) { /* non-critical */ }
-}
-
-// In-memory map: setupId → { messageId, text } for editing after result tapped
-const _signalMessages = {};  // setupId → { messageId, originalText }
-
-// ── TELEGRAM WEBHOOK — receives button taps ───────────────────────────────
-// Register once via: GET /setup-webhook  (see below)
-app.post('/telegram-webhook', async (req, res) => {
-  res.sendStatus(200); // always ack immediately
-
-  try {
-    const update = req.body;
-
-    // Only handle callback_query (button taps)
-    if (!update.callback_query) return;
-
-    const cq       = update.callback_query;
-    const data     = cq.data || '';          // "result:SETUPID:TP1"
-    const parts    = data.split(':');
-
-    if (parts[0] !== 'result' || parts.length < 3) return;
-
-    const setupId  = parts[1];
-    const outcome  = parts[2];               // TP1 | TP2 | SL | BE
-
-    if (!['TP1','TP2','SL','BE'].includes(outcome)) return;
-
-    // Log the result
-    logTradeResult(setupId, outcome);
-    updateTradeMonitorStatus(setupId, outcome).catch(() => {});
-    console.log('[webhook] Result logged: ' + setupId + ' → ' + outcome + ' (via Telegram button)');
-
-    // Answer the callback (removes spinner)
-    const resultEmoji = { TP1: '✅', TP2: '✅✅', SL: '❌', BE: '🔁' };
-    await answerCallbackQuery(cq.id, resultEmoji[outcome] + ' ' + outcome + ' logged');
-
-    // Edit the original message — append result, remove buttons
-    const msgData = _signalMessages[setupId];
-    if (msgData) {
-      const updatedText = msgData.originalText +
-        '\n\n─────────────────────────────' +
-        '\n' + resultEmoji[outcome] + ' <b>RESULT LOGGED: ' + outcome + '</b>' +
-        '\n<i>' + new Date().toUTCString().split(' ')[4] + ' UTC</i>';
-      await editTelegramMessage(msgData.messageId, updatedText);
-      delete _signalMessages[setupId]; // cleanup
-    }
-
+    if (!json.ok) console.error('[telegram] send failed:', json.description);
+    else console.log('[telegram] message sent OK');
   } catch(e) {
-    console.error('[webhook] callback error:', e.message);
+    console.error('[telegram] error:', e.message);
   }
-});
-
-// ── REGISTER WEBHOOK with Telegram ───────────────────────────────────────
-// Call once: GET /setup-webhook
-// Railway URL must be set in RAILWAY_PUBLIC_URL env var, or pass ?url=https://...
-app.get('/setup-webhook', async (req, res) => {
-  if (!TG_TOKEN) return res.json({ ok: false, error: 'TG_TOKEN not set' });
-  try {
-    const baseUrl = req.query.url ||
-                    process.env.RAILWAY_PUBLIC_URL ||
-                    ('https://' + (req.headers.host || ''));
-    const webhookUrl = baseUrl.replace(/\/$/, '') + '/telegram-webhook';
-    const resp = await fetch(
-      'https://api.telegram.org/bot' + TG_TOKEN + '/setWebhook',
-      { method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: webhookUrl, allowed_updates: ['callback_query'] }),
-        signal: AbortSignal.timeout(8000) }
-    );
-    const json = await resp.json();
-    console.log('[webhook] setWebhook response:', JSON.stringify(json));
-    res.json({ ok: json.ok, webhook_url: webhookUrl, telegram_response: json });
-  } catch(e) {
-    res.json({ ok: false, error: e.message });
-  }
-});
-
-// ── CHECK WEBHOOK STATUS ──────────────────────────────────────────────────
-app.get('/webhook-status', async (req, res) => {
-  if (!TG_TOKEN) return res.json({ ok: false, error: 'TG_TOKEN not set' });
-  try {
-    const resp = await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/getWebhookInfo',
-      { signal: AbortSignal.timeout(8000) });
-    res.json(await resp.json());
-  } catch(e) { res.json({ ok: false, error: e.message }); }
-});
+}
 
 // Format full signal for Telegram — v5.2: entry type header, quality label, flexible fields
 function formatTelegramSignal(sig) {
@@ -3930,150 +3168,6 @@ function formatTelegramPreSignal(sym, ns) {
 // No alert fires twice for the same event in the same setup lifecycle.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ── FILTER 1: HTF ALIGNMENT ───────────────────────────────────────────────
-// Returns { allowed, reason, htfBias, strength }
-// Blocks direction that opposes a STRONG HTF bias.
-// STRONG = BOS confirmed + HH/HL or LH/LL structure both present.
-// NEUTRAL = no clear structure → both directions allowed.
-function checkHTFAlignment(m15Candles, direction) {
-  if (!m15Candles || m15Candles.length < 8) {
-    return { allowed: true, reason: 'Insufficient M15 data — filter skipped', htfBias: 'NEUTRAL', strength: 'WEAK' };
-  }
-
-  const candles = m15Candles.slice(-20);
-  const n = candles.length;
-
-  // Find swing highs and lows
-  const swingHighs = [], swingLows = [];
-  for (let i = 1; i < n - 1; i++) {
-    if (candles[i].h > candles[i-1].h && candles[i].h > candles[i+1].h)
-      swingHighs.push(candles[i].h);
-    if (candles[i].l < candles[i-1].l && candles[i].l < candles[i+1].l)
-      swingLows.push(candles[i].l);
-  }
-
-  if (swingHighs.length < 2 || swingLows.length < 2) {
-    return { allowed: true, reason: 'Insufficient swing structure', htfBias: 'NEUTRAL', strength: 'WEAK' };
-  }
-
-  const lastHigh = swingHighs[swingHighs.length - 1];
-  const prevHigh = swingHighs[swingHighs.length - 2];
-  const lastLow  = swingLows[swingLows.length  - 1];
-  const prevLow  = swingLows[swingLows.length  - 2];
-
-  const isHHHL = lastHigh > prevHigh && lastLow > prevLow;  // bullish
-  const isLHLL = lastHigh < prevHigh && lastLow < prevLow;  // bearish
-
-  // BOS check on last 5 candles
-  const BOS_MARGIN = 0.0002;
-  let hasBullishBOS = false, hasBearishBOS = false;
-  for (const c of candles.slice(-5)) {
-    if (c.c > lastHigh * (1 + BOS_MARGIN)) hasBullishBOS = true;
-    if (c.c < lastLow  * (1 - BOS_MARGIN)) hasBearishBOS = true;
-  }
-
-  // STRONG bias requires BOTH structure AND BOS
-  let htfBias = 'NEUTRAL';
-  let strength = 'WEAK';
-
-  if (isHHHL && hasBullishBOS) { htfBias = 'BULLISH'; strength = 'STRONG'; }
-  else if (isLHLL && hasBearishBOS) { htfBias = 'BEARISH'; strength = 'STRONG'; }
-  else if (isHHHL || hasBullishBOS) { htfBias = 'BULLISH'; strength = 'MODERATE'; }
-  else if (isLHLL || hasBearishBOS) { htfBias = 'BEARISH'; strength = 'MODERATE'; }
-
-  // Only block on STRONG bias
-  if (strength === 'STRONG') {
-    if (htfBias === 'BULLISH' && direction === 'SELL') {
-      return { allowed: false, reason: 'HTF strongly bullish (HH/HL + BOS UP) — SELL blocked', htfBias, strength };
-    }
-    if (htfBias === 'BEARISH' && direction === 'BUY') {
-      return { allowed: false, reason: 'HTF strongly bearish (LH/LL + BOS DOWN) — BUY blocked', htfBias, strength };
-    }
-  }
-
-  return { allowed: true, reason: 'HTF ' + htfBias + ' (' + strength + ') — ' + direction + ' allowed', htfBias, strength };
-}
-
-// ── FILTER 2: MICRO-CHOP FILTER ───────────────────────────────────────────
-// Returns { chop, reason, totalRange, atrRatio }
-// Detects low-conviction ranging using last 10 M5 candles.
-// Blocks setup creation when market is compressing with no structure.
-function checkMicroChop(m5Candles, currentATR) {
-  if (!m5Candles || m5Candles.length < 10 || !currentATR || currentATR === 0) {
-    return { chop: false, reason: 'Insufficient data — filter skipped', totalRange: 0, atrRatio: 0 };
-  }
-
-  const last10 = m5Candles.slice(-10);
-
-  // Condition 1: Total price range < 0.6 × ATR
-  const high10     = Math.max(...last10.map(c => c.h));
-  const low10      = Math.min(...last10.map(c => c.l));
-  const totalRange = high10 - low10;
-  const atrRatio   = parseFloat((totalRange / currentATR).toFixed(2));
-  const rangeTight = atrRatio < 0.6;
-
-  // Condition 2: No clear HH/HL or LH/LL in last 10 M5 candles
-  const closes = last10.map(c => c.c);
-  let higherHighs = 0, higherLows = 0, lowerHighs = 0, lowerLows = 0;
-  for (let i = 1; i < last10.length; i++) {
-    if (last10[i].h > last10[i-1].h) higherHighs++;
-    else lowerHighs++;
-    if (last10[i].l > last10[i-1].l) higherLows++;
-    else lowerLows++;
-  }
-  // No clear structure = neither trend dominates by >2 candles
-  const bullishCount = Math.min(higherHighs, higherLows);
-  const bearishCount = Math.min(lowerHighs, lowerLows);
-  const noStructure  = Math.abs(bullishCount - bearishCount) <= 2;
-
-  const isChop = rangeTight && noStructure;
-
-  const reason = isChop
-    ? 'Micro-chop: range=' + totalRange.toFixed(2) + ' (' + atrRatio + '×ATR < 0.6) + no structure'
-    : 'Not chop: range=' + totalRange.toFixed(2) + ' (' + atrRatio + '×ATR)' +
-      (noStructure ? ' [no structure but range OK]' : ' [structure present]');
-
-  return { chop: isChop, reason, totalRange: parseFloat(totalRange.toFixed(3)), atrRatio };
-}
-
-// ── FILTER 3: POST-SWEEP MOMENTUM FILTER ─────────────────────────────────
-// Returns { passed, reason, moveSize, atrMultiple }
-// Called AFTER sweep confirms, BEFORE displacement evaluation.
-// Requires price to move at least 0.5 × ATR away from sweep level within 2 candles.
-function checkPostSweepMomentum(m5Candles, sweepCandleIdx, sweepExtreme, direction, currentATR) {
-  if (!currentATR || currentATR === 0 || sweepCandleIdx < 0) {
-    return { passed: true, reason: 'Cannot evaluate — filter skipped', moveSize: 0, atrMultiple: 0 };
-  }
-
-  const threshold  = currentATR * 0.5;
-  const postCandles = m5Candles.slice(sweepCandleIdx + 1, sweepCandleIdx + 3); // up to 2 candles
-
-  // No candles yet after sweep — or sweep is the last candle in the array (index bug)
-  // Either way: too early to evaluate, skip and wait
-  if (!postCandles.length || postCandles.every(c => !c || (c.h - c.l) === 0)) {
-    return { passed: true, reason: 'No post-sweep candles yet — waiting', moveSize: 0, atrMultiple: 0 };
-  }
-
-  // BUY sweep: price should move UP from sweep extreme
-  // SELL sweep: price should move DOWN from sweep extreme
-  let maxMove = 0;
-  for (const c of postCandles) {
-    const move = direction === 'BUY'
-      ? c.h - sweepExtreme   // how far UP from the sweep low
-      : sweepExtreme - c.l;  // how far DOWN from the sweep high
-    if (move > maxMove) maxMove = move;
-  }
-
-  const atrMultiple = parseFloat((maxMove / currentATR).toFixed(2));
-  const passed      = maxMove >= threshold;
-
-  const reason = passed
-    ? 'Post-sweep momentum: moved ' + maxMove.toFixed(2) + ' (' + atrMultiple + '×ATR ≥ 0.5×) ✓'
-    : 'Post-sweep momentum FAILED: moved only ' + maxMove.toFixed(2) + ' (' + atrMultiple + '×ATR < 0.5×)';
-
-  return { passed, reason, moveSize: parseFloat(maxMove.toFixed(3)), atrMultiple };
-}
-
 const SETUP_STAGES = ['idle','approaching','sweep','move','trend','pullback','entry'];
 
 function createSetup(sym, direction, levelOrZone) {
@@ -4131,20 +3225,42 @@ function createAndLogSetup(sym, direction, levelOrZone) {
 }
 
 // Setups keyed by symbol
-const setups = { XAUUSD: null }; // XAGUSD disabled
+const setups = { XAUUSD: null, XAGUSD: null };
 
 // Active trade monitor — tracks open positions after entry signal fires
 // { XAUUSD: { setupId, direction, entry, sl, tp1, tp2, high, low, resultLogged }, ... }
-const tradeMonitor = { XAUUSD: null }; // XAGUSD disabled
+const tradeMonitor = { XAUUSD: null, XAGUSD: null };
 
 // Per-symbol timing state — persists through setup resets
 // Tracks cooldowns for zone detection, bias flips, invalidation windows
-// v5.5: ZONE_LOCK_SCANS — after sweep confirms, lock primary zone for N scans
-// Prevents zone selector from switching zones mid-setup (root cause of 55% instant resets)
-const ZONE_LOCK_SCANS = 5; // lock for 5 scans (25 min) after sweep
-
 const symTiming = {
   XAUUSD: {
+    zoneDetectionAllowedAt:  0,
+    biasFlipAllowedAt:       0,
+    lastInvalidatedAt:       0,
+    lastInvalidatedDir:      null,
+    pullbackStartCandleIdx:  -1,
+    pullbackCandleCount:     0,
+    lastSweepAlertAt:        0,
+    lastSweepDir:            null,
+    lastSweepZoneKey:        null,
+    // Structural bias — persists until opposite structure confirmed
+    structuralBiasDir:       null,
+    structuralBiasStage:     null,
+    structuralBiasAt:        0,
+    consecutiveFailures:     { BUY: 0, SELL: 0 },
+    // HTF (M15) structural bias — updated every scan
+    htfBias:                 'NEUTRAL',  // 'BULLISH' | 'BEARISH' | 'NEUTRAL'
+    htfLastBOS:              'NONE',     // 'UP' | 'DOWN' | 'NONE'
+    htfLastHigh:             0,
+    htfLastLow:              0,
+    htfUpdatedAt:            0,
+    // H1 structural bias — wider timeframe, true HTF reference for gold
+    h1Bias:                  'NEUTRAL',  // 'BULLISH' | 'BEARISH' | 'NEUTRAL'
+    h1LastBOS:               'NONE',     // 'UP' | 'DOWN' | 'NONE'
+    h1UpdatedAt:             0,
+  },
+  XAGUSD: {
     zoneDetectionAllowedAt:  0,
     biasFlipAllowedAt:       0,
     lastInvalidatedAt:       0,
@@ -4163,12 +3279,10 @@ const symTiming = {
     htfLastHigh:             0,
     htfLastLow:              0,
     htfUpdatedAt:            0,
-    // v5.5: Zone lock after sweep
-    lockedZone:              null,   // the zone object locked after sweep confirms
-    lockedZoneKey:           null,   // priceRange string
-    lockedZoneScansLeft:     0,      // countdown — zone released when reaches 0
-  },
-  // XAGUSD disabled — gold only until paid silver API is sourced
+    h1Bias:                  'NEUTRAL',
+    h1LastBOS:               'NONE',
+    h1UpdatedAt:             0,
+  }
 };
 
 const CANDLE_MS = 5 * 60 * 1000; // 5 minutes per M5 candle
@@ -4296,21 +3410,8 @@ async function invalidateSetup(sym, reason) {
 
   const asset = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
   const dirEmoji = oppositeDir === 'BUY' ? '🟢' : '🔴';
-
-  // Differentiate between a missed entry (trend confirmed but no pullback) and a plain invalidation
-  const _trendWasConfirmed = setup.events?.trend && !setup.events?.entry;
-  const _invalidationType  = _trendWasConfirmed
-    ? asset + ' — ENTRY MISSED'
-    : asset + ' — SETUP INVALIDATED';
-  const _invalidEmoji = _trendWasConfirmed ? '⏰' : '⚠️';
-
-  // For missed entries, add a note about what happened
-  const _missedNote = _trendWasConfirmed
-    ? '\nAll 3 stages confirmed but price did not pull back into entry zone.\n'
-    : '\n';
-
-  await sendTelegram(_invalidEmoji + ' <b>' + _invalidationType + '</b>\n\n' +
-    reason + _missedNote + '\n' + dirEmoji + ' ' + biasMsg +
+  await sendTelegram('⚠️ <b>' + asset + ' — SETUP INVALIDATED</b>\n\n' +
+    reason + '\n\n' + dirEmoji + ' ' + biasMsg +
     '\n\n─────────────────\nAurum Signals');
 }
 
@@ -4339,15 +3440,14 @@ function resetSetup(sym, reason) {
   setups[sym] = null;
 }
 
-// Session time remaining in minutes — returns the LONGEST remaining active session
-// so overlap (13:00–16:00 UTC) uses NY's remaining time, not London's
+// Session time remaining in minutes
 function sessionMinutesRemaining() {
   const h = new Date().getUTCHours();
   const m = new Date().getUTCMinutes();
   const nowMins = h * 60 + m;
-  const londonLeft = (nowMins >= 7*60 && nowMins < 16*60) ? (16*60 - nowMins) : 0;
-  const nyLeft     = (nowMins >= 13*60 && nowMins < 22*60) ? (22*60 - nowMins) : 0;
-  return Math.max(londonLeft, nyLeft);
+  if (nowMins >= 7*60  && nowMins < 16*60) return 16*60 - nowMins;
+  if (nowMins >= 13*60 && nowMins < 22*60) return 22*60 - nowMins;
+  return 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4775,6 +3875,83 @@ function calcHTFBias(m15Candles) {
   return { bias, lastBOS, lastHigh, lastLow, structureMid, reason };
 }
 
+// ── H1 STRUCTURAL BIAS ───────────────────────────────────────────────────────
+// True HTF reference for gold. Uses 30 H1 candles (~30 hours) — wide enough
+// to see daily structure without being too slow to react to trend changes.
+// Same logic as calcHTFBias but tuned for H1 characteristics:
+//   • Wider BOS margin (0.05%) to filter H1 noise
+//   • 2-candle pivot detection (H1 bars are bigger, 1-side pivot is meaningful)
+//   • 30-candle lookback instead of 20
+function calcH1Bias(h1Candles) {
+  if (!h1Candles || h1Candles.length < 10) {
+    return { bias: 'NEUTRAL', lastBOS: 'NONE', lastHigh: 0, lastLow: 0, reason: 'Insufficient H1 data' };
+  }
+
+  const candles = h1Candles.slice(-30);
+  const n = candles.length;
+
+  // Pivot detection: must be highest/lowest of surrounding 2 bars on each side
+  const swingHighs = [];
+  const swingLows  = [];
+  for (let i = 2; i < n - 2; i++) {
+    if (candles[i].h > candles[i-1].h && candles[i].h > candles[i-2].h &&
+        candles[i].h > candles[i+1].h && candles[i].h > candles[i+2].h) {
+      swingHighs.push({ price: candles[i].h, idx: i });
+    }
+    if (candles[i].l < candles[i-1].l && candles[i].l < candles[i-2].l &&
+        candles[i].l < candles[i+1].l && candles[i].l < candles[i+2].l) {
+      swingLows.push({ price: candles[i].l, idx: i });
+    }
+  }
+
+  if (swingHighs.length < 2 || swingLows.length < 2) {
+    return { bias: 'NEUTRAL', lastBOS: 'NONE', lastHigh: candles[n-1].h, lastLow: candles[n-1].l,
+             reason: 'Insufficient H1 swing structure' };
+  }
+
+  const lastHigh = swingHighs[swingHighs.length - 1].price;
+  const prevHigh = swingHighs[swingHighs.length - 2].price;
+  const lastLow  = swingLows[swingLows.length  - 1].price;
+  const prevLow  = swingLows[swingLows.length  - 2].price;
+  const livePrice = candles[n-1].c;
+
+  // H1 BOS: wider margin (0.05%) to avoid false breaks on H1 bar wicks
+  const BOS_MARGIN = 0.0005;
+  let lastBOS = 'NONE';
+  const recent = candles.slice(-5);
+  for (const c of recent) {
+    if (c.c > lastHigh * (1 + BOS_MARGIN)) { lastBOS = 'UP';   break; }
+    if (c.c < lastLow  * (1 - BOS_MARGIN)) { lastBOS = 'DOWN'; break; }
+  }
+
+  const isHHHL = lastHigh > prevHigh && lastLow > prevLow;
+  const isLHLL = lastHigh < prevHigh && lastLow < prevLow;
+  const structureMid = (lastHigh + lastLow) / 2;
+  const aboveMid = livePrice > structureMid;
+
+  let bias = 'NEUTRAL';
+  let reason = '';
+
+  if (lastBOS === 'UP' && (isHHHL || aboveMid)) {
+    bias = 'BULLISH';
+    reason = 'H1 BOS UP + ' + (isHHHL ? 'HH/HL structure' : 'price above mid');
+  } else if (lastBOS === 'DOWN' && (isLHLL || !aboveMid)) {
+    bias = 'BEARISH';
+    reason = 'H1 BOS DOWN + ' + (isLHLL ? 'LH/LL structure' : 'price below mid');
+  } else if (isHHHL && aboveMid) {
+    bias = 'BULLISH';
+    reason = 'H1 HH/HL + price above mid (no BOS yet)';
+  } else if (isLHLL && !aboveMid) {
+    bias = 'BEARISH';
+    reason = 'H1 LH/LL + price below mid (no BOS yet)';
+  } else {
+    bias = 'NEUTRAL';
+    reason = 'H1 ranging / choppy structure';
+  }
+
+  return { bias, lastBOS, lastHigh, lastLow, structureMid, reason };
+}
+
 // ── TRADE RESULT MONITOR ──────────────────────────────────────────────────────
 // Runs on every scan after an entry signal fires.
 // Checks live price against SL/TP1/TP2 and auto-logs the result.
@@ -4806,7 +3983,6 @@ function checkTradeMonitor(sym, livePrice, m5) {
   if (result) {
     mon.resultLogged = true;
     logTradeResult(mon.setupId, result);
-    updateTradeMonitorStatus(mon.setupId, result).catch(() => {});
     console.log('[monitor] ' + sym + ': ' + result + ' hit — ' + mon.direction +
       ' entry=' + mon.entry + ' sl=' + mon.sl + ' tp1=' + mon.tp1);
     tradeMonitor[sym] = null; // clear monitor
@@ -4818,7 +3994,7 @@ async function autoScan() {
   const inSession = (h >= 7 && h < 16) || (h >= 13 && h < 22);
 
   if (!inSession) {
-    for (const sym of ['XAUUSD']) { // Gold only — silver disabled pending paid API
+    for (const sym of ['XAUUSD','XAGUSD']) {
       if (setups[sym]) {
         resetSetup(sym, 'Session closed');
       }
@@ -4827,14 +4003,11 @@ async function autoScan() {
         console.log('[monitor] ' + sym + ': session closed — trade monitor cleared (no result)');
         tradeMonitor[sym] = null;
       }
-      // Reset consecutive failures, structural bias, and zone lock at session close
+      // Reset consecutive failures and structural bias at session close
       if (symTiming[sym]) {
         symTiming[sym].structuralBiasDir   = null;
         symTiming[sym].structuralBiasStage = null;
         symTiming[sym].consecutiveFailures = { BUY: 0, SELL: 0 };
-        symTiming[sym].lockedZone          = null;   // v5.5: clear zone lock
-        symTiming[sym].lockedZoneKey       = null;
-        symTiming[sym].lockedZoneScansLeft = 0;
       }
       clearZoneMemory(sym); // zone memory resets each session
     }
@@ -4843,8 +4016,8 @@ async function autoScan() {
   }
 
   const minsLeft = sessionMinutesRemaining();
-  if (minsLeft < 30) {
-    console.log('[auto-scan] <30min in session (' + minsLeft + 'min) — no new signals');
+  if (minsLeft < 60) {
+    console.log('[auto-scan] <60min in session (' + minsLeft + 'min) — no new signals');
     return;
   }
 
@@ -4853,7 +4026,7 @@ async function autoScan() {
 
   const delay = ms => new Promise(r => setTimeout(r, ms));
 
-  for (const sym of ['XAUUSD']) { // Gold only
+  for (const sym of ['XAUUSD','XAGUSD']) {
     try {
       const m5 = await getCandles(sym, '5min', 120);
       if (!m5 || m5.length < 50) {
@@ -4885,6 +4058,22 @@ async function autoScan() {
       }
       console.log('[htf] ' + sym + ': bias=' + htfResult.bias +
         ' BOS=' + htfResult.lastBOS + ' — ' + htfResult.reason);
+
+      // ── UPDATE H1 BIAS ────────────────────────────────────────
+      // H1 is our true HTF reference — broader structural context for gold.
+      // Fetched separately from M5 (can't derive H1 from 10 hours of M5 data).
+      // Cached for 5 min like all candle data — no extra API rate pressure.
+      const h1 = await getCandles(sym, '1h', 50);
+      const h1Result = (h1 && h1.length >= 10)
+        ? calcH1Bias(h1)
+        : { bias: 'NEUTRAL', lastBOS: 'NONE', reason: 'no H1 data' };
+      if (timing) {
+        timing.h1Bias      = h1Result.bias;
+        timing.h1LastBOS   = h1Result.lastBOS;
+        timing.h1UpdatedAt = Date.now();
+      }
+      console.log('[h1]  ' + sym + ': bias=' + h1Result.bias +
+        ' BOS=' + h1Result.lastBOS + ' — ' + h1Result.reason);
 
       // Log every scan cycle start + HTF bias state
       logScanEvent(sym, 'SCAN_START',
@@ -4918,38 +4107,25 @@ async function autoScan() {
           await delay(400); continue;
         }
 
-        // Counter-structure: only invalidate if price CLOSES beyond the zone
-        // (not just wicks through it). A wick touch of an opposing zone during
-        // a pullback is normal — it was triggering 91 false invalidations.
-        // Require: opposing sweep candle closes fully through zone boundary.
+        // Counter-structure: only check PRIMARY ZONE for opposing sweep
+        // (using all levels caused secondary zones to trigger false invalidations)
         const primaryZoneForCheck = selectPrimaryZone(levels, livePrice, sess, m5);
         if (primaryZoneForCheck) {
           const sweep2 = detectSweep(m5, [primaryZoneForCheck]);
           if (sweep2.found) {
             const sweep2Corrected = correctSweepDirection(sweep2);
             if (sweep2Corrected.direction !== setup.direction) {
-              // Only kill if the close is clearly beyond the zone (not a wick)
-              const s2c = m5[sweep2Corrected.candleIdx];
-              const zoneRef = sweep2Corrected.direction === 'BUY'
-                ? primaryZoneForCheck.minPrice  // opposing buy = price closed below zone low
-                : primaryZoneForCheck.maxPrice; // opposing sell = price closed above zone high
-              const closeThrough = sweep2Corrected.direction === 'BUY'
-                ? s2c && s2c.c < zoneRef * 0.9985   // close >0.15% below zone low
-                : s2c && s2c.c > zoneRef * 1.0015;  // close >0.15% above zone high
-              if (closeThrough) {
-                await invalidateSetup(sym, 'Structure broke against ' + setup.direction + ' direction on primary zone.');
-                resetSetup(sym, 'Counter-structure');
-                if (symTiming[sym]) {
-                  symTiming[sym].structuralBiasDir   = sweep2Corrected.direction;
-                  symTiming[sym].structuralBiasStage = 'sweep';
-                  symTiming[sym].structuralBiasAt    = Date.now();
-                  console.log('[bias] ' + sym + ': structural bias flipped → ' +
-                    sweep2Corrected.direction + ' (confirmed close through zone)');
-                }
-                await delay(400); continue;
-              } else {
-                console.log('[counter-str] ' + sym + ': opposing sweep found but close did not break zone — not invalidating');
+              await invalidateSetup(sym, 'Structure broke against ' + setup.direction + ' direction on primary zone.');
+              resetSetup(sym, 'Counter-structure');
+              // Counter-structure sweep = opposite structure confirmed → clear bias
+              if (symTiming[sym]) {
+                symTiming[sym].structuralBiasDir   = sweep2Corrected.direction;
+                symTiming[sym].structuralBiasStage = 'sweep';
+                symTiming[sym].structuralBiasAt    = Date.now();
+                console.log('[bias] ' + sym + ': structural bias flipped → ' +
+                  sweep2Corrected.direction + ' (counter-structure confirmed)');
               }
+              await delay(400); continue;
             }
           }
         }
@@ -4962,55 +4138,19 @@ async function autoScan() {
         await delay(400); continue;
       }
 
-      // ── HTF NEUTRAL + LOW ATR GATE ─────────────────────────────
-      // Block NEW setup creation when market has no directional conviction
-      // AND volatility is low. Existing setups in progress are allowed to continue.
-      // v5.6: threshold lowered 3.0→2.0 to match ATR floor change (was blocking too much)
-      const htfIsNeutral  = (timing?.htfBias || htfResult.bias) === 'NEUTRAL';
-      const atrIsBelowMid = currentATR !== null && currentATR < 2.0;
-      const hasActiveSetup = setup && setup.active && !setup.invalidated;
-
-      if (htfIsNeutral && atrIsBelowMid && !hasActiveSetup) {
-        console.log('[gate] ' + sym + ': HTF=NEUTRAL + ATR=' + (currentATR?.toFixed(2) || '—') +
-          ' < 3.0 — no new setups (choppy low-vol market)');
-        logScanEvent(sym, 'HTF_ATR_BLOCKED',
-          'HTF NEUTRAL + ATR ' + (currentATR?.toFixed(2) || '—') + ' < 3.0 — setup creation blocked',
-          { notes: htfResult.reason });
-        await delay(400); continue;
-      }
-
       // ── PRIMARY ZONE SELECTION — only this zone matters ─────────
       const structBias = timing
         ? { dir: timing.structuralBiasDir, stage: timing.structuralBiasStage }
         : null;
-
-      // v5.5: If a zone is locked (post-sweep), use it instead of re-ranking
-      // This prevents the zone selector from switching zones between sweep and BOS
-      let primaryZone;
-      if (timing && timing.lockedZone && timing.lockedZoneScansLeft > 0) {
-        timing.lockedZoneScansLeft--;
-        primaryZone = timing.lockedZone;
-        console.log('[zone-lock] ' + sym + ': using locked zone ' + timing.lockedZoneKey +
-          ' (' + timing.lockedZoneScansLeft + ' scans remaining)');
-      } else {
-        if (timing && timing.lockedZone) {
-          console.log('[zone-lock] ' + sym + ': zone lock expired — resuming normal selection');
-          timing.lockedZone          = null;
-          timing.lockedZoneKey       = null;
-          timing.lockedZoneScansLeft = 0;
-        }
-        primaryZone = selectPrimaryZone(levels, livePrice, sess, m5, structBias);
-      }
-
+      const primaryZone = selectPrimaryZone(levels, livePrice, sess, m5, structBias);
       if (!primaryZone) {
         console.log('[' + sym + '] No primary zone found — skip');
         logScanEvent(sym, 'NO_ZONE', 'No qualifying EQH/EQL zone found', { notes: 'Price=$' + livePrice });
         await delay(400); continue;
       }
 
-      // ── ZONE MEMORY: read freshness for logging — DO NOT count here ──
-      // updateZoneMemory is called only when a sweep is confirmed (below),
-      // so exhaustion reflects actual price interaction, not scan frequency.
+      // ── ZONE MEMORY: track retest count + gate exhausted zones ──
+      updateZoneMemory(sym, primaryZone);
       const zoneFreshness = getZoneFreshness(sym, primaryZone);
       console.log('[zone-mem] ' + sym + ': ' + zoneFreshness.label +
         ' (session touches: ' + zoneFreshness.touchCount + ')');
@@ -5033,7 +4173,7 @@ async function autoScan() {
       const zoneScore = primaryZone.confidence?.total || 0;
       console.log('[' + sym + '] Primary zone: ' + primaryZone.direction +
         ' ' + primaryZone.priceRange + ' score=' + zoneScore + '/100' +
-        (zoneScore >= 75 ? ' [FULL]' : zoneScore >= 50 ? ' [STANDARD]' : ' [BLOCKED]'));
+        (zoneScore >= 75 ? ' [FULL]' : zoneScore >= 60 ? ' [STANDARD]' : ' [BLOCKED]'));
 
       // ── ZONE DETECTION COOLDOWN ────────────────────────────────
       // (timing already declared above)
@@ -5077,33 +4217,28 @@ async function autoScan() {
       }
 
       // ── ZONE SCORE GATE ────────────────────────────────────────
-      // v5.4: threshold lowered 60→50 (live data: max score=70, 79% blocked under 60)
-      // < 50  → no signals at all
-      // 50–74 → standard entry only, aggressive engine suppressed
+      // < 60  → no signals at all — zone not strong enough
+      // 60–74 → standard entry only, aggressive engine suppressed
       // ≥ 75  → full system: standard + aggressive
-      if (zoneScore < 50) {
-        console.log('[' + sym + '] Zone score ' + zoneScore + ' < 50 — all signals suppressed');
-        logScanEvent(sym, 'ZONE_SCORE_BLOCKED', 'Score ' + zoneScore + '/100 below 50 minimum',
-          { direction: primaryZone.direction, zoneLow: primaryZone.minPrice, zoneHigh: primaryZone.maxPrice,
-            zoneScore, touches: primaryZone.totalTouches });
+      if (zoneScore < 60) {
+        console.log('[' + sym + '] Zone score ' + zoneScore + ' < 60 — all signals suppressed');
+        // Cancel any active setup that depended on this zone
         if (setup && setup.active) {
-          console.log('[' + sym + '] Cancelling active setup — zone score ' + zoneScore + ' fell below 50');
-          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 50).');
-          resetSetup(sym, 'Zone score below 50');
+          console.log('[' + sym + '] Cancelling active setup — zone score ' + zoneScore + ' fell below 60');
+          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 60).');
+          resetSetup(sym, 'Zone score below 60');
         }
         await delay(400); continue;
       }
 
       // ── ZONE STRENGTH CHECK AT TREND SHIFT+ STAGES ─────────────
-      // v5.5: Only cancel if truly catastrophic (<40) once past sweep stage.
-      // Before v5.5, setups with score 59 were killed mid-progress — live data
-      // showed this was the #2 cause of false invalidations.
-      if (setup && setup.active && setup.events?.sweep) {
-        const killThreshold = setup.events?.trend ? 40 : 50; // more lenient after sweep
-        if (zoneScore < killThreshold) {
-          console.log('[' + sym + '] Setup cancelled at ' + setup.stage + ' stage — zone score ' + zoneScore + ' < ' + killThreshold);
-          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength (score ' + zoneScore + '/100 < ' + killThreshold + ').');
-          resetSetup(sym, 'Zone too weak mid-progress');
+      // If setup has progressed past trend shift but zone score is now < 60,
+      // cancel — do not proceed to pullback or entry with a weak zone.
+      if (setup && setup.active && setup.events?.trend) {
+        if (zoneScore < 60) {
+          console.log('[' + sym + '] Setup cancelled at trend+ stage — zone score ' + zoneScore + ' < 60');
+          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 60).');
+          resetSetup(sym, 'Zone too weak at trend+ stage');
           await delay(400); continue;
         }
       }
@@ -5161,18 +4296,14 @@ async function autoScan() {
       }
 
       // New sweep on a DIFFERENT zone than current setup → reset
-      // v5.5: Skip reset if setup has confirmed sweep stage (zone is locked)
       if (setup && sweep.found) {
         const newZoneId = sweep.level && sweep.level.isZone
           ? Math.round(sweep.level.minPrice) + '-' + Math.round(sweep.level.maxPrice)
           : Math.round(parseFloat(sweep.level?.price || 0));
-        const zoneLocked = timing && timing.lockedZoneScansLeft > 0;
-        if (setup.zoneId && setup.zoneId !== String(newZoneId) && !zoneLocked) {
+        if (setup.zoneId && setup.zoneId !== String(newZoneId)) {
           console.log('[' + sym + '] New sweep on different zone — resetting setup');
           resetSetup(sym, 'New sweep on different zone');
           setup = null;
-        } else if (setup.zoneId && setup.zoneId !== String(newZoneId) && zoneLocked) {
-          console.log('[zone-lock] ' + sym + ': different zone sweep ignored — zone locked after sweep');
         }
       }
 
@@ -5191,35 +4322,9 @@ async function autoScan() {
           console.log('[validate] ' + sym + ': setup creation blocked (' + vResult.reasons.length + ' failures)');
           await delay(400); continue;
         }
-
-        // ── FILTER 1: HTF ALIGNMENT ────────────────────────────
-        const htfAlign = checkHTFAlignment(m15, sweep.direction);
-        console.log('[filter1] ' + sym + ': ' + htfAlign.reason);
-        if (!htfAlign.allowed) {
-          logScanEvent(sym, 'FILTER_HTF_BLOCKED', htfAlign.reason, {
-            direction: sweep.direction,
-            notes: JSON.stringify({ htf_bias: htfAlign.htfBias, strength: htfAlign.strength,
-              filter_blocked_reason: htfAlign.reason }),
-          });
-          await delay(400); continue;
-        }
-
-        // ── FILTER 2: MICRO-CHOP ───────────────────────────────
-        const chopCheck = checkMicroChop(m5, currentATR);
-        console.log('[filter2] ' + sym + ': ' + chopCheck.reason);
-        if (chopCheck.chop) {
-          logScanEvent(sym, 'FILTER_CHOP_BLOCKED', chopCheck.reason, {
-            direction: sweep.direction,
-            notes: JSON.stringify({ chop_detected: true, total_range: chopCheck.totalRange,
-              atr_ratio: chopCheck.atrRatio, filter_blocked_reason: chopCheck.reason }),
-          });
-          await delay(400); continue;
-        }
-
         setup = createAndLogSetup(sym, sweep.direction, sweep.level);
         setups[sym] = setup;
-        console.log('[validate] ' + sym + ': setup passed all rules — created id=' + setup.id +
-          ' | HTF=' + htfAlign.htfBias + '/' + htfAlign.strength + ' | chop=false');
+        console.log('[validate] ' + sym + ': setup passed all 8 rules — created id=' + setup.id);
       }
 
       // Block if already invalidated
@@ -5268,47 +4373,15 @@ async function autoScan() {
       // Prevents bulk-confirmation of multiple stages from historical data.
       if (sweepFired) {
         logStageUpdate(setup, 'sweep');
-        // Count this zone touch only when price actually sweeps it
-        updateZoneMemory(sym, primaryZone);
-        console.log('[zone-mem] ' + sym + ': zone touch recorded at sweep (total: ' + (getZoneFreshness(sym, primaryZone).touchCount) + ')');
+        // Record structural bias at sweep stage
         if (timing) {
           timing.structuralBiasDir   = sweep.direction;
           timing.structuralBiasStage = 'sweep';
           timing.structuralBiasAt    = Date.now();
           console.log('[bias] ' + sym + ': structural bias set → ' + sweep.direction + ' (sweep stage)');
-          // v5.5: Lock this zone so selector can't switch it between stages
-          timing.lockedZone          = primaryZone;
-          timing.lockedZoneKey       = primaryZone.priceRange;
-          timing.lockedZoneScansLeft = ZONE_LOCK_SCANS;
-          console.log('[zone-lock] ' + sym + ': zone locked → ' + primaryZone.priceRange +
-            ' for ' + ZONE_LOCK_SCANS + ' scans after sweep');
         }
         console.log('[' + sym + '] Sweep fired this scan — waiting for next scan before displacement');
         await delay(400); continue;
-      }
-
-      // ── FILTER 3: POST-SWEEP MOMENTUM ────────────────────────
-      // Runs every scan after sweep confirms, until displacement is found.
-      // Allows 3 candles (15 min) before blocking — gives momentum time to form.
-      if (setup.events.sweep && !setup.events.move) {
-        const candlesSinceSweep = m5.length - 1 - sweep.candleIdx;
-        if (candlesSinceSweep >= 2) { // only evaluate after at least 2 post-sweep candles
-          const momentumCheck = checkPostSweepMomentum(m5, sweep.candleIdx, sweep.sweepExtreme, sweep.direction, currentATR);
-          console.log('[filter3] ' + sym + ': ' + momentumCheck.reason);
-          if (!momentumCheck.passed && candlesSinceSweep >= 3) {
-            // Hard block after 3 candles (15 min) with no momentum
-            logScanEvent(sym, 'FILTER_MOMENTUM_BLOCKED', momentumCheck.reason, {
-              direction: sweep.direction,
-              notes: JSON.stringify({ momentum_passed: false, move_size: momentumCheck.moveSize,
-                atr_multiple: momentumCheck.atrMultiple, candles_since_sweep: candlesSinceSweep,
-                filter_blocked_reason: momentumCheck.reason }),
-            });
-            await invalidateSetup(sym, 'Post-sweep momentum failed — price moved only ' +
-              momentumCheck.moveSize + ' (' + momentumCheck.atrMultiple + '×ATR < 0.5×) after sweep.');
-            resetSetup(sym, 'Post-sweep momentum failed');
-            await delay(400); continue;
-          }
-        }
       }
 
       // ── STAGE: DISPLACEMENT (MOVE) ────────────────────────────
@@ -5316,7 +4389,30 @@ async function autoScan() {
       const _htfBiasNow = timing?.htfBias || 'NEUTRAL';
       const _htfCounter = (_htfBiasNow === 'BULLISH' && sweep.direction === 'SELL') ||
                           (_htfBiasNow === 'BEARISH' && sweep.direction === 'BUY');
-      const dispMinRatio = _htfCounter ? 1.2 : null; // counter-HTF: stricter 1.2×; normal: use function default (0.8×)
+
+      // ── H1 STRUCTURAL BIAS GATE ──────────────────────────────
+      // H1 is the true HTF reference. Counter-H1 setups have materially lower
+      // win probability — block below zone score 80, require 2× displacement if ≥ 80.
+      const _h1BiasNow  = timing?.h1Bias || 'NEUTRAL';
+      const isCounterH1 = (_h1BiasNow === 'BULLISH' && sweep.direction === 'SELL') ||
+                          (_h1BiasNow === 'BEARISH' && sweep.direction === 'BUY');
+      const isAlignedH1 = (_h1BiasNow === 'BULLISH' && sweep.direction === 'BUY') ||
+                          (_h1BiasNow === 'BEARISH' && sweep.direction === 'SELL');
+      if (isCounterH1 && zoneScore < 80) {
+        console.log('[h1-gate] ' + sym + ': counter-H1 (' + _h1BiasNow + ') blocked — zone ' +
+          zoneScore + '/100 < 80 minimum for counter-trend entries');
+        await delay(400); continue;
+      }
+      if (isCounterH1) {
+        console.log('[h1-gate] ' + sym + ': counter-H1 (' + _h1BiasNow + ') — zone ' +
+          zoneScore + '/100 ≥ 80, applying 2× displacement requirement');
+      }
+      if (isAlignedH1) {
+        console.log('[h1-gate] ' + sym + ': H1 ALIGNED (' + _h1BiasNow + ') — full engine enabled');
+      }
+
+      // dispMinRatio: counter-H1 = 2.0×, counter-M15 = 1.5×, standard = 1.2×
+      const dispMinRatio = isCounterH1 ? 2.0 : _htfCounter ? 1.5 : 1.2;
 
       const disp = detectDisplacement(m5, sweep.candleIdx, sweep.direction, dispMinRatio);
       if (!disp.found) {
@@ -5350,15 +4446,34 @@ async function autoScan() {
         await delay(400); continue;
       }
 
-      // ── VWAP RECLAIM — soft check only ────────────────────────
-      // VWAP reclaim is a quality indicator, not a hard gate.
-      // Strong trending gold moves frequently displace through VWAP without
-      // retracing to it — killing those setups was the primary cause of
-      // MOVE-stage setups never reaching TREND (4 of 9 killed here).
-      // Log for context and scoring; do not block pipeline progression.
+      // ── VWAP RECLAIM CHECK (HARD GATE) ────────────────────────
+      // Requires price to close back through session VWAP after the sweep
+      // before BOS is evaluated. Eliminates fake displacement moves that
+      // fail to reclaim value area — the most common source of false signals.
+      //
+      // Grace period: 3 candles (15 min) after the sweep before blocking.
+      // This allows the reclaim candle time to form without firing too early.
       const vwapCheck = detectVWAPReclaim(m5, sweep.candleIdx, sweep.direction);
-      console.log('[vwap] ' + sym + ': ' + vwapCheck.note + (vwapCheck.reclaimed ? ' ✓' : ' (soft — not blocking)'));
-
+      console.log('[vwap] ' + sym + ': ' + vwapCheck.note);
+      if (!vwapCheck.reclaimed) {
+        const candlesSinceSweep = m5.length - 1 - sweep.candleIdx;
+        if (candlesSinceSweep > 3) {
+          // Hard block: no VWAP reclaim after 15 min = weak institutional follow-through
+          console.log('[vwap] ' + sym + ': ❌ BLOCKED — no VWAP reclaim after ' +
+            candlesSinceSweep + ' candles (VWAP $' + (vwapCheck.vwap || '—') + ')');
+          // Log the invalidation so it appears in /stats and Sheets
+          if (setup && !setup.invalidated) {
+            await invalidateSetup(sym, 'VWAP reclaim failed — price could not close through session VWAP after sweep.');
+            resetSetup(sym, 'VWAP reclaim failed');
+          }
+          await delay(400); continue;
+        }
+        // Within grace period — wait silently
+        console.log('[vwap] ' + sym + ': waiting for VWAP reclaim (candle ' +
+          candlesSinceSweep + '/3 grace period)');
+        await delay(400); continue;
+      }
+      console.log('[vwap] ' + sym + ': ✓ VWAP reclaimed — BOS evaluation unlocked');
 
       // ── STAGE: TREND SHIFT (BOS) ──────────────────────────────
       const bos = detectBOS(m5, sweep.candleIdx, sweep.direction);
@@ -5390,29 +4505,9 @@ async function autoScan() {
           timing.structuralBiasAt    = Date.now();
           console.log('[bias] ' + sym + ': structural bias confirmed → ' + sweep.direction + ' (BOS stage)');
         }
-        // PRE-ENTRY ALERT: send at trend confirmation — ACTIONABLE levels
-        // All 3 structural stages done. User needs to know exactly what to watch for.
-        // ── HARD FILTERS before pre-signal fires ─────────────────
-        // 1. Displacement must be ≥ 1.0× — weak momentum = noise
-        // 2. Zone touches must be > 14 — fewer = insufficient institutional interest
-        // 3. HTF Neutral setups require score ≥ 65 — no structural tailwind = higher bar
-        const _dispRatioNow  = disp?.ratio || 0;
-        const _touchesNow    = primaryZone?.totalTouches || 0;
-        const _htfBiasNow2   = timing?.htfBias || 'NEUTRAL';
-        const _preSignalBlock =
-          _dispRatioNow < 1.0
-            ? 'Displacement ' + _dispRatioNow + 'x < 1.0x minimum — pre-signal suppressed'
-          : _touchesNow <= 14
-            ? 'Zone touches ' + _touchesNow + ' ≤ 14 — insufficient institutional interest'
-          : (_htfBiasNow2 === 'NEUTRAL' && zoneScore < 65)
-            ? 'HTF Neutral + score ' + zoneScore + '/100 < 65 — pre-signal suppressed'
-          : null;
-
-        if (_preSignalBlock) {
-          console.log('[pre-signal filter] ' + sym + ': BLOCKED — ' + _preSignalBlock);
-        }
-
-        if (TELEGRAM_MODE !== 'FULL' && setup && !setup.tgAlerts?.preEntry && !_preSignalBlock) {
+        // PRE-ENTRY ALERT: send at trend confirmation (not pullback)
+        // This ensures alert fires even if pullback immediately exceeds 70%
+        if (TELEGRAM_MODE !== 'FULL' && setup && !setup.tgAlerts?.preEntry) {
           if (setup.tgAlerts) setup.tgAlerts.preEntry = true;
           const _htfNow     = timing?.htfBias || 'NEUTRAL';
           const _htfAligned = (_htfNow === 'BULLISH' && sweep.direction === 'BUY') ||
@@ -5422,60 +4517,18 @@ async function autoScan() {
           const _htfLine    = _htfNow === 'NEUTRAL'
             ? 'HTF Bias: Neutral ➖'
             : _htfAligned
-              ? 'HTF Bias: ' + (_htfNow.charAt(0) + _htfNow.slice(1).toLowerCase()) + ' ✅ (aligned)'
-              : 'HTF Bias: ' + (_htfNow.charAt(0) + _htfNow.slice(1).toLowerCase()) + ' ❌ (counter)';
-
-          // Pre-calculate SL and TP so user can prepare a limit order right now
-          const _slPre  = sweep.sweepExtreme
-            ? calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym, sweep.direction === 'SELL' ? sweep.zoneMax : sweep.zoneMin)
-            : null;
-
-          // Estimate entry price: midpoint of displacement candle at 55% retracement
-          let _entryEstPre = null;
-          if (disp.found && disp.impulseHigh != null && disp.impulseLow != null) {
-            const _range = disp.impulseHigh - disp.impulseLow;
-            _entryEstPre = sweep.direction === 'BUY'
-              ? parseFloat((disp.impulseHigh - _range * 0.55).toFixed(2))
-              : parseFloat((disp.impulseLow  + _range * 0.55).toFixed(2));
-          } else {
-            // Fallback: zone midpoint
-            _entryEstPre = parseFloat(((primaryZone.minPrice + primaryZone.maxPrice) / 2).toFixed(2));
-          }
-
-          const _tpsPre  = (_entryEstPre && _slPre) ? calcTP(sweep.direction, _entryEstPre, _slPre, levels) : null;
-          const _tp1Pre  = _tpsPre ? _tpsPre.tp1  : null;
-          const _tp2Pre  = _tpsPre ? _tpsPre.tp2  : null;
-          const _rrPre   = _tpsPre ? _tpsPre.rr1  : null;
-
-          const _isBuyNow   = sweep.direction === 'BUY';
-          const _dirEmoji   = _isBuyNow ? '🟢' : '🔴';
-          const _pullbackDir = _isBuyNow ? 'dip into' : 'rally into';
-
-          const _levelsBlock = [
-            _entryEstPre ? 'Entry zone: ~$' + _entryEstPre          : null,
-            _slPre        ? 'Stop loss:   $' + _slPre                : null,
-            _tp1Pre       ? 'TP1:          $' + _tp1Pre + (_rrPre ? '  (1:' + _rrPre + 'R)' : '') : null,
-            _tp2Pre       ? 'TP2:          $' + _tp2Pre               : null,
-          ].filter(Boolean).join('\n');
-
+              ? 'HTF Bias: ' + _htfNow.charAt(0) + _htfNow.slice(1).toLowerCase() + ' ✅ (aligned)'
+              : 'HTF Bias: ' + _htfNow.charAt(0) + _htfNow.slice(1).toLowerCase() + ' ❌ (counter — stronger confirmation required)';
           await sendTelegram(
-            _dirEmoji + ' <b>' + asset + ' ' + sweep.direction + ' — ENTRY IMMINENT</b>\n\n' +
-            '✅ Liquidity sweep confirmed\n' +
-            '✅ Strong move (' + disp.ratio + '× displacement)\n' +
-            '✅ Break of structure (' + bosType + ')\n\n' +
-            '<b>Waiting for price to ' + _pullbackDir + ' entry zone.</b>\n' +
-            'Zone: $' + parseFloat(primaryZone.minPrice).toFixed(2) + ' – $' + parseFloat(primaryZone.maxPrice).toFixed(2) + '\n' +
-            'Touches: ' + primaryZone.totalTouches + '  |  Conf: ' + zoneScore + '/100\n' +
+            '⚠️ <b>' + asset + ' ' + sweep.direction + ' — SETUP FORMING</b>\n\n' +
+            'Zone: $' + parseFloat(primaryZone.minPrice).toFixed(2) +
+            ' – $' + parseFloat(primaryZone.maxPrice).toFixed(2) + '\n' +
+            'Confidence: ' + zoneScore + '/100\n' +
+            'Touches: ' + primaryZone.totalTouches + '\n' +
             _htfLine + '\n\n' +
-            '<b>📌 Anticipated levels:</b>\n' +
-            _levelsBlock + '\n\n' +
-            '⚡ <b>Entry alert fires automatically when pullback confirms.</b>\n' +
-            'Do NOT enter manually — wait for the entry signal.\n' +
-            '─────────────────\nAurum Signals'
+            'Status: Waiting for pullback into entry zone.\n\n' +
+            '⏳ No action yet — monitor closely.\n\n─────────────────\nAurum Signals'
           );
-
-          // Store pre-calculated levels on setup for entry signal to reference
-          setup._preEntryLevels = { entry: _entryEstPre, sl: _slPre, tp1: _tp1Pre, tp2: _tp2Pre, rr: _rrPre };
         }
         console.log('[' + sym + '] Trend fired this scan — waiting for next scan before pullback');
         await delay(400); continue;
@@ -5492,13 +4545,7 @@ async function autoScan() {
         await delay(400); continue;
       }
 
-      // ── PULLBACK ANCHOR FIX ───────────────────────────────────
-      // By the time BOS fires, the 10-candle window after disp.candleIdx is often
-      // already exhausted. Anchor from the BOS candle instead so the window
-      // covers candles that actually occur AFTER structure confirmation.
-      const _bosCandleIdx = bos.bos_candle ?? bos.candleIdx ?? disp.candleIdx;
-      const pbStartIdx    = Math.max(disp.candleIdx, _bosCandleIdx - 2);
-      const pb = detectPullback(m5, pbStartIdx, sweep.direction, sweep.sweepExtreme);
+      const pb = detectPullback(m5, disp.candleIdx, sweep.direction, sweep.sweepExtreme);
 
       // Track pullback candle count — need min 2 candles of structure before 70% invalidation
       const curCandleIdx = m5.length - 1;
@@ -5573,7 +4620,7 @@ async function autoScan() {
       // Run aggressive entry engine — gated by zone score
       // Zone score < 75 → aggressive engine suppressed, standard only
       // Zone score ≥ 75 → full aggressive engine enabled
-      const allowAggressive = zoneScore >= 60; // v5.5: was 75 — no zone ever scored ≥75 in live data
+      const allowAggressive = zoneScore >= 75;
       const entryResult = allowAggressive
         ? aggressiveEntryEngine(sym, m5, primaryZone, sess)
         : { type: 'NO_ENTRY', reason: 'Zone score ' + zoneScore + ' < 75 — aggressive suppressed' };
@@ -5627,7 +4674,7 @@ async function autoScan() {
 
       const sl  = isContinuation
         ? activePb.sl  // continuation uses tighter SL from detectContinuation
-        : calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym, sweep.direction === 'SELL' ? sweep.zoneMax : sweep.zoneMin);
+        : calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5);
       const tps = calcTP(sweep.direction, activePb.entry, sl, levels);
 
       if (tps.rr1 < 1.5) {
@@ -5645,7 +4692,7 @@ async function autoScan() {
 
       const scoreResult = scoreSetup(sess, sessionOk, sweep, disp, bos, activePb,
         volatility.ok === true || volatility.ok === undefined, directionalBias, biasPenalty,
-        timing?.htfBias || 'NEUTRAL');
+        timing?.htfBias || 'NEUTRAL', timing?.h1Bias || 'NEUTRAL');
 
       // Continuation penalty: -10 (higher risk, no pullback confirmation)
       if (isContinuation) {
@@ -5761,8 +4808,6 @@ async function autoScan() {
           resultLogged: false,
           startedAt:    Date.now(),
         };
-        // Persist to Sheets so monitor survives Railway restarts
-        persistTradeMonitor(sym, tradeMonitor[sym]).catch(() => {});
         console.log('[monitor] ' + sym + ': trade monitor started — ' +
           rawSig.direction + ' entry=' + rawSig.entry + ' SL=' + rawSig.stop_loss +
           ' TP1=' + rawSig.take_profit_1 + ' TP2=' + rawSig.take_profit_2);
@@ -5771,15 +4816,7 @@ async function autoScan() {
           setup.earlyLockUntil = Date.now() + 10 * 60 * 1000; // 10 min = 2 × M5 candles
           console.log('[lock] ' + sym + ': AGGRESSIVE_EARLY lock active for 10 min');
         }
-        await sendTelegramWithButtons(formatTelegramSignal(rawSig), setup.id)
-          .then(messageId => {
-            if (messageId) {
-              _signalMessages[setup.id] = {
-                messageId,
-                originalText: formatTelegramSignal(rawSig),
-              };
-            }
-          });
+        await sendTelegram(formatTelegramSignal(rawSig));
       });
 
     } catch(e) {
@@ -5817,78 +4854,86 @@ app.listen(PORT, () => {
   // Run once immediately on startup (after 10s to let server settle)
   setTimeout(autoScan, 10000);
   console.log('[scheduler] Auto-scan started — every 5 minutes during sessions');
-  // On boot: write sheet headers, restore logs + open trade monitors
+  // On boot: write sheet headers if row 1 is empty, then restore last 24h of logs
   ensureSheetHeaders()
     .then(() => hydrateFromSheets(_setupLogs))
-    .then(() => restoreTradeMonitors())
     .catch(e => console.error('[boot]', e.message));
-
-  // XAG: load candles from disk first, then seed from history if needed
-  const diskLoaded = xagLoadCandles();
-  if (!diskLoaded || xagState.candles.length < 20) {
-    // Seed from gold-api.com history — gives instant analysis without warmup
-    xagSeedHistory().then(seeded => {
-      if (!seeded) console.log('[xag] History seed failed — will build from live polls (2hr warmup)');
-    });
-  } else {
-    console.log('[xag] ✓ Candles loaded from disk — no warmup needed');
-  }
 });
 
 // ── ENSURE SHEET HEADERS — runs once on boot ──────────────────────────────
-// Writes 19-col Aurum headers + creates AurumTrades tab.
-// Safe to run on every deploy — skips if already present.
+// Writes the 18-column header row to Aurum!A1:R1 only if it is empty.
+// Safe to run on every deploy — skips silently if headers already exist.
 async function ensureSheetHeaders() {
   const sheetId   = process.env.GOOGLE_SHEET_ID;
   const credsJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!sheetId || !credsJson) { console.log("[sheets] Env vars not set — skipping"); return; }
+  if (!sheetId || !credsJson) {
+    console.log("[sheets] Env vars not set — skipping header setup");
+    return;
+  }
   try {
     const { google } = require("googleapis");
-    const auth   = new google.auth.GoogleAuth({ credentials: JSON.parse(credsJson), scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
+    const auth = new google.auth.GoogleAuth({
+      credentials: JSON.parse(credsJson),
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+    });
     const sheets = google.sheets({ version: "v4", auth });
 
-    // ── Aurum tab — 19 cols (A:S) ─────────────────────────────
-    const aurumCheck = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: "Aurum!A1" });
-    if (!aurumCheck.data.values?.[0]?.[0]) {
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: sheetId, range: "Aurum!A1:S1", valueInputOption: "RAW",
-        requestBody: { values: [["Timestamp","Setup ID","Symbol","Direction","Session","Zone Low","Zone High","Zone Score","Touches","Event","Entry Price","Stop Loss","TP1","TP2","Candles to Event","Result","Invalidation Reason","Stages Confirmed","Notes (v5.3)"]] },
-      });
-      console.log("[sheets] Aurum headers written (19 cols)");
+    // Check if A1 already has content
+    const check = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId,
+      range: "Aurum!A1",
+    });
+    if (check.data.values && check.data.values[0]?.[0]) {
+      console.log("[sheets] Headers already present — skipping");
+      return;
     }
 
-    // ── AurumTrades tab ───────────────────────────────────────
-    const meta       = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
-    const hasTrades  = meta.data.sheets.some(s => s.properties.title === "AurumTrades");
-    if (!hasTrades) {
-      await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId,
-        requestBody: { requests: [{ addSheet: { properties: { title: "AurumTrades",
-          tabColor: { red: 0.2, green: 0.6, blue: 1.0 } } } }] } });
-      console.log("[sheets] AurumTrades tab created");
-    }
-    const tradesCheck = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: "AurumTrades!A1" });
-    if (!tradesCheck.data.values?.[0]?.[0]) {
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: sheetId, range: "AurumTrades!A1:I1", valueInputOption: "RAW",
-        requestBody: { values: [["Timestamp","Setup ID","Symbol","Direction","Entry","SL","TP1","TP2","Status"]] },
-      });
-      console.log("[sheets] AurumTrades headers written");
-    }
+    // Write headers
+    const HEADERS = [
+      "Timestamp", "Setup ID", "Symbol", "Direction", "Session",
+      "Zone Low", "Zone High", "Zone Score", "Touches", "Event",
+      "Entry Price", "Stop Loss", "TP1", "TP2", "Candles to Event",
+      "Result", "Invalidation Reason", "Stages Confirmed",
+    ];
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: sheetId,
+      range: "Aurum!A1:R1",
+      valueInputOption: "RAW",
+      requestBody: { values: [HEADERS] },
+    });
 
-    // ── Format Aurum header row ───────────────────────────────
-    const aurumTab = meta.data.sheets.find(s => s.properties.title === "Aurum");
-    if (aurumTab) {
-      const tabId = aurumTab.properties.sheetId;
-      await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody: { requests: [
-        { repeatCell: { range: { sheetId: tabId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 19 },
-          cell: { userEnteredFormat: { backgroundColor: { red: 0.098, green: 0.098, blue: 0.098 },
+    // Get tab sheetId for formatting
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
+    const tab  = meta.data.sheets.find(s => s.properties.title === "Aurum");
+    if (!tab) { console.log("[sheets] Aurum tab not found — headers written, no formatting"); return; }
+    const tabId = tab.properties.sheetId;
+
+    // Apply formatting in one batchUpdate
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: sheetId,
+      requestBody: { requests: [
+        { repeatCell: {
+          range: { sheetId: tabId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 18 },
+          cell: { userEnteredFormat: {
+            backgroundColor: { red: 0.098, green: 0.098, blue: 0.098 },
             textFormat: { foregroundColor: { red: 1.0, green: 0.843, blue: 0.0 }, bold: true, fontSize: 10 },
-            horizontalAlignment: "CENTER" }},
-          fields: "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)" }},
-        { updateSheetProperties: { properties: { sheetId: tabId, gridProperties: { frozenRowCount: 1 } }, fields: "gridProperties.frozenRowCount" }},
-        { updateSheetProperties: { properties: { sheetId: tabId, tabColor: { red: 1.0, green: 0.843, blue: 0.0 } }, fields: "tabColor" }},
-      ]}});
-    }
-    console.log("[sheets] Sheet setup complete");
-  } catch(e) { console.error("[sheets] Header setup failed (non-fatal):", e.message); }
+            horizontalAlignment: "CENTER",
+          }},
+          fields: "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
+        }},
+        { updateSheetProperties: {
+          properties: { sheetId: tabId, gridProperties: { frozenRowCount: 1 } },
+          fields: "gridProperties.frozenRowCount",
+        }},
+        { updateSheetProperties: {
+          properties: { sheetId: tabId, tabColor: { red: 1.0, green: 0.843, blue: 0.0 } },
+          fields: "tabColor",
+        }},
+      ]},
+    });
+
+    console.log("[sheets] Header setup complete — Aurum tab formatted");
+  } catch(e) {
+    console.error("[sheets] Header setup failed (non-fatal):", e.message);
+  }
 }
