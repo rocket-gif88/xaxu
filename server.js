@@ -1379,16 +1379,15 @@ function scoreZone(z, price, sess) {
 
 
 // ── ZONE RANKING ENGINE — selects ONE primary zone per symbol ───────────────
-function selectPrimaryZone(levels, price, sess, m5Candles, structuralBias) {
+// ── ZONE SCORING ENGINE ──────────────────────────────────────────────────────
+// Shared by selectPrimaryZone and selectDualZones. Returns all valid zones
+// with scores applied — sorted descending. Structural bias demotions included.
+function scoreZones(levels, price, sess, m5Candles, structuralBias) {
   const m5 = m5Candles || [];
-  // structuralBias: { dir: 'BUY'|'SELL'|null, stage: 'sweep'|'move'|'trend'|null }
-  // If set, the opposite direction zone cannot become primary unless structure confirms
-
-  // 1. Pull only EQH/EQL clustered zones
   const zones = levels.filter(l => l.isZone && (l.type === 'EQH' || l.type === 'EQL'));
-  if (!zones.length) return null;
+  if (!zones.length) return [];
 
-  // 2. Hard filter — discard invalid zones before scoring
+  // Hard filter
   const valid = [];
   for (const z of zones) {
     const hf = passesHardFilter(z, m5);
@@ -1398,9 +1397,8 @@ function selectPrimaryZone(levels, price, sess, m5Candles, structuralBias) {
     }
     valid.push(z);
   }
-  if (!valid.length) return null;
+  if (!valid.length) return [];
 
-  // 3. Score + add confluence from structural levels (PDH/PDL/ASH/ASL)
   const structural = levels.filter(l => ['PDH','PDL','ASH','ASL'].includes(l.type));
   const scored = valid.map(z => {
     const direction = getZoneDirection(z);
@@ -1408,10 +1406,8 @@ function selectPrimaryZone(levels, price, sess, m5Candles, structuralBias) {
     const distPct   = Math.abs(price - nearEdge) / nearEdge;
     const inside    = price >= z.minPrice && price <= z.maxPrice;
 
-    // Run ranking model
     const confidence = rankZone(z, price, sess, m5);
 
-    // Confluence bonus: add +5 for each nearby structural level (within 0.2%)
     let confBonus = 0;
     for (const sl of structural) {
       if (Math.abs(sl.price - z.price) / z.price <= 0.002) {
@@ -1425,7 +1421,6 @@ function selectPrimaryZone(levels, price, sess, m5Candles, structuralBias) {
         .map(sl => sl.type) };
     }
 
-    // Debug log for every valid zone
     console.log('[zone] ' + z.type + ' ' + z.priceRange +
       ' score=' + confidence.total + '/100' +
       ' touches=' + z.totalTouches +
@@ -1438,8 +1433,7 @@ function selectPrimaryZone(levels, price, sess, m5Candles, structuralBias) {
              inside, confidence, score: confidence.total };
   });
 
-  // 4. Apply structural bias — block opposite direction zones from becoming primary
-  // unless bias is only at 'sweep' level (weakest) and no opposing zone is stronger
+  // Structural bias demotions
   if (structuralBias && structuralBias.dir) {
     const biasDir       = structuralBias.dir;
     const biasStage     = structuralBias.stage || 'sweep';
@@ -1449,15 +1443,12 @@ function selectPrimaryZone(levels, price, sess, m5Candles, structuralBias) {
 
     scored.forEach(z => {
       if (z.direction === oppositeDir) {
-        // Counter-trend zone — demote unless bias is only at sweep level
         if (biasStrength >= 2) {
-          // Move or trend confirmed — strongly suppress counter-trend zone
           z.score        = Math.max(0, z.score - 40);
           z.isCounterTrend = true;
           console.log('[bias] ' + oppositeDir + ' zone ' + z.priceRange +
             ' demoted (counter-trend — ' + biasDir + ' bias at ' + biasStage + ' stage)');
         } else {
-          // Only sweep confirmed — moderate suppression
           z.score        = Math.max(0, z.score - 20);
           z.isCounterTrend = true;
           console.log('[bias] ' + oppositeDir + ' zone ' + z.priceRange +
@@ -1467,24 +1458,99 @@ function selectPrimaryZone(levels, price, sess, m5Candles, structuralBias) {
     });
   }
 
-  // 4. Sort by score descending — highest score = primary zone
   scored.sort((a, b) => b.score - a.score);
+  return scored;
+}
+
+// ── SINGLE PRIMARY ZONE (legacy / test routes) ───────────────────────────────
+function selectPrimaryZone(levels, price, sess, m5Candles, structuralBias) {
+  const scored = scoreZones(levels, price, sess, m5Candles, structuralBias);
+  if (!scored.length) return null;
 
   const primary = scored[0];
   if (primary.isCounterTrend) {
     console.log('[bias] WARNING: primary zone is counter-trend — no same-direction zone available');
   }
   console.log('[zone] PRIMARY ZONE SELECTED: ' + primary.direction +
-    ' ' + primary.priceRange +
-    ' score=' + primary.score + '/100' +
-    ' touches=' + primary.totalTouches);
+    ' ' + primary.priceRange + ' score=' + primary.score + '/100 touches=' + primary.totalTouches);
 
-  // Mark others as secondary (for debug/UI only — signal logic ignores them)
   scored.slice(1).forEach(z => {
     console.log('[zone] SECONDARY (ignored): ' + z.type + ' ' + z.priceRange + ' score=' + z.score);
   });
 
   return primary;
+}
+
+// ── DUAL ZONE SELECTION ───────────────────────────────────────────────────────
+// Returns the best BUY zone and best SELL zone independently.
+// Both zones must pass hard filters and score ≥ 30 to be returned.
+function selectDualZones(levels, price, sess, m5Candles, structuralBias) {
+  const scored = scoreZones(levels, price, sess, m5Candles, structuralBias);
+
+  const buyZones  = scored.filter(z => z.direction === 'BUY');
+  const sellZones = scored.filter(z => z.direction === 'SELL');
+
+  const buyZone  = buyZones.length  ? buyZones[0]  : null;
+  const sellZone = sellZones.length ? sellZones[0] : null;
+
+  if (buyZone)  console.log('[dual-zone] BUY  best: ' + buyZone.priceRange  + ' score=' + buyZone.score);
+  if (sellZone) console.log('[dual-zone] SELL best: ' + sellZone.priceRange + ' score=' + sellZone.score);
+
+  return { buyZone, sellZone };
+}
+
+// ── ACTIVE ZONE PICKER ────────────────────────────────────────────────────────
+// Decides which zone to activate this scan when no setup is locked.
+// Priority: (1) live sweep in either zone, (2) proximity (within 0.5%),
+// (3) score. This is what catches the missed trade — yesterday price swept
+// the BUY zone at $4,540 but the engine was watching the SELL zone at $4,560
+// because it scored higher. Now the sweep fires immediately regardless of score.
+function pickActiveZone(dual, livePrice, m5) {
+  const { buyZone, sellZone } = dual;
+  if (!buyZone && !sellZone) return null;
+  if (!buyZone)  return sellZone;
+  if (!sellZone) return buyZone;
+
+  // 1. Live sweep detection — sweep wins over everything
+  const buySweep  = detectSweep(m5, [buyZone]);
+  const sellSweep = detectSweep(m5, [sellZone]);
+
+  if (buySweep.found  && !sellSweep.found) {
+    console.log('[dual-zone] BUY zone swept — activating BUY zone');
+    return buyZone;
+  }
+  if (sellSweep.found && !buySweep.found) {
+    console.log('[dual-zone] SELL zone swept — activating SELL zone');
+    return sellZone;
+  }
+  if (buySweep.found && sellSweep.found) {
+    // Both swept — most recent sweep takes priority
+    const pick = buySweep.candleIdx >= sellSweep.candleIdx ? buyZone : sellZone;
+    console.log('[dual-zone] Both zones swept — using more recent: ' + pick.direction);
+    return pick;
+  }
+
+  // 2. Proximity — if price is within 0.5% of one zone's near edge, use it
+  const buyEdge  = buyZone.maxPrice;   // BUY zone: price approaches from above
+  const sellEdge = sellZone.minPrice;  // SELL zone: price approaches from below
+  const buyDist  = Math.abs(livePrice - buyEdge)  / buyEdge;
+  const sellDist = Math.abs(livePrice - sellEdge) / sellEdge;
+  const PROX_THRESHOLD = 0.005; // 0.5%
+
+  if (buyDist  <= PROX_THRESHOLD && buyDist  < sellDist) {
+    console.log('[dual-zone] BUY zone proximity (' + (buyDist*100).toFixed(2) + '%) — activating BUY zone');
+    return buyZone;
+  }
+  if (sellDist <= PROX_THRESHOLD && sellDist < buyDist) {
+    console.log('[dual-zone] SELL zone proximity (' + (sellDist*100).toFixed(2) + '%) — activating SELL zone');
+    return sellZone;
+  }
+
+  // 3. Fall back to score (same as old behaviour)
+  const pick = buyZone.score >= sellZone.score ? buyZone : sellZone;
+  console.log('[dual-zone] Score fallback — ' + pick.direction + ' (' + pick.score + ' vs ' +
+    (pick === buyZone ? sellZone.score : buyZone.score) + ')');
+  return pick;
 }
 
 
@@ -2616,7 +2682,8 @@ app.get('/analyze/:sym', async (req, res) => {
   // ── PRIMARY ZONE SELECTION (before sweep detection) ────────────────────
   // Must happen here so detectSweep can be locked to primary zone only.
   // Prevents secondary zones from triggering conflicting signals.
-  const primaryZoneEarly = selectPrimaryZone(levels, currentPrice, sess, m5, null);
+  const _dualEarly    = selectDualZones(levels, currentPrice, sess, m5, null);
+  const primaryZoneEarly = pickActiveZone(_dualEarly, currentPrice, m5);
   const sweepLevels = primaryZoneEarly ? [primaryZoneEarly] : [];
 
   if (!sessionOk) {
@@ -2892,6 +2959,8 @@ app.get('/analyze/:sym', async (req, res) => {
       approaching_levels: approachingLevels,
       sweep_potentials:  sweepPotentials,
       primary_zone:      primaryZone,
+      buy_zone:          _dualEarly.buyZone  || null,
+      sell_zone:         _dualEarly.sellZone || null,
       zone_confidence:   pzConf,
       zone_direction:    primaryZone?.direction || null,
       zone_score_tier:   pzConf >= 75 ? 'FULL' : pzConf >= 50 ? 'STANDARD' : 'BLOCKED',
@@ -5104,8 +5173,11 @@ async function autoScan() {
         ? { dir: timing.structuralBiasDir, stage: timing.structuralBiasStage }
         : null;
 
-      // v5.5: If a zone is locked (post-sweep), use it instead of re-ranking
-      // This prevents the zone selector from switching zones between sweep and BOS
+      // ── DUAL ZONE SELECTION ───────────────────────────────────────
+      // v5.6: Select best BUY zone AND best SELL zone independently.
+      // - Locked zone (post-sweep): stays locked to active setup direction
+      // - Active setup: use the zone matching setup direction
+      // - No setup: pick via sweep detection → proximity → score
       let primaryZone;
       if (timing && timing.lockedZone && timing.lockedZoneScansLeft > 0) {
         timing.lockedZoneScansLeft--;
@@ -5114,12 +5186,20 @@ async function autoScan() {
           ' (' + timing.lockedZoneScansLeft + ' scans remaining)');
       } else {
         if (timing && timing.lockedZone) {
-          console.log('[zone-lock] ' + sym + ': zone lock expired — resuming normal selection');
+          console.log('[zone-lock] ' + sym + ': zone lock expired — resuming dual-zone selection');
           timing.lockedZone          = null;
           timing.lockedZoneKey       = null;
           timing.lockedZoneScansLeft = 0;
         }
-        primaryZone = selectPrimaryZone(levels, livePrice, sess, m5, structBias);
+        const dual = selectDualZones(levels, livePrice, sess, m5, structBias);
+        if (setup && setup.active && !setup.invalidated) {
+          // Active setup: stay with its direction — don't let zone picker flip mid-trade
+          primaryZone = setup.direction === 'BUY' ? dual.buyZone : dual.sellZone;
+          if (!primaryZone) primaryZone = pickActiveZone(dual, livePrice, m5);
+        } else {
+          // No active setup: pick whichever zone price is sweeping / approaching
+          primaryZone = pickActiveZone(dual, livePrice, m5);
+        }
       }
 
       if (!primaryZone) {
