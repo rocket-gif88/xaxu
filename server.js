@@ -3818,7 +3818,37 @@ app.post('/telegram-webhook', async (req, res) => {
   try {
     const update = req.body;
 
-    // Only handle callback_query (button taps)
+    // ── TEXT COMMANDS (/status, /help) ────────────────────────────
+    if (update.message && update.message.text) {
+      const chatId = update.message.chat?.id;
+      const text   = update.message.text.trim().toLowerCase();
+
+      // Security: only respond to the configured chat
+      if (TG_CHAT_ID && String(chatId) !== String(TG_CHAT_ID)) return;
+
+      if (text === '/status' || text === '/status@' + (update.message.bot_name || '')) {
+        const statusMsg = buildStatusMessage();
+        if (TG_TOKEN && chatId) {
+          await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, text: statusMsg, parse_mode: 'HTML' }),
+            signal: AbortSignal.timeout(8000),
+          });
+        }
+      } else if (text === '/help') {
+        const helpMsg = '📖 <b>Aurum Commands</b>\n\n/status — current engine state, bias, zones & active setup\n/help — this message';
+        await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, text: helpMsg, parse_mode: 'HTML' }),
+          signal: AbortSignal.timeout(8000),
+        });
+      }
+      return;
+    }
+
+    // ── BUTTON TAPS (callback_query) ──────────────────────────────
     if (!update.callback_query) return;
 
     const cq       = update.callback_query;
@@ -3857,6 +3887,88 @@ app.post('/telegram-webhook', async (req, res) => {
   }
 });
 
+// ── STATUS MESSAGE BUILDER ────────────────────────────────────────────────────
+// Called when /status is sent to the bot. Compiles current engine state into
+// a single Telegram message — price, bias, zones, active setup stage.
+function buildStatusMessage() {
+  const now     = new Date();
+  const utcTime = now.toUTCString().split(' ')[4] + ' UTC';
+  const sym     = 'XAUUSD';
+  const timing  = symTiming[sym];
+  const setup   = setups[sym];
+  const sess    = sessionName(Date.now()) || 'Closed';
+
+  // Price from candle cache
+  const xauCache = getCached('candles_XAUUSD_5min_120');
+  const price    = xauCache ? parseFloat(xauCache[xauCache.length - 1]?.c).toFixed(2) : '—';
+
+  // Session indicator
+  const sessLine = sess === 'Closed'
+    ? '🔴 Session: Closed'
+    : sess === 'London+NY Overlap'
+      ? '🟢 Session: London + NY Overlap'
+      : '🟡 Session: ' + sess;
+
+  // H1 and HTF bias
+  const h1Bias   = timing?.h1Bias  || 'NEUTRAL';
+  const htfBias  = timing?.htfBias || 'NEUTRAL';
+  const biasEmoji = { BULLISH: '▲', BEARISH: '▼', NEUTRAL: '—' };
+  const h1Line   = 'H1 bias:   ' + biasEmoji[h1Bias]  + ' ' + h1Bias;
+  const htfLine  = 'M15 bias:  ' + biasEmoji[htfBias] + ' ' + htfBias;
+
+  // Active setup
+  let setupLine = 'Setup:     No active setup';
+  if (setup && setup.active && !setup.invalidated) {
+    const dir   = setup.direction === 'BUY' ? '🟢 BUY' : '🔴 SELL';
+    const stage = setup.stage || 'unknown';
+    const stageLabels = {
+      sweep:    'Liquidity grab confirmed — awaiting displacement',
+      move:     'Displacement confirmed — awaiting BOS',
+      trend:    'BOS confirmed — awaiting pullback',
+      pullback: 'Pullback forming — entry imminent',
+      entry:    'Entry triggered',
+    };
+    setupLine = 'Setup:     ' + dir + ' · ' + (stageLabels[stage] || stage);
+  }
+
+  // Locked zone
+  let zoneLine = 'Zone:      No zone selected';
+  if (timing?.lockedZone) {
+    const lz  = timing.lockedZone;
+    const dir = lz.direction || '?';
+    zoneLine  = 'Zone:      ' + dir + ' $' + parseFloat(lz.minPrice).toFixed(2) +
+                '–$' + parseFloat(lz.maxPrice).toFixed(2) +
+                ' (score ' + (lz.confidence?.total || lz.score || 0) + '/100, locked)';
+  }
+
+  // Consecutive failures
+  const failures = timing?.consecutiveFailures;
+  const failLine = failures
+    ? 'Failures:  BUY ' + (failures.BUY || 0) + '  SELL ' + (failures.SELL || 0)
+    : '';
+
+  const lines = [
+    '📡 <b>Aurum Status — ' + utcTime + '</b>',
+    '',
+    '💰 XAUUSD: <b>$' + price + '</b>',
+    sessLine,
+    '',
+    '<b>Bias</b>',
+    h1Line,
+    htfLine,
+    '',
+    '<b>Engine</b>',
+    setupLine,
+    zoneLine,
+    failLine,
+    '',
+    '─────────────────',
+    'Aurum Signals',
+  ].filter(l => l !== undefined && !(l === '' && lines && lines[lines.length-1] === ''));
+
+  return lines.join('\n');
+}
+
 // ── REGISTER WEBHOOK with Telegram ───────────────────────────────────────
 // Call once: GET /setup-webhook
 // Railway URL must be set in RAILWAY_PUBLIC_URL env var, or pass ?url=https://...
@@ -3871,7 +3983,7 @@ app.get('/setup-webhook', async (req, res) => {
       'https://api.telegram.org/bot' + TG_TOKEN + '/setWebhook',
       { method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: webhookUrl, allowed_updates: ['callback_query'] }),
+        body: JSON.stringify({ url: webhookUrl, allowed_updates: ['callback_query', 'message'] }),
         signal: AbortSignal.timeout(8000) }
     );
     const json = await resp.json();
