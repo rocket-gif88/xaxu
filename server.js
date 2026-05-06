@@ -3964,7 +3964,7 @@ function buildStatusMessage() {
     '',
     '─────────────────',
     'Aurum Signals',
-  ].filter(l => l !== undefined && !(l === '' && lines && lines[lines.length-1] === ''));
+  ].filter(l => l !== undefined);
 
   return lines.join('\n');
 }
