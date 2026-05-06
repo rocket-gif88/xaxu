@@ -2054,24 +2054,39 @@ function runQualityFilters(candles, m15Candles, sweep, disp, bos, pullback,
 }
 
 // ─── STOP LOSS ─────────────────────────────────────────────────────────────
-function calcSL(direction, sweepExtreme, atr, symOverride, zoneExtreme) {
+function calcSL(direction, sweepExtreme, atr, symOverride, zoneExtreme, entryPrice) {
   const _sym = symOverride || 'XAUUSD';
   const PIP_BUFFER = _sym === 'XAUUSD' ? 0.50 : 0.10;
-  const atrBuffer = atr * 0.10;
+  // Minimum buffer raised from 0.10× to 0.35× ATR — 0.10× was too tight (~$0.38)
+  // which produced absurd R:R ratios and stops that any single candle would tag.
+  const atrBuffer = atr * 0.35;
   const buffer = Math.max(parseFloat(PIP_BUFFER), atrBuffer);
+
+  let sl;
   if (direction === 'BUY') {
     const anchor = (zoneExtreme != null) ? Math.min(sweepExtreme, zoneExtreme) : sweepExtreme;
-    return parseFloat((anchor - buffer).toFixed(3));
+    sl = parseFloat((anchor - buffer).toFixed(3));
+    // Validate: SL must be BELOW entry for a BUY
+    if (entryPrice != null && sl >= entryPrice) {
+      console.log('[calcSL] BUY SL above entry — repositioning to entry - 0.5×ATR');
+      sl = parseFloat((entryPrice - Math.max(buffer, atr * 0.5)).toFixed(3));
+    }
   } else {
     const anchor = (zoneExtreme != null) ? Math.max(sweepExtreme, zoneExtreme) : sweepExtreme;
-    return parseFloat((anchor + buffer).toFixed(3));
+    sl = parseFloat((anchor + buffer).toFixed(3));
+    // Validate: SL must be ABOVE entry for a SELL
+    if (entryPrice != null && sl <= entryPrice) {
+      console.log('[calcSL] SELL SL below entry — repositioning to entry + 0.5×ATR');
+      sl = parseFloat((entryPrice + Math.max(buffer, atr * 0.5)).toFixed(3));
+    }
   }
+  return sl;
 }
 
 // ─── TAKE PROFIT ───────────────────────────────────────────────────────────
 function calcTP(direction, entry, sl, levels) {
   const riskDist = Math.abs(entry - sl);
-  const MIN_RR   = 1.5;
+  const MIN_RR   = 2.0;  // raised from 1.5 — 1.5 was too low to be profitable after spread
   const fallback25R = direction === 'BUY'
     ? entry + riskDist * 2.5
     : entry - riskDist * 2.5;
@@ -2614,6 +2629,7 @@ app.get('/analyze/:sym', async (req, res) => {
     // ── 4. SWEEP DETECTION — PRIMARY ZONE ONLY ──────────────────────────
     let sweep = detectSweep(m5, sweepLevels); // locked to primary zone
     if (sweep.found) sweep = correctSweepDirection(sweep); // enforce direction from zone type
+    let disp = null; // hoisted — referenced in near_setup block outside inner scope
 
     if (!sweep.found) {
       setupState = 'idle';
@@ -2634,7 +2650,7 @@ app.get('/analyze/:sym', async (req, res) => {
         log.push('Setup expired: ' + sweepToNow + ' candles have passed since the liquidity grab (maximum is 10). Setup reset.');
       } else {
         // ── 6. DISPLACEMENT ───────────────────────────────────────────
-        const disp = detectDisplacement(m5, sweep.candleIdx, sweep.direction);
+        disp = detectDisplacement(m5, sweep.candleIdx, sweep.direction);
 
         if (!disp.found) {
           setupState = 'sweep_detected';
@@ -2670,10 +2686,10 @@ app.get('/analyze/:sym', async (req, res) => {
               log.push('Pullback entry confirmed: ' + pb.retracement + '% retracement — entry price $' + pb.entry.toFixed(3));
 
               // ── 9. LEVELS ─────────────────────────────────────────
-              const sl   = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym, sweep.direction === 'SELL' ? sweep.zoneMax : sweep.zoneMin);
+              const sl   = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym, sweep.direction === 'SELL' ? sweep.zoneMax : sweep.zoneMin, pb.entry);
               const tps  = calcTP(sweep.direction, pb.entry, sl, levels);
 
-              if (tps.rr1 < 1.5) {
+              if (tps.rr1 < 2.0) {
                 setupState = 'invalidated';
                 log.push('Risk/Reward check: ' + tps.rr1 + ' — below the minimum 1:2 requirement. Setup not valid.');
               } else {
@@ -5552,12 +5568,7 @@ async function autoScan() {
               ? 'HTF Bias: ' + (_htfNow.charAt(0) + _htfNow.slice(1).toLowerCase()) + ' ✅ (aligned)'
               : 'HTF Bias: ' + (_htfNow.charAt(0) + _htfNow.slice(1).toLowerCase()) + ' ❌ (counter)';
 
-          // Pre-calculate SL and TP so user can prepare a limit order right now
-          const _slPre  = sweep.sweepExtreme
-            ? calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym, sweep.direction === 'SELL' ? sweep.zoneMax : sweep.zoneMin)
-            : null;
-
-          // Estimate entry price: midpoint of displacement candle at 55% retracement
+          // Estimate entry price first — needed for SL side validation
           let _entryEstPre = null;
           if (disp.found && disp.impulseHigh != null && disp.impulseLow != null) {
             const _range = disp.impulseHigh - disp.impulseLow;
@@ -5568,6 +5579,11 @@ async function autoScan() {
             // Fallback: zone midpoint
             _entryEstPre = parseFloat(((primaryZone.minPrice + primaryZone.maxPrice) / 2).toFixed(2));
           }
+
+          // Pre-calculate SL and TP so user can prepare a limit order right now
+          const _slPre  = sweep.sweepExtreme
+            ? calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym, sweep.direction === 'SELL' ? sweep.zoneMax : sweep.zoneMin, _entryEstPre)
+            : null;
 
           const _tpsPre  = (_entryEstPre && _slPre) ? calcTP(sweep.direction, _entryEstPre, _slPre, levels) : null;
           const _tp1Pre  = _tpsPre ? _tpsPre.tp1  : null;
@@ -5754,11 +5770,11 @@ async function autoScan() {
 
       const sl  = isContinuation
         ? activePb.sl  // continuation uses tighter SL from detectContinuation
-        : calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym, sweep.direction === 'SELL' ? sweep.zoneMax : sweep.zoneMin);
+        : calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5, sym, sweep.direction === 'SELL' ? sweep.zoneMax : sweep.zoneMin, activePb.entry);
       const tps = calcTP(sweep.direction, activePb.entry, sl, levels);
 
-      if (tps.rr1 < 1.5) {
-        console.log('[' + sym + '] R:R ' + tps.rr1 + ' below minimum — no signal');
+      if (tps.rr1 < 2.0) {
+        console.log('[' + sym + '] R:R ' + tps.rr1 + ' below minimum 2.0 — no signal');
         await delay(400); continue;
       }
 
