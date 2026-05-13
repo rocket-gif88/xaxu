@@ -102,8 +102,9 @@ async function hydrateFromSheets(setupLogs) {
 // ──────────────────────────────────────────────────────────────────────────
 
 const zoneMemory = {
-  XAUUSD: {},  // priceRange → { firstSeenAt, touchCount, lastTouchedAt }
+  XAUUSD: {},
   XAGUSD: {},
+  WTIUSD: {},
 };
 
 function updateZoneMemory(sym, zone) {
@@ -245,15 +246,22 @@ function calcLots(accountSize, entryPrice, stopLoss) {
 }
 
 // Returns the formatted ATR block string for insertion into Telegram signal
-function formatATRBlock(currentATR, entryPrice, stopLoss) {
+function formatATRBlock(sym, currentATR, entryPrice, stopLoss) {
   if (!currentATR || !entryPrice || !stopLoss) return '';
 
+  const pipValue = PIP_VALUE_BY_SYM[sym] || 100;
   const stopDist    = Math.abs(entryPrice - stopLoss);
   const atrMultiple = (stopDist / currentATR).toFixed(1);
 
-  const lot10k  = calcLots(10000,  entryPrice, stopLoss);
-  const lot50k  = calcLots(50000,  entryPrice, stopLoss);
-  const lot100k = calcLots(100000, entryPrice, stopLoss);
+  const calcLotsLocal = (accountSize) => {
+    const riskAmount = accountSize * (RISK_PCT / 100);
+    const lots = riskAmount / (stopDist * pipValue);
+    return parseFloat(Math.max(lots, 0.01).toFixed(2));
+  };
+
+  const lot10k  = calcLotsLocal(10000);
+  const lot50k  = calcLotsLocal(50000);
+  const lot100k = calcLotsLocal(100000);
 
   return [
     '',
@@ -614,7 +622,7 @@ async function restoreTradeMonitors() {
       const [ts, setupId, sym, dir, entry, sl, tp1, tp2, status] = row;
       if (status !== 'OPEN') continue;
       if (new Date(ts).getTime() < cutoff) continue;
-      if (!sym || sym !== 'XAUUSD') continue; // Gold only
+      if (!sym || !setups.hasOwnProperty(sym)) continue; // Only tracked symbols
       // Only restore if no monitor already active for this symbol
       if (tradeMonitor[sym]) continue;
       tradeMonitor[sym] = {
@@ -678,7 +686,8 @@ function readAllLogs() {
 }
 
 const SYMBOLS = {
-  XAUUSD: 'XAU/USD',   // Gold spot — Twelve Data (Silver disabled — no free intraday XAG API available)
+  XAUUSD: 'XAU/USD',   // Gold spot — Twelve Data
+  WTIUSD: 'WTI/USD',   // WTI crude oil — Twelve Data (paid plan required)
 };
 
 // ─── XAG SYNTHETIC CANDLE ENGINE ──────────────────────────────────────────
@@ -1016,8 +1025,34 @@ function deriveM15FromM5(m5Candles) {
 // --- ATR RANGE VALIDATION ----------------------------------------------------
 const ATR_RANGE = {
   XAUUSD: { min: 1.0,  max: 20.0 },
-  XAGUSD: { min: 0.05, max: 2.00  }  // XAG/USD real spot via Twelve Data
+  XAGUSD: { min: 0.05, max: 2.00  },
+  WTIUSD: { min: 0.08, max: 3.00  }, // WTI M5: typical $0.10–0.40, spikes $1–2 on inventory
 };
+
+// Per-symbol HTF+ATR neutral gate — blocks new setups in choppy low-vol conditions
+// Expressed as absolute ATR floor matching each asset's typical M5 volatility
+const HTF_ATR_NEUTRAL_GATE = {
+  XAUUSD: 2.0,   // Gold: typical M5 ATR $3–8, gate at $2
+  XAGUSD: 0.05,
+  WTIUSD: 0.10,  // WTI: typical M5 ATR $0.15–0.30, gate at $0.10
+};
+
+// Per-symbol position sizing — dollar value per $1 move per standard lot
+// Gold:   1 lot = 100 oz   → $100/lot per $1 move
+// WTI:    1 lot = 1000 bbl → $1000/lot per $1 move
+const PIP_VALUE_BY_SYM = {
+  XAUUSD: 100,
+  XAGUSD: 50,
+  WTIUSD: 1000,
+};
+
+// ── Asset display label ────────────────────────────────────────────────────
+function getAssetLabel(sym) {
+  if (sym === 'XAUUSD') return 'GOLD';
+  if (sym === 'WTIUSD') return 'WTI OIL';
+  if (sym === 'XAGUSD') return 'SILVER';
+  return sym;
+}
 function checkATR(sym, atrValues) {
   if (!atrValues || atrValues.length < 5 || !ATR_RANGE[sym]) {
     return { ok: true, state: 'unknown', current: null, avg20: null, note: 'Insufficient ATR' };
@@ -2122,7 +2157,10 @@ function runQualityFilters(candles, m15Candles, sweep, disp, bos, pullback,
 // ─── STOP LOSS ─────────────────────────────────────────────────────────────
 function calcSL(direction, sweepExtreme, atr, symOverride, zoneExtreme, entryPrice) {
   const _sym = symOverride || 'XAUUSD';
-  const PIP_BUFFER = _sym === 'XAUUSD' ? 0.50 : 0.10;
+  // Minimum pip buffer — scaled to asset price magnitude
+  const PIP_BUFFER = _sym === 'XAUUSD' ? 0.50
+                   : _sym === 'WTIUSD' ? 0.05   // WTI ~$75: 5c buffer
+                   : 0.10;                        // other / XAGUSD
   // Minimum buffer raised from 0.10× to 0.35× ATR — 0.10× was too tight (~$0.38)
   // which produced absurd R:R ratios and stops that any single candle would tag.
   const atrBuffer = atr * 0.35;
@@ -2373,7 +2411,7 @@ function calcConfidence(sessionOk, sessionOverlap, volatilityOk, sweep, displace
 
 function formatSignalAlert(sig, atr) {
   const isBuy    = sig.direction === 'BUY';
-  const asset    = sig.asset === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  const asset    = getAssetLabel(sig.asset);
   const emoji    = isBuy ? '🟢' : '🔴';
   const dirLabel = isBuy ? 'BUY' : 'SELL';
 
@@ -2470,7 +2508,7 @@ function formatSignalAlert(sig, atr) {
 }
 
 function formatPreSignalAlert(stage, sym, direction, message, level, session, bias) {
-  const asset   = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  const asset   = getAssetLabel(sym);
   const isBuy   = direction === 'BUY';
   const emoji   = {
     approaching_liquidity:  '📍',
@@ -3279,7 +3317,7 @@ app.get('/health', async (req, res) => {
     session: inSession
       ? (h >= 13 && h < 16 ? 'London+NY Overlap' : h < 16 ? 'London' : 'New York')
       : 'Closed',
-    symbols: { XAUUSD: 'XAU/USD (Gold spot)' }, // Silver disabled
+    symbols: Object.fromEntries(Object.entries(SYMBOLS).map(([k,v]) => [k, v])),
     ts: new Date().toUTCString()
   });
 });
@@ -3289,17 +3327,19 @@ app.get('/prices', (req, res) => {
   const xauCache = getCached('candles_XAUUSD_5min_120');
   const xau = xauCache ? parseFloat(xauCache[xauCache.length-1]?.c) || null : null;
 
-  // XAGUSD: use synthetic candle store (gold-api.com real XAG spot)
+  const wtiCache = getCached('candles_WTIUSD_5min_120');
+  const wti = wtiCache ? parseFloat(wtiCache[wtiCache.length-1]?.c) || null : null;
+
+  // XAGUSD: use synthetic candle store
   const xagCandles = xagState.candles.length > 0 ? xagState.candles : null;
   const xag = xagCandles ? parseFloat(xagCandles[xagCandles.length-1]?.c) || null
     : xagState.lastPrice || null;
 
-  // Gold/Silver ratio
   const ratio = xau && xag ? parseFloat((xau / xag).toFixed(1)) : null;
 
   res.json({
     success:  true,
-    prices:   { XAUUSD: xau, XAGUSD: xag },
+    prices:   { XAUUSD: xau, WTIUSD: wti, XAGUSD: xag },
     ratio,
     xag_candles: xagCandles?.length || 0,
     from_cache: true,
@@ -3580,132 +3620,6 @@ app.get('/stats', (req, res) => {
   }
 });
 
-// ── GET /setup-state — Hermes confluence query ───────────────────────────────
-// Returns current active setup state for each tracked symbol.
-// Hermes calls this before firing a signal to check technical confluence.
-// Response shape per symbol:
-//   hasActiveSetup  bool    — is a setup currently live?
-//   direction       string  — "BUY" | "SELL" | null
-//   stage           string  — "sweep"|"move"|"trend"|"pullback"|"entry"|null
-//   stageScore      number  — 1–5 (stages confirmed so far — higher = more structure)
-//   setupAgeMinutes number  — how long the current setup has been active
-//   entryZone       object  — { low, high } if known
-//   htfBias         string  — "BULLISH"|"BEARISH"|"NEUTRAL"
-//   h1Bias          string  — "BULLISH"|"BEARISH"|"NEUTRAL"
-//   zoneFreshness   string  — "FRESH"|"RETESTED"|"WEAKENED"|"EXHAUSTED"
-//   hasOpenTrade    bool    — trade monitor active (entry already fired)
-//   confluenceScore number  — 0–100 composite for Hermes to use directly
-app.get('/setup-state', (req, res) => {
-  try {
-    const stageOrder = ['sweep', 'move', 'trend', 'pullback', 'entry'];
-    const result = {};
-
-    for (const sym of Object.keys(SYMBOLS)) {
-      const setup   = setups[sym];
-      const timing  = symTiming[sym];
-      const monitor = tradeMonitor[sym];
-
-      // ── Active setup ──────────────────────────────────────────────────────
-      const hasActive = !!(setup && setup.active && !setup.invalidated);
-
-      // Stage score: count confirmed stages (1–5)
-      let stage = null;
-      let stageScore = 0;
-      if (hasActive && setup.events) {
-        for (const s of stageOrder) {
-          if (setup.events[s]) { stage = s; stageScore++; }
-        }
-      }
-
-      // Setup age
-      const setupAgeMinutes = hasActive && setup.createdAt
-        ? Math.round((Date.now() - setup.createdAt) / 60000)
-        : null;
-
-      // Entry zone from active setup
-      let entryZone = null;
-      if (hasActive && setup.zone) {
-        entryZone = {
-          low:  setup.zone.minPrice || setup.zone.low  || null,
-          high: setup.zone.maxPrice || setup.zone.high || null,
-        };
-      }
-
-      // Zone freshness label (strip emoji for clean comparison in Hermes)
-      let zoneFreshnessLabel = 'UNKNOWN';
-      if (hasActive && setup.zone) {
-        const zf = getZoneFreshness(sym, setup.zone);
-        zoneFreshnessLabel = zf.suppress ? 'EXHAUSTED'
-          : zf.touchCount <= 1 ? 'FRESH'
-          : zf.touchCount === 2 ? 'RETESTED'
-          : 'WEAKENED';
-      }
-
-      const htfBias = timing?.htfBias || 'NEUTRAL';
-      const h1Bias  = timing?.h1Bias  || 'NEUTRAL';
-
-      // ── Confluence score ──────────────────────────────────────────────────
-      // Used by Hermes to boost signal confidence when technical structure agrees.
-      // Max 100. Components:
-      //   Stage depth    (0–40): more stages confirmed = stronger structure
-      //   HTF alignment  (0–20): htfBias matches setup direction
-      //   H1 alignment   (0–15): h1Bias matches setup direction
-      //   Zone freshness (0–15): fresh zones carry more unfilled orders
-      //   Age penalty    (0–10): setups > 90 min old decay
-      let confluenceScore = 0;
-
-      if (hasActive) {
-        // Stage depth
-        confluenceScore += stageScore * 8; // up to 40 for 5 stages
-
-        // HTF alignment
-        if (setup.direction === 'BUY'  && htfBias === 'BULLISH') confluenceScore += 20;
-        else if (setup.direction === 'SELL' && htfBias === 'BEARISH') confluenceScore += 20;
-        else if (htfBias === 'NEUTRAL') confluenceScore += 8;
-        // conflicting HTF = 0 bonus
-
-        // H1 alignment
-        if (setup.direction === 'BUY'  && h1Bias === 'BULLISH') confluenceScore += 15;
-        else if (setup.direction === 'SELL' && h1Bias === 'BEARISH') confluenceScore += 15;
-        else if (h1Bias === 'NEUTRAL') confluenceScore += 5;
-
-        // Zone freshness
-        if (zoneFreshnessLabel === 'FRESH')    confluenceScore += 15;
-        else if (zoneFreshnessLabel === 'RETESTED') confluenceScore += 8;
-        else if (zoneFreshnessLabel === 'WEAKENED') confluenceScore += 3;
-        // EXHAUSTED = 0
-
-        // Age penalty: decay after 90 min
-        if (setupAgeMinutes !== null && setupAgeMinutes > 90) {
-          const penalty = Math.min(10, Math.floor((setupAgeMinutes - 90) / 30) * 3);
-          confluenceScore = Math.max(0, confluenceScore - penalty);
-        }
-
-        confluenceScore = Math.min(100, confluenceScore);
-      }
-
-      result[sym] = {
-        hasActiveSetup:   hasActive,
-        direction:        hasActive ? setup.direction : null,
-        stage,
-        stageScore,
-        setupAgeMinutes,
-        entryZone,
-        htfBias,
-        h1Bias,
-        zoneFreshness:    hasActive ? zoneFreshnessLabel : null,
-        hasOpenTrade:     !!(monitor && !monitor.resultLogged),
-        confluenceScore,
-        queriedAt:        new Date().toISOString(),
-      };
-    }
-
-    res.json(result);
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 // ── POST /result — record trade outcome manually
 // Body: { setupId: string, result: "TP1"|"TP2"|"SL"|"BE" }
 app.post('/result', (req, res) => {
@@ -3720,7 +3634,8 @@ app.post('/result', (req, res) => {
 // Usage: GET /test-signal  (or /test-signal?dir=BUY)
 app.get('/test-signal', async (req, res) => {
   const dir   = (req.query.dir || 'SELL').toUpperCase();
-  const asset = req.query.sym === 'XAGUSD' ? 'XAGUSD' : 'XAUUSD';
+  const asset = req.query.sym === 'WTIUSD' ? 'WTIUSD'
+              : req.query.sym === 'XAGUSD' ? 'XAGUSD' : 'XAUUSD';
   const isBuy = dir === 'BUY';
 
   const mockSig = {
@@ -4134,7 +4049,7 @@ app.get('/webhook-status', async (req, res) => {
 function formatTelegramSignal(sig) {
   const isBuy      = sig.direction === 'BUY';
   const dir        = sig.direction;
-  const asset      = sig.asset === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  const asset      = getAssetLabel(sig.asset);
   const isCont     = sig.entryType === 'CONTINUATION';
 
   // ── Header: entry type determines emoji + title ───────────────
@@ -4204,7 +4119,7 @@ function formatTelegramSignal(sig) {
   const freshLine = sig.zoneFreshness ? 'Zone:          ' + sig.zoneFreshness : null;
 
   // ── ATR position sizing block ─────────────────────────────────
-  const atrBlock = formatATRBlock(sig.atr, entryPrice, sl);
+  const atrBlock = formatATRBlock(sig.asset, sig.atr, entryPrice, sl);
 
   // ── Continuation warning ──────────────────────────────────────
   const contWarning = isCont
@@ -4249,7 +4164,7 @@ function formatTelegramSignal(sig) {
 // Format pre-signal alert for Telegram
 // Format pre-signal alert for Telegram — short, readable in <5 seconds
 function formatTelegramPreSignal(sym, ns) {
-  const asset = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  const asset = getAssetLabel(sym);
   const dir   = ns.direction || '—';
 
   const stageConfig = {
@@ -4481,11 +4396,11 @@ function createAndLogSetup(sym, direction, levelOrZone) {
 }
 
 // Setups keyed by symbol
-const setups = { XAUUSD: null }; // XAGUSD disabled
+const setups = { XAUUSD: null, WTIUSD: null }; // XAGUSD disabled
 
 // Active trade monitor — tracks open positions after entry signal fires
 // { XAUUSD: { setupId, direction, entry, sl, tp1, tp2, high, low, resultLogged }, ... }
-const tradeMonitor = { XAUUSD: null }; // XAGUSD disabled
+const tradeMonitor = { XAUUSD: null, WTIUSD: null };
 
 // Per-symbol timing state — persists through setup resets
 // Tracks cooldowns for zone detection, bias flips, invalidation windows
@@ -4513,16 +4428,40 @@ const symTiming = {
     htfLastHigh:             0,
     htfLastLow:              0,
     htfUpdatedAt:            0,
-    // H1 structural bias — true HTF reference for gold
-    h1Bias:                  'NEUTRAL',  // 'BULLISH' | 'BEARISH' | 'NEUTRAL'
+    h1Bias:                  'NEUTRAL',
     h1LastBOS:               'NONE',
     h1UpdatedAt:             0,
-    // v5.5: Zone lock after sweep
-    lockedZone:              null,   // the zone object locked after sweep confirms
-    lockedZoneKey:           null,   // priceRange string
-    lockedZoneScansLeft:     0,      // countdown — zone released when reaches 0
+    lockedZone:              null,
+    lockedZoneKey:           null,
+    lockedZoneScansLeft:     0,
   },
-  // XAGUSD disabled — gold only until paid silver API is sourced
+  WTIUSD: {
+    zoneDetectionAllowedAt:  0,
+    biasFlipAllowedAt:       0,
+    lastInvalidatedAt:       0,
+    lastInvalidatedDir:      null,
+    pullbackStartCandleIdx:  -1,
+    pullbackCandleCount:     0,
+    lastSweepAlertAt:        0,
+    lastSweepDir:            null,
+    lastSweepZoneKey:        null,
+    structuralBiasDir:       null,
+    structuralBiasStage:     null,
+    structuralBiasAt:        0,
+    consecutiveFailures:     { BUY: 0, SELL: 0 },
+    htfBias:                 'NEUTRAL',
+    htfLastBOS:              'NONE',
+    htfLastHigh:             0,
+    htfLastLow:              0,
+    htfUpdatedAt:            0,
+    h1Bias:                  'NEUTRAL',
+    h1LastBOS:               'NONE',
+    h1UpdatedAt:             0,
+    lockedZone:              null,
+    lockedZoneKey:           null,
+    lockedZoneScansLeft:     0,
+  },
+  // XAGUSD disabled — silver pending paid API
 };
 
 const CANDLE_MS = 5 * 60 * 1000; // 5 minutes per M5 candle
@@ -4648,7 +4587,7 @@ async function invalidateSetup(sym, reason) {
       ' after ' + setup.direction + ' invalidation (stage: ' + failedStage + ', failures: ' + failures + ')');
   }
 
-  const asset = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  const asset = getAssetLabel(sym);
   const dirEmoji = oppositeDir === 'BUY' ? '🟢' : '🔴';
 
   // Differentiate between a missed entry (trend confirmed but no pullback) and a plain invalidation
@@ -5230,7 +5169,7 @@ async function autoScan() {
   const inSession = (h >= 7 && h < 16) || (h >= 13 && h < 22);
 
   if (!inSession) {
-    for (const sym of ['XAUUSD']) { // Gold only — silver disabled pending paid API
+    for (const sym of Object.keys(setups)) { // All active symbols: XAUUSD, WTIUSD
       if (setups[sym]) {
         resetSetup(sym, 'Session closed');
       }
@@ -5265,7 +5204,7 @@ async function autoScan() {
 
   const delay = ms => new Promise(r => setTimeout(r, ms));
 
-  for (const sym of ['XAUUSD']) { // Gold only
+  for (const sym of Object.keys(setups)) { // All active symbols: XAUUSD, WTIUSD
     try {
       const m5 = await getCandles(sym, '5min', 120);
       if (!m5 || m5.length < 50) {
@@ -5331,7 +5270,7 @@ async function autoScan() {
                         : Math.abs(globalBias.score) >= 2 ? 5
                         : Math.abs(globalBias.score) >= 1 ? 3 : 0;
 
-      const asset = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
+      const asset = getAssetLabel(sym);
       let setup   = setups[sym];
 
       // ── INVALIDATION CHECKS on existing setup ──────────────────
@@ -5394,7 +5333,7 @@ async function autoScan() {
       // AND volatility is low. Existing setups in progress are allowed to continue.
       // v5.6: threshold lowered 3.0→2.0 to match ATR floor change (was blocking too much)
       const htfIsNeutral  = (timing?.htfBias || htfResult.bias) === 'NEUTRAL';
-      const atrIsBelowMid = currentATR !== null && currentATR < 2.0;
+      const atrIsBelowMid = currentATR !== null && currentATR < (HTF_ATR_NEUTRAL_GATE[sym] ?? 2.0);
       const hasActiveSetup = setup && setup.active && !setup.invalidated;
 
       if (htfIsNeutral && atrIsBelowMid && !hasActiveSetup) {
@@ -6052,7 +5991,7 @@ async function autoScan() {
       if (entryResult.type === 'NO_ENTRY' && entryResult.reason?.includes('window expired') && setup) {
         if (!setup.momentumTimeoutSent && (TELEGRAM_MODE === 'FULL' || setup.tgAlerts?.preEntry || setup.events?.pullback)) {
           setup.momentumTimeoutSent = true;
-          const _asset2  = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
+          const _asset2  = getAssetLabel(sym);
           const _oppDir  = setup.direction === 'BUY' ? 'SELL' : 'BUY';
           const _oppEmoji= _oppDir === 'BUY' ? '🟢' : '🔴';
           const _t2      = symTiming[sym];
