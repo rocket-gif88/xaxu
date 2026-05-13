@@ -687,7 +687,7 @@ function readAllLogs() {
 
 const SYMBOLS = {
   XAUUSD: 'XAU/USD',   // Gold spot — Twelve Data
-  WTIUSD: 'WTI/USD',   // WTI crude oil — Twelve Data (paid plan required)
+  // WTIUSD uses Yahoo Finance (CL=F) — no Twelve Data key needed, see wtiGetCandles()
 };
 
 // ─── XAG SYNTHETIC CANDLE ENGINE ──────────────────────────────────────────
@@ -909,6 +909,134 @@ function setCached(key, data) {
   cache[key] = { ts: Date.now(), data };
 }
 
+// ─── WTI CANDLE ENGINE (Yahoo Finance) ────────────────────────────────────────
+// Twelve Data requires a paid plan for WTI/USD.
+// Yahoo Finance serves CL=F (front-month WTI futures) free — real OHLC, no key.
+// Same approach as the XAG engine. Overrides getCandles() for WTIUSD.
+//
+// CL=F trades Sun 23:00 – Fri 22:00 UTC with a 1hr daily maintenance break
+// (22:00–23:00 UTC). Aurum's London/NY session filter handles this naturally.
+
+const WTI_YAHOO_SYM    = 'CL=F';
+const WTI_CANDLE_FILE  = '/tmp/wti_candles.json';
+const WTI_MAX_CANDLES  = 150;  // ~12.5 hours of M5
+
+const wtiState = {
+  candles:  [],
+  seeded:   false,
+};
+
+function wtiSaveCandles() {
+  try {
+    require('fs').writeFileSync(WTI_CANDLE_FILE,
+      JSON.stringify({ candles: wtiState.candles, savedAt: Date.now() }));
+  } catch(e) { /* non-critical */ }
+}
+
+function wtiLoadCandles() {
+  try {
+    const raw  = require('fs').readFileSync(WTI_CANDLE_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    if (data.candles && data.candles.length > 0) {
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      wtiState.candles = data.candles.filter(c => c.t > cutoff);
+      console.log('[wti] Loaded ' + wtiState.candles.length + ' candles from disk');
+      return true;
+    }
+  } catch(e) { /* file not yet created */ }
+  return false;
+}
+
+// Fetch real OHLC M5 or H1 candles from Yahoo Finance
+async function wtiFetchCandles(interval) {
+  const yahooInterval = interval === '5min' ? '5m' : '1h';
+  const range         = interval === '5min' ? '2d' : '5d';
+  const url = 'https://query1.finance.yahoo.com/v8/finance/chart/' +
+              WTI_YAHOO_SYM + '?interval=' + yahooInterval + '&range=' + range;
+  try {
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(10000),
+    });
+    const json  = await resp.json();
+    const chart = json?.chart?.result?.[0];
+    if (!chart) return null;
+
+    const ts   = chart.timestamp || [];
+    const ohlc = chart.indicators?.quote?.[0] || {};
+    const { open, high, low, close } = ohlc;
+    if (!ts.length || !close) return null;
+
+    return ts.map((t, i) => ({
+      t: t * 1000,
+      o: parseFloat(open?.[i]  ?? close[i]),
+      h: parseFloat(high?.[i]  ?? close[i]),
+      l: parseFloat(low?.[i]   ?? close[i]),
+      c: parseFloat(close[i]),
+    })).filter(c => c.c > 0 && !isNaN(c.c));
+  } catch(e) {
+    console.error('[wti] Yahoo Finance fetch error:', e.message);
+    return null;
+  }
+}
+
+// Called once on boot — seeds candle history so engine runs immediately
+async function wtiSeedHistory() {
+  console.log('[wti] Seeding from Yahoo Finance (CL=F 5min)...');
+  const candles = await wtiFetchCandles('5min');
+  if (candles && candles.length >= 10) {
+    wtiState.candles = candles.slice(-WTI_MAX_CANDLES);
+    wtiState.seeded  = true;
+    wtiSaveCandles();
+    console.log('[wti] ✓ Seeded ' + wtiState.candles.length + ' M5 candles');
+    return true;
+  }
+  console.log('[wti] Seed failed — engine will build from live polls');
+  return false;
+}
+
+// Main entry point — called by getCandles() override for WTIUSD
+async function wtiGetCandles(interval, n) {
+  const cacheKey = 'candles_WTIUSD_' + interval + '_' + n;
+  const cached   = getCached(cacheKey);
+  if (cached) return cached;
+
+  // For M5: use in-memory candle store (seeded on boot + refreshed each scan)
+  if (interval === '5min') {
+    if (wtiState.candles.length >= 20) {
+      const slice = wtiState.candles.slice(-n);
+      setCached(cacheKey, slice);
+      return slice;
+    }
+    // Not enough candles yet — try a fresh fetch
+    const fresh = await wtiFetchCandles('5min');
+    if (fresh && fresh.length > 0) {
+      wtiState.candles = fresh.slice(-WTI_MAX_CANDLES);
+      wtiSaveCandles();
+      const slice = wtiState.candles.slice(-n);
+      setCached(cacheKey, slice);
+      return slice;
+    }
+    return null;
+  }
+
+  // For H1 (HTF bias): always fetch fresh from Yahoo
+  const candles = await wtiFetchCandles('1h');
+  if (!candles) return null;
+  const slice = candles.slice(-n);
+  setCached(cacheKey, slice);
+  return slice;
+}
+
+// Refresh WTI M5 store each scan cycle (called from autoScan)
+async function wtiRefreshCandles() {
+  const fresh = await wtiFetchCandles('5min');
+  if (fresh && fresh.length > 0) {
+    wtiState.candles = fresh.slice(-WTI_MAX_CANDLES);
+    wtiSaveCandles();
+  }
+}
+
 // ─── SAFE FETCH ────────────────────────────────────────────────────────────
 async function tdFetch(path) {
   const sep = path.includes('?') ? '&' : '?';
@@ -928,6 +1056,9 @@ async function tdFetch(path) {
 
 // ─── CANDLE FETCH ─────────────────────────────────────────────────────────
 async function getCandles(sym, interval, n) {
+  // WTIUSD: bypass Twelve Data entirely — use Yahoo Finance (free)
+  if (sym === 'WTIUSD') return wtiGetCandles(interval, n);
+
   const td = SYMBOLS[sym];
   if (!td) { console.error('Unknown symbol:', sym); return null; }
   
@@ -3328,7 +3459,9 @@ app.get('/prices', (req, res) => {
   const xau = xauCache ? parseFloat(xauCache[xauCache.length-1]?.c) || null : null;
 
   const wtiCache = getCached('candles_WTIUSD_5min_120');
-  const wti = wtiCache ? parseFloat(wtiCache[wtiCache.length-1]?.c) || null : null;
+  const wti = wtiCache
+    ? parseFloat(wtiCache[wtiCache.length-1]?.c) || null
+    : (wtiState.candles.length > 0 ? parseFloat(wtiState.candles[wtiState.candles.length-1]?.c) || null : null);
 
   // XAGUSD: use synthetic candle store
   const xagCandles = xagState.candles.length > 0 ? xagState.candles : null;
@@ -3711,9 +3844,35 @@ app.get('/debug/xag-raw', async (req, res) => {
 // Usage: /debug/XAUUSD or /debug/XAGUSD
 app.get('/debug/:sym', async (req, res) => {
   const sym = req.params.sym.toUpperCase();
-  if (!SYMBOLS[sym]) return res.status(400).json({ error: 'Unknown symbol' });
 
-  // XAGUSD now uses Twelve Data same as XAUUSD
+  // WTIUSD: test Yahoo Finance connection instead of Twelve Data
+  if (sym === 'WTIUSD') {
+    try {
+      const url = 'https://query1.finance.yahoo.com/v8/finance/chart/CL=F?interval=5m&range=1d';
+      const resp = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(10000),
+      });
+      const json = await resp.json();
+      const result = json?.chart?.result?.[0];
+      const closes = result?.indicators?.quote?.[0]?.close || [];
+      const latestPrice = closes.filter(Boolean).pop() || null;
+      return res.json({
+        symbol:        'WTIUSD',
+        data_source:   'Yahoo Finance (CL=F — WTI front-month futures, free)',
+        http_status:   resp.status,
+        has_values:    closes.filter(Boolean).length > 0,
+        candle_count:  closes.filter(Boolean).length,
+        latest_price:  latestPrice ? parseFloat(latestPrice.toFixed(2)) : null,
+        wti_candles_in_memory: wtiState.candles.length,
+        status:        closes.filter(Boolean).length > 0 ? 'ok' : 'no_data',
+      });
+    } catch(e) {
+      return res.json({ symbol: 'WTIUSD', error: e.message });
+    }
+  }
+
+  if (!SYMBOLS[sym]) return res.status(400).json({ error: 'Unknown symbol' });
   const td = SYMBOLS[sym];
   try {
     const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(td)}&interval=5min&outputsize=5&apikey=${TWELVE_KEY}`;
@@ -5206,6 +5365,9 @@ async function autoScan() {
 
   for (const sym of Object.keys(setups)) { // All active symbols: XAUUSD, WTIUSD
     try {
+      // WTI uses Yahoo Finance — refresh candle store before analysis
+      if (sym === 'WTIUSD') await wtiRefreshCandles();
+
       const m5 = await getCandles(sym, '5min', 120);
       if (!m5 || m5.length < 50) {
         console.log('[auto-scan] ' + sym + ': insufficient data');
@@ -6222,6 +6384,16 @@ app.listen(PORT, () => {
     .then(() => hydrateFromSheets(_setupLogs))
     .then(() => restoreTradeMonitors())
     .catch(e => console.error('[boot]', e.message));
+
+  // WTI: load candles from disk, then seed from Yahoo Finance if needed
+  const wtiDiskLoaded = wtiLoadCandles();
+  if (!wtiDiskLoaded || wtiState.candles.length < 20) {
+    wtiSeedHistory().then(seeded => {
+      if (!seeded) console.log('[wti] Seed failed — will build from live polls (2hr warmup)');
+    });
+  } else {
+    console.log('[wti] ✓ Candles loaded from disk — no warmup needed');
+  }
 
   // XAG: load candles from disk first, then seed from history if needed
   const diskLoaded = xagLoadCandles();
