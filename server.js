@@ -3580,6 +3580,132 @@ app.get('/stats', (req, res) => {
   }
 });
 
+// ── GET /setup-state — Hermes confluence query ───────────────────────────────
+// Returns current active setup state for each tracked symbol.
+// Hermes calls this before firing a signal to check technical confluence.
+// Response shape per symbol:
+//   hasActiveSetup  bool    — is a setup currently live?
+//   direction       string  — "BUY" | "SELL" | null
+//   stage           string  — "sweep"|"move"|"trend"|"pullback"|"entry"|null
+//   stageScore      number  — 1–5 (stages confirmed so far — higher = more structure)
+//   setupAgeMinutes number  — how long the current setup has been active
+//   entryZone       object  — { low, high } if known
+//   htfBias         string  — "BULLISH"|"BEARISH"|"NEUTRAL"
+//   h1Bias          string  — "BULLISH"|"BEARISH"|"NEUTRAL"
+//   zoneFreshness   string  — "FRESH"|"RETESTED"|"WEAKENED"|"EXHAUSTED"
+//   hasOpenTrade    bool    — trade monitor active (entry already fired)
+//   confluenceScore number  — 0–100 composite for Hermes to use directly
+app.get('/setup-state', (req, res) => {
+  try {
+    const stageOrder = ['sweep', 'move', 'trend', 'pullback', 'entry'];
+    const result = {};
+
+    for (const sym of Object.keys(SYMBOLS)) {
+      const setup   = setups[sym];
+      const timing  = symTiming[sym];
+      const monitor = tradeMonitor[sym];
+
+      // ── Active setup ──────────────────────────────────────────────────────
+      const hasActive = !!(setup && setup.active && !setup.invalidated);
+
+      // Stage score: count confirmed stages (1–5)
+      let stage = null;
+      let stageScore = 0;
+      if (hasActive && setup.events) {
+        for (const s of stageOrder) {
+          if (setup.events[s]) { stage = s; stageScore++; }
+        }
+      }
+
+      // Setup age
+      const setupAgeMinutes = hasActive && setup.createdAt
+        ? Math.round((Date.now() - setup.createdAt) / 60000)
+        : null;
+
+      // Entry zone from active setup
+      let entryZone = null;
+      if (hasActive && setup.zone) {
+        entryZone = {
+          low:  setup.zone.minPrice || setup.zone.low  || null,
+          high: setup.zone.maxPrice || setup.zone.high || null,
+        };
+      }
+
+      // Zone freshness label (strip emoji for clean comparison in Hermes)
+      let zoneFreshnessLabel = 'UNKNOWN';
+      if (hasActive && setup.zone) {
+        const zf = getZoneFreshness(sym, setup.zone);
+        zoneFreshnessLabel = zf.suppress ? 'EXHAUSTED'
+          : zf.touchCount <= 1 ? 'FRESH'
+          : zf.touchCount === 2 ? 'RETESTED'
+          : 'WEAKENED';
+      }
+
+      const htfBias = timing?.htfBias || 'NEUTRAL';
+      const h1Bias  = timing?.h1Bias  || 'NEUTRAL';
+
+      // ── Confluence score ──────────────────────────────────────────────────
+      // Used by Hermes to boost signal confidence when technical structure agrees.
+      // Max 100. Components:
+      //   Stage depth    (0–40): more stages confirmed = stronger structure
+      //   HTF alignment  (0–20): htfBias matches setup direction
+      //   H1 alignment   (0–15): h1Bias matches setup direction
+      //   Zone freshness (0–15): fresh zones carry more unfilled orders
+      //   Age penalty    (0–10): setups > 90 min old decay
+      let confluenceScore = 0;
+
+      if (hasActive) {
+        // Stage depth
+        confluenceScore += stageScore * 8; // up to 40 for 5 stages
+
+        // HTF alignment
+        if (setup.direction === 'BUY'  && htfBias === 'BULLISH') confluenceScore += 20;
+        else if (setup.direction === 'SELL' && htfBias === 'BEARISH') confluenceScore += 20;
+        else if (htfBias === 'NEUTRAL') confluenceScore += 8;
+        // conflicting HTF = 0 bonus
+
+        // H1 alignment
+        if (setup.direction === 'BUY'  && h1Bias === 'BULLISH') confluenceScore += 15;
+        else if (setup.direction === 'SELL' && h1Bias === 'BEARISH') confluenceScore += 15;
+        else if (h1Bias === 'NEUTRAL') confluenceScore += 5;
+
+        // Zone freshness
+        if (zoneFreshnessLabel === 'FRESH')    confluenceScore += 15;
+        else if (zoneFreshnessLabel === 'RETESTED') confluenceScore += 8;
+        else if (zoneFreshnessLabel === 'WEAKENED') confluenceScore += 3;
+        // EXHAUSTED = 0
+
+        // Age penalty: decay after 90 min
+        if (setupAgeMinutes !== null && setupAgeMinutes > 90) {
+          const penalty = Math.min(10, Math.floor((setupAgeMinutes - 90) / 30) * 3);
+          confluenceScore = Math.max(0, confluenceScore - penalty);
+        }
+
+        confluenceScore = Math.min(100, confluenceScore);
+      }
+
+      result[sym] = {
+        hasActiveSetup:   hasActive,
+        direction:        hasActive ? setup.direction : null,
+        stage,
+        stageScore,
+        setupAgeMinutes,
+        entryZone,
+        htfBias,
+        h1Bias,
+        zoneFreshness:    hasActive ? zoneFreshnessLabel : null,
+        hasOpenTrade:     !!(monitor && !monitor.resultLogged),
+        confluenceScore,
+        queriedAt:        new Date().toISOString(),
+      };
+    }
+
+    res.json(result);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── POST /result — record trade outcome manually
 // Body: { setupId: string, result: "TP1"|"TP2"|"SL"|"BE" }
 app.post('/result', (req, res) => {
