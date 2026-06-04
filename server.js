@@ -4541,6 +4541,7 @@ function createSetup(sym, direction, levelOrZone) {
     startedAt:       Date.now(),
     lastEventAt:     Date.now(),
     earlyLockUntil:  0,
+    frozenZoneScore: null,  // v5.7: set at sweep confirmation, used for mid-progress score gates
     cooldowns: {}
   };
   console.log('[setup] Created id=' + id + ' dir=' + direction + ' zone=' + zoneId);
@@ -5620,29 +5621,41 @@ async function autoScan() {
       // < 50  → no signals at all
       // 50–74 → standard entry only, aggressive engine suppressed
       // ≥ 75  → full system: standard + aggressive
+      //
+      // v5.7: Use frozenZoneScore for active setups — live score fluctuates ±5pts
+      // every scan as candle cluster changes. Killing a setup because score dipped
+      // from 60→59 was the #1 cause of invalidations in March logs.
+      // Freeze the score at sweep confirmation; only block on catastrophic drops.
+      const effectiveZoneScore = (setup && setup.active && setup.frozenZoneScore != null)
+        ? setup.frozenZoneScore
+        : zoneScore;
+
       if (zoneScore < 50) {
         console.log('[' + sym + '] Zone score ' + zoneScore + ' < 50 — all signals suppressed');
         logScanEvent(sym, 'ZONE_SCORE_BLOCKED', 'Score ' + zoneScore + '/100 below 50 minimum',
           { direction: primaryZone.direction, zoneLow: primaryZone.minPrice, zoneHigh: primaryZone.maxPrice,
             zoneScore, touches: primaryZone.totalTouches });
-        if (setup && setup.active) {
-          console.log('[' + sym + '] Cancelling active setup — zone score ' + zoneScore + ' fell below 50');
+        if (setup && setup.active && !setup.events?.sweep) {
+          // Only cancel pre-sweep setups on score drop — post-sweep uses frozen score
+          console.log('[' + sym + '] Cancelling pre-sweep setup — zone score ' + zoneScore + ' fell below 50');
           await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 50).');
           resetSetup(sym, 'Zone score below 50');
         }
-        await delay(400); continue;
+        if (!setup || !setup.events?.sweep) {
+          await delay(400); continue;
+        }
       }
 
       // ── ZONE STRENGTH CHECK AT TREND SHIFT+ STAGES ─────────────
-      // v5.5: Only cancel if truly catastrophic (<40) once past sweep stage.
-      // Before v5.5, setups with score 59 were killed mid-progress — live data
-      // showed this was the #2 cause of false invalidations.
+      // v5.7: Use effectiveZoneScore (frozen at sweep). Only cancel on truly
+      // catastrophic drops — zone reclustering causes ±5pt swings that were
+      // killing valid setups mid-progress.
       if (setup && setup.active && setup.events?.sweep) {
-        const killThreshold = setup.events?.trend ? 40 : 50; // more lenient after sweep
-        if (zoneScore < killThreshold) {
-          console.log('[' + sym + '] Setup cancelled at ' + setup.stage + ' stage — zone score ' + zoneScore + ' < ' + killThreshold);
-          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength (score ' + zoneScore + '/100 < ' + killThreshold + ').');
-          resetSetup(sym, 'Zone too weak mid-progress');
+        const killThreshold = 35; // catastrophic only — zone completely invalid
+        if (effectiveZoneScore < killThreshold) {
+          console.log('[' + sym + '] Setup cancelled — effective zone score ' + effectiveZoneScore + ' < ' + killThreshold + ' (catastrophic)');
+          await invalidateSetup(sym, 'Setup cancelled: zone completely invalid (score ' + effectiveZoneScore + '/100 < ' + killThreshold + ').');
+          resetSetup(sym, 'Zone catastrophically weak');
           await delay(400); continue;
         }
       }
@@ -5807,6 +5820,10 @@ async function autoScan() {
       // Prevents bulk-confirmation of multiple stages from historical data.
       if (sweepFired) {
         logStageUpdate(setup, 'sweep');
+        // v5.7: Freeze zone score at sweep confirmation — prevents mid-progress
+        // invalidations from ±5pt reclustering fluctuations (was #1 kill cause)
+        setup.frozenZoneScore = zoneScore;
+        console.log('[zone-score] ' + sym + ': zone score frozen at ' + zoneScore + ' (sweep confirmed)');
         // Count this zone touch only when price actually sweeps it
         updateZoneMemory(sym, primaryZone);
         console.log('[zone-mem] ' + sym + ': zone touch recorded at sweep (total: ' + (getZoneFreshness(sym, primaryZone).touchCount) + ')');
@@ -5956,18 +5973,18 @@ async function autoScan() {
         // All 3 structural stages done. User needs to know exactly what to watch for.
         // ── HARD FILTERS before pre-signal fires ─────────────────
         // 1. Displacement must be ≥ 1.0× — weak momentum = noise
-        // 2. Zone touches must be > 14 — fewer = insufficient institutional interest
-        // 3. HTF Neutral setups require score ≥ 65 — no structural tailwind = higher bar
+        // 2. Zone touches must be > 4 — fewer = zone hasn't been tested enough
+        // 3. HTF Neutral setups require score ≥ 55 — lowered to match realistic score ceiling
         const _dispRatioNow  = disp?.ratio || 0;
         const _touchesNow    = primaryZone?.totalTouches || 0;
         const _htfBiasNow2   = timing?.htfBias || 'NEUTRAL';
         const _preSignalBlock =
           _dispRatioNow < 1.0
             ? 'Displacement ' + _dispRatioNow + 'x < 1.0x minimum — pre-signal suppressed'
-          : _touchesNow <= 14
-            ? 'Zone touches ' + _touchesNow + ' ≤ 14 — insufficient institutional interest'
-          : (_htfBiasNow2 === 'NEUTRAL' && zoneScore < 65)
-            ? 'HTF Neutral + score ' + zoneScore + '/100 < 65 — pre-signal suppressed'
+          : _touchesNow <= 4
+            ? 'Zone touches ' + _touchesNow + ' ≤ 4 — insufficient zone confirmation'
+          : (_htfBiasNow2 === 'NEUTRAL' && zoneScore < 55)
+            ? 'HTF Neutral + score ' + zoneScore + '/100 < 55 — pre-signal suppressed'
           : null;
 
         if (_preSignalBlock) {
@@ -6233,9 +6250,11 @@ async function autoScan() {
           (entryResult.type === 'NO_ENTRY' ? ' [aggressive engine: no pattern]' : ''));
       }
 
-      // Tier gate: only HIGH (≥70) gets a full signal (v5.2: was 75)
-      if (scoreResult.tier !== 'HIGH') {
-        console.log('[' + sym + '] Score ' + finalScore + ' tier=' + scoreResult.tier + ' — below 70 threshold');
+      // Tier gate: v5.7: VALID (≥55) or HIGH (≥70) both get full signal
+      // The 70 threshold was unreachable in London session with HTF NEUTRAL.
+      // Realistic max score on London+NEUTRAL = ~65. Lowered to fire on VALID tier.
+      if (scoreResult.tier === 'LOW' || scoreResult.tier === 'IGNORE') {
+        console.log('[' + sym + '] Score ' + finalScore + ' tier=' + scoreResult.tier + ' — below 55 minimum threshold');
         await delay(400); continue;
       }
 
